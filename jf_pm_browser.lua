@@ -1,22 +1,22 @@
--- egxrkin_pm_browser.lua
--- Egxrkin Project Manager: браузер проектов (ReaImGui).
+-- jf_pm_browser.lua
+-- JF Project Manager: браузер проектов (ReaImGui).
 -- Запуск по хоткею из Action List, в фоне не висит.
--- Читает ТОЛЬКО индекс (egxrkin_pm_index.json); Rescan пересобирает индекс
+-- Читает ТОЛЬКО индекс (jf_pm_index.json); Rescan пересобирает индекс
 -- парсингом .rpp как текста — проекты не открываются.
 
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
-local core = dofile(SCRIPT_DIR .. '/egxrkin_pm_core.lua')
+local core = dofile(SCRIPT_DIR .. '/jf_pm_core.lua')
 
 if not reaper.ImGui_GetBuiltinPath then
   reaper.MB('Нужен ReaImGui 0.9+ (ReaPack: ReaImGui: ReaScript binding for Dear ImGui).',
-    'Egxrkin PM', 0)
+    'JF PM', 0)
   return
 end
 package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua;' .. package.path
 local ImGui = require 'imgui' '0.9'
 
-local ctx = ImGui.CreateContext('Egxrkin PM')
+local ctx = ImGui.CreateContext('JF PM')
 local font = ImGui.CreateFont('sans-serif', 14)
 ImGui.Attach(ctx, font)
 
@@ -25,7 +25,7 @@ ImGui.Attach(ctx, font)
 local state = {
   index = core.load_index(),
   scan_paths = core.get_scan_paths_str(),
-  filter_status = 0,        -- 0 = все, 1..#STATUSES, затем спец-фильтры
+  filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, дальше статусы
   filter_tag = '',
   sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя
   expanded = nil,           -- path раскрытой карточки
@@ -39,7 +39,7 @@ local STATUS_ORDER = {}
 for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 
 local function status_filter_labels()
-  local items = { 'все', 'без отчёта' }
+  local items = { 'активные', 'все', 'без отчёта' }
   for _, s in ipairs(core.STATUSES) do items[#items + 1] = s end
   items[#items + 1] = 'без статуса'
   return table.concat(items, '\0') .. '\0'
@@ -73,11 +73,13 @@ local function collect_cards()
     local meta = core.card_meta(card)
     local ok = true
     local f = state.filter_status
-    if f == 1 then
+    if f == 0 then
+      ok = meta.status ~= 'архив'
+    elseif f == 2 then
       ok = card.needs_report or meta.report_ts == 0
-    elseif f >= 2 and f <= 1 + #core.STATUSES then
-      ok = meta.status == core.STATUSES[f - 1]
-    elseif f == 2 + #core.STATUSES then
+    elseif f >= 3 and f <= 2 + #core.STATUSES then
+      ok = meta.status == core.STATUSES[f - 2]
+    elseif f == 3 + #core.STATUSES then
       ok = meta.status == ''
     end
     if ok and state.filter_tag ~= '' then
@@ -204,7 +206,7 @@ end
 local function draw_card(entry, card_w)
   local card, meta = entry.card, entry.meta
   local expanded = state.expanded == card.path
-  local h = expanded and 0 or 118  -- 0 = авто-высота по контенту
+  local h = expanded and 0 or 132  -- 0 = авто-высота по контенту
 
   local child_flags = ImGui.ChildFlags_Border
   if expanded then
@@ -214,9 +216,16 @@ local function draw_card(entry, card_w)
     ImGui.Text(ctx, card.name)
 
     local color = core.STATUS_COLORS[meta.status]
+    local stage = core.PIPELINE[meta.status]
+    if stage then
+      -- прогресс по пайплайну: ●●○○ = «в работе»
+      ImGui.SameLine(ctx)
+      local dots = string.rep('●', stage) .. string.rep('○', core.PIPELINE_STEPS - stage)
+      ImGui.TextColored(ctx, color or 0xAAAAAAFF, dots)
+    end
     if meta.status ~= '' then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, color or 0xAAAAAAFF, '· ' .. meta.status)
+      ImGui.TextColored(ctx, color or 0xAAAAAAFF, meta.status)
     end
     if card.needs_report then
       ImGui.SameLine(ctx)
@@ -225,6 +234,12 @@ local function draw_card(entry, card_w)
 
     ImGui.TextDisabled(ctx, fmt_date(card.mtime) .. '   ' ..
       fmt_duration(card.duration) .. '   ' .. (#card.regions) .. ' рег.')
+
+    -- следующий шаг из последнего отчёта — открытая петля снаружи головы
+    local next_action = meta.report_todo:match('^[^\n]+')
+    if next_action then
+      ImGui.TextColored(ctx, 0xD9B96CFF, '→ ' .. next_action)
+    end
 
     local tags = all_tags(card, meta)
     if #tags > 0 then
@@ -264,6 +279,21 @@ local function draw_toolbar()
   changed, val = ImGui.InputTextWithHint(ctx, '##tag', 'тег…', state.filter_tag)
   if changed then state.filter_tag = val end
 
+  -- WIP-счётчик: >3 в работе — многовато, внимание расползается
+  local wip, no_report = 0, 0
+  for _, card in pairs(state.index.projects) do
+    local s = (card.ext or {}).STATUS or ''
+    if s == 'в работе' or s == 'к миксу' then wip = wip + 1 end
+    if card.needs_report then no_report = no_report + 1 end
+  end
+  ImGui.SameLine(ctx)
+  ImGui.TextColored(ctx, wip > 3 and 0xE06060FF or 0x8A8A8AFF,
+    string.format('WIP: %d', wip))
+  if no_report > 0 then
+    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, 0xE06060FF, string.format('без отчёта: %d', no_report))
+  end
+
   if state.status_msg ~= '' then
     ImGui.SameLine(ctx)
     ImGui.TextDisabled(ctx, state.status_msg)
@@ -273,7 +303,7 @@ end
 local function loop()
   ImGui.PushFont(ctx, font)
   ImGui.SetNextWindowSize(ctx, 940, 640, ImGui.Cond_FirstUseEver)
-  local visible, open = ImGui.Begin(ctx, 'Egxrkin — проекты', true)
+  local visible, open = ImGui.Begin(ctx, 'JF — проекты', true)
   if visible then
     draw_toolbar()
     if state.show_settings then draw_settings() end

@@ -2,7 +2,7 @@
 -- Запуск: lua5.4 tests/test_parser.lua  (из корня репозитория)
 -- Проверяет парсер .rpp, JSON и кодирование multiline без Reaper.
 
-local core = dofile('egxrkin_pm_core.lua')
+local core = dofile('jf_pm_core.lua')
 
 local failed = 0
 local function check(cond, msg)

@@ -1,5 +1,5 @@
--- egxrkin_pm_report.lua
--- Egxrkin PM: отчёт по манифесту при закрытии проекта.
+-- jf_pm_report.lua
+-- JF PM: отчёт по манифесту при закрытии проекта.
 -- Вешается на Cmd+W ВМЕСТО штатного File: Close project.
 --
 -- Почему не custom action из двух шагов (скрипт + Close project):
@@ -13,10 +13,10 @@
 
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
-local core = dofile(SCRIPT_DIR .. '/egxrkin_pm_core.lua')
+local core = dofile(SCRIPT_DIR .. '/jf_pm_core.lua')
 
 if not reaper.ImGui_GetBuiltinPath then
-  reaper.MB('Нужен ReaImGui 0.9+ (ReaPack).', 'Egxrkin PM', 0)
+  reaper.MB('Нужен ReaImGui 0.9+ (ReaPack).', 'JF PM', 0)
   return
 end
 package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua;' .. package.path
@@ -49,7 +49,7 @@ end
 
 local STATUS_LABELS = '(нет)\0' .. table.concat(core.STATUSES, '\0') .. '\0'
 
-local ctx = ImGui.CreateContext('Egxrkin PM Report')
+local ctx = ImGui.CreateContext('JF PM Report')
 local font = ImGui.CreateFont('sans-serif', 14)
 ImGui.Attach(ctx, font)
 

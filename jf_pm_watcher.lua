@@ -1,5 +1,5 @@
--- egxrkin_pm_watcher.lua
--- Egxrkin PM: фоновый watcher. Единственная задача — заметить, что вкладка
+-- jf_pm_watcher.lua
+-- JF PM: фоновый watcher. Единственная задача — заметить, что вкладка
 -- проекта исчезла без отчёта, и пометить проект в индексе как «без отчёта».
 --
 -- Предельно лёгкий: раз в ~1 сек только EnumProjects (без парсинга и I/O).
@@ -11,7 +11,7 @@
 
 local SCRIPT_PATH, SECTION_ID, CMD_ID = select(2, reaper.get_action_context())
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
-local core = dofile(SCRIPT_DIR .. '/egxrkin_pm_core.lua')
+local core = dofile(SCRIPT_DIR .. '/jf_pm_core.lua')
 
 -- toggle: второй запуск того же экшна просит первый остановиться
 if reaper.GetExtState(core.EXT_SECTION, 'watcher_running') == '1' then
