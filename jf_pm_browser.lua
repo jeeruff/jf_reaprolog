@@ -213,19 +213,32 @@ local function get_image(path)
 end
 
 local function draw_thumb(card, size)
-  -- своя картинка: jf_thumb.png/jpg в папке проекта
-  if card.thumb_file then
-    local img = get_image(card.thumb_file)
-    if img then
-      ImGui.Image(ctx, img, size, size)
-      return
-    end
+  -- превью: назначенное вручную → <имя проекта>.png / jf_thumb.png в папке
+  local img = card.thumb_user and get_image(card.thumb_user) or nil
+  if not img and card.thumb_file then img = get_image(card.thumb_file) end
+  if img then
+    ImGui.Image(ctx, img, size, size)
+    return
   end
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
   ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + size, y0 + size, 0x161616FF, 4)
   local h = fnv1a(card.path)
-  if state.thumb_style == 1 then
+  if state.thumb_style == 2 and #(card.items or {}) > 0
+     and (card.duration or 0) > 0 then
+    -- навигатор: мини-аранжировка, айтемы по трекам, оттенок — от трека
+    local tracks = math.max(card.track_count or 1, 1)
+    local row = size / tracks
+    for _, it in ipairs(card.items) do
+      local ix0 = x0 + (it.p / card.duration) * size
+      local ix1 = math.min(ix0 + (it.l / card.duration) * size, x0 + size)
+      if ix1 - ix0 < 1 then ix1 = ix0 + 1 end
+      local iy0 = y0 + (it.t - 1) * row
+      local col = hash_color((h + it.t * 53) % 360, 0.5, 0.85)
+      ImGui.DrawList_AddRectFilled(dl, ix0, iy0 + 0.5,
+        ix1, iy0 + math.max(1, row - 1) + 0.5, col)
+    end
+  elseif state.thumb_style == 1 then
     -- радикал, детерминированный от пути проекта
     local glyph = RADICALS[h % #RADICALS + 1]
     local col = hash_color(h % 360, 0.45, 0.95)
@@ -314,6 +327,23 @@ local function draw_card_details(card, meta)
   end
   ImGui.TextDisabled(ctx, card.path)
   if ImGui.SmallButton(ctx, 'свернуть') then state.expanded = nil end
+  ImGui.SameLine(ctx)
+  if ImGui.SmallButton(ctx, 'превью…') then
+    -- нативный Finder-диалог, без зависимостей от js_ReaScriptAPI
+    local rv, fn = reaper.GetUserFileNameForRead('', 'Картинка-превью проекта', '')
+    if rv and fn and fn ~= '' then
+      card.thumb_user = fn
+      img_cache[fn] = nil -- если раньше не загрузилась — пробуем заново
+      core.save_index(state.index)
+    end
+  end
+  if card.thumb_user then
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, 'сбросить превью') then
+      card.thumb_user = nil
+      core.save_index(state.index)
+    end
+  end
 end
 
 local function draw_card(entry, i, card_w)
@@ -630,7 +660,9 @@ local function draw_settings()
   ImGui.SameLine(ctx)
   if chip('иероглиф', state.thumb_style == 1) then state.thumb_style = 1 end
   ImGui.SameLine(ctx)
-  ImGui.TextDisabled(ctx, 'или jf_thumb.png в папке проекта')
+  if chip('навигатор', state.thumb_style == 2) then state.thumb_style = 2 end
+  ImGui.SameLine(ctx)
+  ImGui.TextDisabled(ctx, 'или <имя проекта>.png / jf_thumb.png в папке проекта')
 
   if ImGui.Button(ctx, 'Сохранить настройки') then
     core.set_setting('scan_paths', state.scan_paths)

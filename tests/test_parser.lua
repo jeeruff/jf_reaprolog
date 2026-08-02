@@ -65,6 +65,14 @@ eq(card.render_pattern, '$project_v3', 'render pattern')
 -- items: 0+32.25 и 32.25+72.5=104.75; регионы до 96 → длительность 104.75
 eq(card.duration, 104.75, 'duration from items/regions')
 
+-- карта айтемов для тамбнейла-навигатора (позиции округлены до 0.1)
+eq(#card.items, 2, 'item map count')
+eq(card.items[1].t, 1, 'item 1 on track 1')
+eq(card.items[1].p, 0, 'item 1 position')
+eq(card.items[1].l, 32.3, 'item 1 length rounded')
+eq(card.items[2].t, 2, 'item 2 on track 2')
+eq(card.items[2].p, 32.3, 'item 2 position rounded')
+
 eq(card.ext.STATUS, 'в работе', 'extstate STATUS')
 eq(card.ext.TAGS, 'флейта,dungeon,EP-кандидат', 'extstate TAGS')
 eq(card.ext.SOMEKEY, nil, 'foreign namespace ignored')

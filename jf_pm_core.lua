@@ -225,8 +225,9 @@ function M.parse_rpp(path)
     tempo = nil, timesig_num = 4, timesig_den = 4,
     track_names = {}, regions = {}, markers = {},
     render_file = '', render_pattern = '',
-    duration = 0, ext = {},
+    duration = 0, ext = {}, items = {},
   }
+  local MAX_ITEMS = 800 -- кап карты айтемов, чтобы индекс не разбухал
   local stack = {}
   local region_open = {}   -- id -> запись региона, ждущая парной строки-конца
   local cur_item = nil
@@ -241,13 +242,21 @@ function M.parse_rpp(path)
       if tag == 'TRACK' and parent == 'REAPER_PROJECT' then
         card.track_names[#card.track_names + 1] = ''
       elseif tag == 'ITEM' then
-        cur_item = { pos = 0, len = 0 }
+        cur_item = { pos = 0, len = 0, tr = #card.track_names }
       end
     elseif s == '>' then
       local top = stack[#stack]
       if top == 'ITEM' and cur_item then
         local fin = cur_item.pos + cur_item.len
         if fin > card.duration then card.duration = fin end
+        -- карта айтемов для тамбнейла-навигатора: {t трек, p позиция, l длина}
+        if cur_item.tr > 0 and cur_item.len > 0 and #card.items < MAX_ITEMS then
+          card.items[#card.items + 1] = {
+            t = cur_item.tr,
+            p = math.floor(cur_item.pos * 10 + 0.5) / 10,
+            l = math.floor(cur_item.len * 10 + 0.5) / 10,
+          }
+        end
         cur_item = nil
       end
       stack[#stack] = nil
@@ -485,20 +494,24 @@ function M.find_backups(path)
   return out
 end
 
--- Своя картинка-тамбнейл: jf_thumb.png/jpg в папке проекта
+-- Своя картинка-тамбнейл в папке проекта: <имя проекта>.png/jpg приоритетнее
+-- общего jf_thumb.png (несколько .rpp в папке — у каждого своё превью).
 function M.find_thumb(path)
   local dir = path:match('^(.*)[/\\]') or '.'
+  local base = (path:match('([^/\\]+)%.[rR][pP][pP]$') or ''):lower()
+  local generic
   local i = 0
   while true do
     local fn = reaper.EnumerateFiles(dir, i)
     if not fn then break end
-    local l = fn:lower()
-    if l == 'jf_thumb.png' or l == 'jf_thumb.jpg' or l == 'jf_thumb.jpeg' then
-      return dir .. '/' .. fn
+    local stem, ext = fn:lower():match('^(.+)%.([a-z]+)$')
+    if ext == 'png' or ext == 'jpg' or ext == 'jpeg' then
+      if base ~= '' and stem == base then return dir .. '/' .. fn end
+      if stem == 'jf_thumb' then generic = dir .. '/' .. fn end
     end
     i = i + 1
   end
-  return nil
+  return generic
 end
 
 -- Полная карточка одного проекта (парсинг + fs). old_card — из прежнего
@@ -520,6 +533,7 @@ function M.build_card(path, old_card, dir_sizes)
   card.fs_tags = M.finder_tags(path)
   card.backups = M.find_backups(path)
   card.thumb_file = M.find_thumb(path)
+  card.thumb_user = old_card and old_card.thumb_user or nil
   card.needs_report = old_card and old_card.needs_report or false
   return card
 end
@@ -549,7 +563,7 @@ end
 
 -- Ключи настроек: scan_paths (директории проектов через ;),
 -- stems_path (расслоение на мультитреки), regions_path (расслоение
--- на регионы), thumb_style ('0' калейдоскоп / '1' иероглиф)
+-- на регионы), thumb_style ('0' калейдоскоп / '1' иероглиф / '2' навигатор)
 
 function M.get_scan_paths_str()
   return M.get_setting('scan_paths')
