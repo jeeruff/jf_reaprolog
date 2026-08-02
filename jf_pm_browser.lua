@@ -12,6 +12,7 @@
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
 local core = dofile(SCRIPT_DIR .. '/jf_pm_core.lua')
+local gallery = dofile(SCRIPT_DIR .. '/jf_pm_gallery.lua')
 
 if not reaper.ImGui_GetBuiltinPath then
   reaper.MB('Нужен ReaImGui 0.9+ (ReaPack: ReaImGui: ReaScript binding for Dear ImGui).',
@@ -190,6 +191,22 @@ local function rescan()
   for _ in pairs(state.index.projects) do n = n + 1 end
   state.status_msg = string.format('Rescan: %d проектов за %.1f c', n,
     reaper.time_precise() - t0)
+end
+
+-- Экспорт текущего вида (фильтры и сортировка учтены) в автономный HTML
+local function export_gallery()
+  local out = SCRIPT_DIR .. '/jf_pm_gallery.html'
+  local ok, err = gallery.export(core, collect_cards(), out)
+  if not ok then
+    state.status_msg = 'Галерея: ' .. tostring(err)
+    return
+  end
+  state.status_msg = 'Галерея: ' .. out
+  if reaper.CF_ShellExecute then
+    reaper.CF_ShellExecute(out)
+  else
+    reaper.ExecProcess('/usr/bin/open "' .. out .. '"', -1)
+  end
 end
 
 local function open_project(path)
@@ -679,6 +696,8 @@ local function draw_toolbar()
   if ImGui.Button(ctx, 'Rescan') then rescan() end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, 'пути') then state.show_settings = not state.show_settings end
+  ImGui.SameLine(ctx)
+  if ImGui.Button(ctx, 'галерея') then export_gallery() end
 
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
