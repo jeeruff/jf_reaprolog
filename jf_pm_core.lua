@@ -312,6 +312,14 @@ end
 -- Файловая система (только внутри Reaper)
 -- ===========================================================================
 
+function M.file_size(path)
+  local f = io.open(path, 'rb')
+  if not f then return 0 end
+  local size = f:seek('end') or 0
+  f:close()
+  return size
+end
+
 function M.file_mtime(path)
   -- js_ReaScriptAPI установлен (см. handover); формат modifiedTime проверить
   -- на железе — подстраховано разбором и unix-ts, и ISO-строки.
@@ -422,6 +430,53 @@ function M.save_index(idx)
   return true
 end
 
+-- Бэкапы проекта: *.rpp-bak / autosave / таймстампы рядом с проектом
+-- и в подпапке Backups. Форматы имён проверить на железе.
+function M.find_backups(path)
+  local dir = path:match('^(.*)[/\\]') or '.'
+  local name = path:match('([^/\\]+)$')
+  local base = name:gsub('%.[rR][pP][pP]$', '')
+  local out = {}
+  local function checkdir(d)
+    local i = 0
+    while true do
+      local fn = reaper.EnumerateFiles(d, i)
+      if not fn then break end
+      if fn ~= name and fn:sub(1, #base) == base then
+        local l = fn:lower()
+        if l:find('bak', 1, true) or l:find('autosave', 1, true)
+           or fn:match('%d%d%d%d%-%d%d%-%d%d') then
+          local full = d .. '/' .. fn
+          out[#out + 1] = {
+            file = fn, mtime = M.file_mtime(full), size = M.file_size(full),
+          }
+        end
+      end
+      i = i + 1
+    end
+  end
+  checkdir(dir)
+  checkdir(dir .. '/Backups')
+  table.sort(out, function(a, b) return (a.mtime or 0) > (b.mtime or 0) end)
+  return out
+end
+
+-- Своя картинка-тамбнейл: jf_thumb.png/jpg в папке проекта
+function M.find_thumb(path)
+  local dir = path:match('^(.*)[/\\]') or '.'
+  local i = 0
+  while true do
+    local fn = reaper.EnumerateFiles(dir, i)
+    if not fn then break end
+    local l = fn:lower()
+    if l == 'jf_thumb.png' or l == 'jf_thumb.jpg' or l == 'jf_thumb.jpeg' then
+      return dir .. '/' .. fn
+    end
+    i = i + 1
+  end
+  return nil
+end
+
 -- Полная карточка одного проекта (парсинг + fs). old_card — из прежнего
 -- индекса, оттуда переносятся index-only поля (needs_report).
 function M.build_card(path, old_card)
@@ -431,6 +486,8 @@ function M.build_card(path, old_card)
   card.name = path:match('([^/\\]+)%.[rR][pP][pP]$') or path
   card.mtime = M.file_mtime(path)
   card.fs_tags = M.finder_tags(path)
+  card.backups = M.find_backups(path)
+  card.thumb_file = M.find_thumb(path)
   card.needs_report = old_card and old_card.needs_report or false
   return card
 end
@@ -449,12 +506,24 @@ end
 -- Настройки (глобальный extstate, переживает рестарт Reaper)
 -- ===========================================================================
 
+function M.get_setting(key)
+  return reaper.GetExtState(M.EXT_SECTION, key)
+end
+
+function M.set_setting(key, val)
+  reaper.SetExtState(M.EXT_SECTION, key, val, true)
+end
+
+-- Ключи настроек: scan_paths (директории проектов через ;),
+-- stems_path (расслоение на мультитреки), regions_path (расслоение
+-- на регионы), thumb_style ('0' калейдоскоп / '1' иероглиф)
+
 function M.get_scan_paths_str()
-  return reaper.GetExtState(M.EXT_SECTION, 'scan_paths')
+  return M.get_setting('scan_paths')
 end
 
 function M.set_scan_paths_str(str)
-  reaper.SetExtState(M.EXT_SECTION, 'scan_paths', str, true)
+  M.set_setting('scan_paths', str)
 end
 
 function M.get_scan_paths()
