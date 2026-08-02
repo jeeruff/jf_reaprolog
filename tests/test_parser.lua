@@ -65,6 +65,30 @@ eq(card.render_pattern, '$project_v3', 'render pattern')
 -- items: 0+32.25 и 32.25+72.5=104.75; регионы до 96 → длительность 104.75
 eq(card.duration, 104.75, 'duration from items/regions')
 
+print('== merge_projects ==')
+-- пути в индексе абсолютные — merge тоже тестируем с абсолютным
+local cwd = io.popen('pwd'):read('*l')
+local fixture = cwd .. '/tests/fixtures/test_project.rpp'
+local merged_path = os.tmpname()
+local ok, merr = core.merge_projects({ fixture, fixture }, merged_path)
+check(ok, 'merge ok: ' .. tostring(merr))
+local mc = core.parse_rpp(merged_path)
+check(mc ~= nil, 'merged parses')
+eq(mc.track_count, 8, 'merged track count doubled')
+eq(#mc.items, 4, 'merged item count doubled')
+eq(mc.items[3].t, 5, 'follower item on shifted track')
+eq(mc.items[3].p, 104.8, 'follower item position offset (104.75 → 0.1)')
+eq(mc.duration, 209.5, 'merged duration is sum')
+-- 3 базовых + 3 сдвинутых + 2 региона-проекта
+eq(#mc.regions, 8, 'merged regions: base + follower + per-project spans')
+local mf = io.open(merged_path, 'rb')
+local mtxt = mf:read('*a') mf:close()
+check(mtxt:find('FILE "tests/fixtures/audio/', 1, true) == nil,
+  'no relative FILE paths left')
+check(mtxt:find('/tests/fixtures/audio/flute_main_take3.wav', 1, true) ~= nil,
+  'FILE paths absolutized')
+os.remove(merged_path)
+
 -- карта айтемов для тамбнейла-навигатора (позиции округлены до 0.1)
 eq(#card.items, 2, 'item map count')
 eq(card.items[1].t, 1, 'item 1 on track 1')

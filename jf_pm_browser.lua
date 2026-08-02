@@ -5,9 +5,11 @@
 -- парсингом .rpp как текста — проекты не открываются.
 --
 -- Эргономика: без слайдеров и выпадашек — всё чипами в ширину, не в глубину.
--- Vim-навигация: h/j/k/l — фокус по карточкам, Enter — раскрыть (в таймлайне —
--- открыть), o — открыть проект, / — в поле тега, Esc — свернуть/сброс,
--- g/G — в начало/конец.
+-- Vim-навигация: h/j/k/l — фокус, Enter — раскрыть (вне сетки — открыть),
+-- o — открыть, x — в выборку (порядок = порядок merge), p — закрепить,
+-- Shift+D — удалить в Корзину, m — merge выборки, / — в поле fzf,
+-- g/G — в начало/конец, Esc — свернуть → сброс выборки → сброс фокуса.
+-- Канбан: Shift+H/L — перенести карточку в соседний статус, drag&drop мышью.
 
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
@@ -21,6 +23,23 @@ if not reaper.ImGui_GetBuiltinPath then
 end
 package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua;' .. package.path
 local ImGui = require 'imgui' '0.9'
+
+-- ===========================================================================
+-- ТЕГИ: правь список прямо здесь. { 'имя', 0xRRGGBBAA }.
+-- Тег не из списка тоже работает — цвет получит от хеша имени.
+-- ===========================================================================
+local TAGS = {
+  { 'флейта',      0x7BB8D9FF },
+  { 'dungeon',     0x9A7BD9FF },
+  { 'EP-кандидат', 0xD9B96CFF },
+  { 'амбиент',     0x7BD9A8FF },
+  { 'бит',         0xD97B7BFF },
+  { 'лайв',        0xD9A87BFF },
+  { 'кавер',       0x7BD9D0FF },
+  { 'скетч',       0x8A8F93FF },
+}
+local TAG_COLOR_MAP = {}
+for _, e in ipairs(TAGS) do TAG_COLOR_MAP[e[1]] = e[2] end
 
 local ctx = ImGui.CreateContext('JF PM')
 local font = ImGui.CreateFont('sans-serif', 14)
@@ -36,9 +55,11 @@ local state = {
   stems_path = core.get_setting('stems_path'),
   regions_path = core.get_setting('regions_path'),
   thumb_style = tonumber(core.get_setting('thumb_style')) or 0, -- 0 калейдоскоп, 1 иероглиф
-  view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь
+  view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
-  filter_tag = '',
+  filter_text = '',         -- fzf: имя, теги, треки
+  sel = {},                 -- упорядоченный список путей — порядок = порядок merge
+  kb_col = 0, kb_row = 0,   -- фокус в канбане
   sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя, 5 размер
   sort_rev = false,         -- клик по активному чипу переворачивает порядок
   expanded = nil,           -- path раскрытой карточки
@@ -55,7 +76,7 @@ for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'имя', 'размер' }
 -- естественное направление: true = по убыванию (новое/большое сверху)
 local SORT_DESC_NATURAL = { true, false, true, false, true }
-local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь' }
+local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
 -- радикалы Канси для тамбнейлов-иероглифов
 local RADICALS = {
@@ -114,13 +135,85 @@ local function all_tags(card, meta)
   for _, t in ipairs(card.fs_tags or {}) do
     if not seen[t] then seen[t] = true; out[#out + 1] = t end
   end
+  for _, t in ipairs(card.tags_extra or {}) do
+    if not seen[t] then seen[t] = true; out[#out + 1] = t end
+  end
   return out
+end
+
+local function tag_color(t)
+  return TAG_COLOR_MAP[t] or hash_color(fnv1a(t) % 360, 0.4, 0.8)
+end
+
+-- ---------------------------------------------------------------------------
+-- fzf: подпоследовательность по имени, тегам и трекам всех проектов.
+-- string.lower не знает кириллицу — свой utf8-lower для А-Я/Ё.
+
+local function ulower(s)
+  return (s:gsub('[\194-\244][\128-\191]*', function(ch)
+    if #ch ~= 2 then return ch end
+    local b1, b2 = ch:byte(1, 2)
+    local cp = (b1 - 0xC0) * 64 + (b2 - 0x80)
+    if cp >= 0x410 and cp <= 0x42F then cp = cp + 0x20      -- А-Я → а-я
+    elseif cp == 0x401 then cp = 0x451                       -- Ё → ё
+    else return ch end
+    return string.char(0xC0 + math.floor(cp / 64), 0x80 + cp % 64)
+  end)):lower()
+end
+
+local function to_codes(s)
+  local t = {}
+  for _, c in utf8.codes(s) do t[#t + 1] = c end
+  return t
+end
+
+local function fuzzy_match(needle_codes, hay)
+  if #needle_codes == 0 then return true end
+  local k = 1
+  for _, c in utf8.codes(hay) do
+    if c == needle_codes[k] then
+      k = k + 1
+      if k > #needle_codes then return true end
+    end
+  end
+  return false
+end
+
+-- кэш поисковой строки на карточку (не пересобирать каждый кадр);
+-- инвалидация: rescan и правка тегов
+local search_cache = {}
+local function search_text(card, meta)
+  local s = search_cache[card.path]
+  if not s then
+    s = ulower(card.name .. ' ' .. table.concat(all_tags(card, meta), ' ')
+      .. ' ' .. table.concat(card.track_names or {}, ' '))
+    search_cache[card.path] = s
+  end
+  return s
+end
+
+-- ---------------------------------------------------------------------------
+-- Выбор (порядок выделения = порядок merge)
+
+local function sel_index(path)
+  for i, p in ipairs(state.sel) do if p == path then return i end end
+  return nil
+end
+
+local function toggle_select(path)
+  local i = sel_index(path)
+  if i then table.remove(state.sel, i) else state.sel[#state.sel + 1] = path end
 end
 
 -- ---------------------------------------------------------------------------
 
 local function collect_cards()
   local cards = {}
+  local needle_codes
+  if state.filter_text ~= '' then
+    local okc, codes = pcall(to_codes, ulower(state.filter_text))
+    needle_codes = okc and codes or nil
+  end
   for _, card in pairs(state.index.projects) do
     local meta = core.card_meta(card)
     local ok = true
@@ -132,12 +225,9 @@ local function collect_cards()
     elseif f >= 3 then
       ok = meta.status == core.STATUSES[f - 2]
     end
-    if ok and state.filter_tag ~= '' then
-      local needle = state.filter_tag:lower()
-      ok = false
-      for _, t in ipairs(all_tags(card, meta)) do
-        if t:lower():find(needle, 1, true) then ok = true break end
-      end
+    if ok and needle_codes then
+      local okm, m = pcall(fuzzy_match, needle_codes, search_text(card, meta))
+      ok = okm and m
     end
     if ok then cards[#cards + 1] = { card = card, meta = meta } end
   end
@@ -167,7 +257,10 @@ local function collect_cards()
     return a.card.name < b.card.name
   end
   table.sort(cards, function(a, b)
-    -- проекты без отчёта всплывают наверх при любой сортировке
+    -- закреплённые — всегда сверху, затем проекты без отчёта
+    local pa = a.card.pinned and 1 or 0
+    local pb = b.card.pinned and 1 or 0
+    if pa ~= pb then return pa > pb end
     local na = a.card.needs_report and 1 or 0
     local nb = b.card.needs_report and 1 or 0
     if na ~= nb then return na > nb end
@@ -180,13 +273,14 @@ end
 local function rescan()
   local paths = core.get_scan_paths()
   if #paths == 0 then
-    state.status_msg = 'Укажи директории проектов (кнопка «пути»)'
+    state.status_msg = 'Укажи директории проектов (кнопка «настройки»)'
     state.show_settings = true
     return
   end
   local t0 = reaper.time_precise()
   state.index = core.build_index(paths, state.index)
   core.save_index(state.index)
+  search_cache = {}
   local n = 0
   for _ in pairs(state.index.projects) do n = n + 1 end
   state.status_msg = string.format('Rescan: %d проектов за %.1f c', n,
@@ -212,6 +306,84 @@ end
 local function open_project(path)
   reaper.Main_OnCommand(40859, 0) -- New project tab
   reaper.Main_openProject(path)
+end
+
+-- Статус из канбана: живёт в индексе, пока проект не открыт и отчёт
+-- не перезаписал STATUS в .rpp (см. build_card).
+local function set_status(card, status)
+  if status == '' then
+    card.status_over, card.status_over_base = nil, nil
+  else
+    card.status_over = status
+    card.status_over_base = (card.ext or {}).STATUS or ''
+  end
+  core.save_index(state.index)
+end
+
+local function toggle_pin(card)
+  card.pinned = not card.pinned or nil
+  core.save_index(state.index)
+end
+
+-- Удаление в Корзину через Finder (с возможностью «вернуть обратно»).
+-- Папку целиком — только если это не корень сканирования.
+local function delete_project(card)
+  local dir = card.path:match('^(.*)[/\\]')
+  local roots = {}
+  for _, p in ipairs(core.get_scan_paths()) do roots[(p:gsub('/+$', ''))] = true end
+  local dir_ok = dir and not roots[dir]
+  local r = reaper.MB(
+    'Удалить «' .. card.name .. '» в Корзину?\n\n' ..
+    (dir_ok and 'Да — папку проекта целиком\nНет — только .rpp'
+            or 'Да/Нет — только .rpp (папка — корень сканирования)'),
+    'JF PM — удаление', 3)
+  if r ~= 6 and r ~= 7 then return end
+  local target = (r == 6 and dir_ok) and dir or card.path
+
+  local scpt = os.tmpname()
+  local f = io.open(scpt, 'wb')
+  if not f then state.status_msg = 'Удаление: tmp недоступен' return end
+  f:write('tell application "Finder" to delete POSIX file "' .. target .. '"')
+  f:close()
+  reaper.ExecProcess('/usr/bin/osascript "' .. scpt .. '"', 15000)
+  os.remove(scpt)
+
+  local still = io.open(card.path, 'rb')
+  if still then
+    still:close()
+    state.status_msg = 'Удаление не удалось (Finder)'
+    return
+  end
+  for p in pairs(state.index.projects) do
+    if p == card.path or (target == dir and p:sub(1, #dir + 1) == dir .. '/') then
+      state.index.projects[p] = nil
+    end
+  end
+  local i = sel_index(card.path)
+  if i then table.remove(state.sel, i) end
+  if state.expanded == card.path then state.expanded = nil end
+  state.focus = 0
+  core.save_index(state.index)
+  state.status_msg = 'В Корзине: ' .. target
+end
+
+-- Merge: выделенные соединяются последовательно в порядке выделения.
+local function merge_selected()
+  if #state.sel < 2 then return end
+  local dir = state.sel[1]:match('^(.*)[/\\]')
+  local out = dir .. '/merge_' .. os.date('%y%m%d_%H%M') .. '.rpp'
+  local ok, err = core.merge_projects(state.sel, out)
+  if not ok then
+    state.status_msg = 'Merge: ' .. tostring(err)
+    return
+  end
+  local card = core.build_card(out, nil)
+  if card then
+    state.index.projects[out] = card
+    core.save_index(state.index)
+  end
+  state.sel = {}
+  state.status_msg = 'Merge → ' .. out
 end
 
 -- ---------------------------------------------------------------------------
@@ -254,6 +426,16 @@ local function draw_thumb(card, size)
       local col = hash_color((h + it.t * 53) % 360, 0.5, 0.85)
       ImGui.DrawList_AddRectFilled(dl, ix0, iy0 + 0.5,
         ix1, iy0 + math.max(1, row - 1) + 0.5, col)
+    end
+    -- полоса регионов внизу: цвет от имени региона, «intro» узнаваем
+    -- одинаково во всех проектах
+    for _, r in ipairs(card.regions or {}) do
+      local rx0 = x0 + math.max(r.pos / card.duration, 0) * size
+      local rx1 = x0 + math.min(r.fin / card.duration, 1) * size
+      if rx1 - rx0 < 1 then rx1 = rx0 + 1 end
+      local rh = fnv1a(r.name ~= '' and r.name or '?')
+      ImGui.DrawList_AddRectFilled(dl, rx0, y0 + size - 4, rx1, y0 + size,
+        hash_color(rh % 360, 0.6, 0.9))
     end
   elseif state.thumb_style == 1 then
     -- радикал, детерминированный от пути проекта
@@ -342,8 +524,52 @@ local function draw_card_details(card, meta)
   if card.render_file ~= '' then
     ImGui.TextDisabled(ctx, 'Рендер: ' .. card.render_file)
   end
+  -- назначение тегов: клик по чипу включает/выключает (хранится в индексе);
+  -- теги из .rpp и Finder отсюда не снимаются
+  ImGui.TextDisabled(ctx, 'Теги:')
+  local cur = {}
+  for _, t in ipairs(all_tags(card, meta)) do cur[t] = true end
+  for i, e in ipairs(TAGS) do
+    local t = e[1]
+    local label = (cur[t] and '#' or '·') .. t
+    ImGui.SameLine(ctx)
+    if ImGui.CalcTextSize(ctx, label) + 12 > ImGui.GetContentRegionAvail(ctx) then
+      ImGui.NewLine(ctx)
+    end
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, cur[t] and e[2] or 0x9A9A9AFF)
+    if ImGui.SmallButton(ctx, label .. '###tag' .. i) then
+      local extra = card.tags_extra or {}
+      local found
+      for j, x in ipairs(extra) do if x == t then found = j end end
+      if found then
+        table.remove(extra, found)
+      elseif not cur[t] then
+        extra[#extra + 1] = t
+      else
+        state.status_msg = 'Тег из .rpp/Finder — снимай в проекте'
+      end
+      card.tags_extra = #extra > 0 and extra or nil
+      search_cache[card.path] = nil
+      core.save_index(state.index)
+    end
+    ImGui.PopStyleColor(ctx)
+  end
+
   ImGui.TextDisabled(ctx, card.path)
   if ImGui.SmallButton(ctx, 'свернуть') then state.expanded = nil end
+  ImGui.SameLine(ctx)
+  if ImGui.SmallButton(ctx, card.pinned and 'открепить' or 'закрепить') then
+    toggle_pin(card)
+  end
+  ImGui.SameLine(ctx)
+  if ImGui.SmallButton(ctx, sel_index(card.path) and 'снять выбор' or 'выбрать') then
+    toggle_select(card.path)
+  end
+  ImGui.SameLine(ctx)
+  if ImGui.SmallButton(ctx, 'удалить…') then
+    delete_project(card)
+    return
+  end
   ImGui.SameLine(ctx)
   if ImGui.SmallButton(ctx, 'превью…') then
     -- нативный Finder-диалог, без зависимостей от js_ReaScriptAPI
@@ -367,6 +593,7 @@ local function draw_card(entry, i, card_w)
   local card, meta = entry.card, entry.meta
   local expanded = state.expanded == card.path
   local focused = state.focus == i
+  local si = sel_index(card.path)
   local h = expanded and 0 or 138  -- 0 = авто-высота по контенту
 
   local child_flags = ImGui.ChildFlags_Border
@@ -375,12 +602,23 @@ local function draw_card(entry, i, card_w)
   end
   if focused then
     ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xE8E8E8FF)
+  elseif si then
+    ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
   end
   if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags) then
     draw_thumb(card, 64)
     ImGui.SameLine(ctx)
     ImGui.BeginGroup(ctx)
     ImGui.Text(ctx, trunc(card.name, 22))
+    if card.pinned then
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, 0xD9B96CFF, '●') -- закреплён
+    end
+    if si then
+      ImGui.SameLine(ctx)
+      -- номер в выборке = позиция в merge
+      ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
+    end
 
     local color = core.STATUS_COLORS[meta.status]
     local stage = core.PIPELINE[meta.status]
@@ -413,28 +651,43 @@ local function draw_card(entry, i, card_w)
       ImGui.TextColored(ctx, 0xD9B96CFF, '→ ' .. next_action)
     end
 
+    -- теги цветными чипами с ручным переносом по ширине карточки
     local tags = all_tags(card, meta)
-    if #tags > 0 then
-      ImGui.TextWrapped(ctx, '# ' .. table.concat(tags, '  # '))
+    for ti, t in ipairs(tags) do
+      local label = '#' .. t
+      if ti > 1 then
+        ImGui.SameLine(ctx)
+        if ImGui.CalcTextSize(ctx, label) > ImGui.GetContentRegionAvail(ctx) then
+          ImGui.NewLine(ctx)
+        end
+      end
+      ImGui.TextColored(ctx, tag_color(t), label)
     end
 
     if expanded then draw_card_details(card, meta) end
     ImGui.EndChild(ctx)
   end
-  if focused then
+  if focused or si then
     ImGui.PopStyleColor(ctx)
-    if state.scroll_to_focus then
-      ImGui.SetScrollHereY(ctx, 0.5)
-      state.scroll_to_focus = false
-    end
+  end
+  if focused and state.scroll_to_focus then
+    ImGui.SetScrollHereY(ctx, 0.5)
+    state.scroll_to_focus = false
   end
 
   if ImGui.IsItemHovered(ctx) then
+    local mods = ImGui.GetKeyMods(ctx)
+    local select_click = mods & ImGui.Mod_Ctrl ~= 0 or mods & ImGui.Mod_Super ~= 0
     if ImGui.IsMouseDoubleClicked(ctx, ImGui.MouseButton_Left) then
       open_project(card.path)
-    elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) and not expanded then
-      state.expanded = card.path
-      state.focus = i
+    elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) then
+      if select_click then
+        toggle_select(card.path) -- cmd/ctrl+клик: в выборку для merge
+        state.focus = i
+      elseif not expanded then
+        state.expanded = card.path
+        state.focus = i
+      end
     end
   end
 end
@@ -613,6 +866,92 @@ local function draw_calendar(cards)
 end
 
 -- ---------------------------------------------------------------------------
+-- Канбан: колонка на статус, перенос карточки — drag&drop или Shift+H/L.
+-- Статус пишется в индекс (status_over), .rpp не трогается.
+
+local function draw_kanban(cards)
+  local cols = { { status = '', label = '—' } }
+  for _, s in ipairs(core.STATUSES) do
+    cols[#cols + 1] = { status = s, label = s }
+  end
+  local by_status = {}
+  for _, c in ipairs(cols) do c.entries = {}; by_status[c.status] = c end
+  for _, e in ipairs(cards) do
+    local c = by_status[e.meta.status] or by_status['']
+    c.entries[#c.entries + 1] = e
+  end
+  state.kb_cols = cols -- для vim-навигации в handle_keys
+
+  local col_w = 200
+  for ci, c in ipairs(cols) do
+    if ci > 1 then ImGui.SameLine(ctx) end
+    if ImGui.BeginChild(ctx, '##kb' .. ci, col_w, 0, ImGui.ChildFlags_Border) then
+      ImGui.TextColored(ctx, core.STATUS_COLORS[c.status] or 0x8A8A8AFF,
+        string.format('%s (%d)', c.label, #c.entries))
+      ImGui.Separator(ctx)
+      for ei, e in ipairs(c.entries) do
+        local card = e.card
+        local focused = state.kb_col == ci and state.kb_row == ei
+        local si = sel_index(card.path)
+        if focused then
+          ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xE8E8E8FF)
+        elseif si then
+          ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
+        end
+        if ImGui.BeginChild(ctx, '##kbc' .. card.path, col_w - 16, 58,
+            ImGui.ChildFlags_Border) then
+          ImGui.Text(ctx, trunc(card.name, 18))
+          if card.pinned then
+            ImGui.SameLine(ctx)
+            ImGui.TextColored(ctx, 0xD9B96CFF, '●')
+          end
+          if si then
+            ImGui.SameLine(ctx)
+            ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
+          end
+          ImGui.TextDisabled(ctx, fmt_date(card.mtime))
+          local na = e.meta.report_todo:match('^[^\n]+')
+          if na then
+            ImGui.TextColored(ctx, 0xD9B96CFF, trunc('→ ' .. na, 24))
+          end
+          ImGui.EndChild(ctx)
+        end
+        if focused or si then ImGui.PopStyleColor(ctx) end
+        if focused and state.scroll_to_focus then
+          ImGui.SetScrollHereY(ctx, 0.5)
+          state.scroll_to_focus = false
+        end
+        if ImGui.BeginDragDropSource(ctx) then
+          ImGui.SetDragDropPayload(ctx, 'JF_PM_CARD', card.path)
+          ImGui.Text(ctx, card.name)
+          ImGui.EndDragDropSource(ctx)
+        end
+        if ImGui.IsItemHovered(ctx) then
+          local mods = ImGui.GetKeyMods(ctx)
+          if ImGui.IsMouseDoubleClicked(ctx, ImGui.MouseButton_Left) then
+            open_project(card.path)
+          elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) then
+            if mods & ImGui.Mod_Ctrl ~= 0 or mods & ImGui.Mod_Super ~= 0 then
+              toggle_select(card.path)
+            end
+            state.kb_col, state.kb_row = ci, ei
+          end
+        end
+      end
+      ImGui.EndChild(ctx)
+    end
+    if ImGui.BeginDragDropTarget(ctx) then
+      local ok, payload = ImGui.AcceptDragDropPayload(ctx, 'JF_PM_CARD')
+      if ok and payload then
+        local card = state.index.projects[payload]
+        if card then set_status(card, c.status) end
+      end
+      ImGui.EndDragDropTarget(ctx)
+    end
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Тулбар и настройки: всё чипами, без выпадашек
 
 local function chip(label, active)
@@ -695,9 +1034,23 @@ end
 local function draw_toolbar()
   if ImGui.Button(ctx, 'Rescan') then rescan() end
   ImGui.SameLine(ctx)
-  if ImGui.Button(ctx, 'пути') then state.show_settings = not state.show_settings end
+  if ImGui.Button(ctx, 'настройки') then
+    state.show_settings = not state.show_settings
+  end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, 'галерея') then export_gallery() end
+
+  -- блок выборки: порядок номеров = порядок склейки
+  if #state.sel > 0 then
+    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, 0xD9B96CFF, string.format('выбрано: %d', #state.sel))
+    if #state.sel >= 2 then
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'merge') then merge_selected() end
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, 'сброс') then state.sel = {} end
+  end
 
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
@@ -769,8 +1122,9 @@ local function draw_toolbar()
     ImGui.SetKeyboardFocusHere(ctx)
     state.focus_tag_input = false
   end
-  local changed, val = ImGui.InputTextWithHint(ctx, '##tag', 'тег… ( / )', state.filter_tag)
-  if changed then state.filter_tag = val end
+  local changed, val = ImGui.InputTextWithHint(ctx, '##tag',
+    'fzf: имя, теги, треки ( / )', state.filter_text)
+  if changed then state.filter_text = val end
 end
 
 -- ---------------------------------------------------------------------------
@@ -781,53 +1135,96 @@ local function handle_keys(cards, cols)
   if not ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows) then
     return
   end
-  local n = #cards
-  if n == 0 then return end
-  local moved = false
-  local step_h = state.view == 0 and 1 or 0
-  local step_v = state.view == 0 and cols or 1
+  local shift = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
+  local entry
 
-  local function move(delta)
-    local f = state.focus
-    if f == 0 then
-      f = 1
-    else
-      f = f + delta
-      if f < 1 then f = 1 end
-      if f > n then f = n end
+  if state.view == 3 then
+    -- канбан: h/l — колонки, j/k — внутри, Shift+H/L — сменить статус
+    local kcols = state.kb_cols or {}
+    if #kcols == 0 then return end
+    local ci, ri = state.kb_col, state.kb_row
+    local moved = false
+    local function clamp()
+      if ci < 1 then ci = 1 end
+      if ci > #kcols then ci = #kcols end
+      local nn = #kcols[ci].entries
+      if ri > nn then ri = nn end
+      if ri < 1 then ri = 1 end
     end
-    state.focus = f
-    moved = true
-  end
-
-  if ImGui.IsKeyPressed(ctx, ImGui.Key_J) then move(step_v) end
-  if ImGui.IsKeyPressed(ctx, ImGui.Key_K) then move(-step_v) end
-  if step_h > 0 then
-    if ImGui.IsKeyPressed(ctx, ImGui.Key_L) then move(step_h) end
-    if ImGui.IsKeyPressed(ctx, ImGui.Key_H) then move(-step_h) end
-  end
-  if ImGui.IsKeyPressed(ctx, ImGui.Key_G) then
-    if ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0 then
-      state.focus = n
+    if ci == 0 then ci, ri = 1, 1 clamp() end
+    local cur = kcols[ci] and kcols[ci].entries[ri]
+    if shift and cur then
+      local target
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_L) then target = ci + 1 end
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_H) then target = ci - 1 end
+      if target and kcols[target] then
+        set_status(cur.card, kcols[target].status)
+        ci = target
+        ri = #kcols[target].entries + 1 -- карточка встанет в конец колонки
+        moved = true
+      end
     else
-      state.focus = 1
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_L) then ci = ci + 1 moved = true end
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_H) then ci = ci - 1 moved = true end
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_J) then ri = ri + 1 moved = true end
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_K) then ri = ri - 1 moved = true end
     end
-    moved = true
-  end
-  if moved then state.scroll_to_focus = true end
+    clamp()
+    state.kb_col, state.kb_row = ci, ri
+    if moved then state.scroll_to_focus = true end
+    entry = kcols[ci] and kcols[ci].entries[ri]
+  else
+    local n = #cards
+    if n == 0 then return end
+    local moved = false
+    local step_h = state.view == 0 and 1 or 0
+    local step_v = state.view == 0 and cols or 1
 
-  local entry = state.focus > 0 and cards[state.focus] or nil
+    local function move(delta)
+      local f = state.focus
+      if f == 0 then
+        f = 1
+      else
+        f = f + delta
+        if f < 1 then f = 1 end
+        if f > n then f = n end
+      end
+      state.focus = f
+      moved = true
+    end
+
+    if ImGui.IsKeyPressed(ctx, ImGui.Key_J) then move(step_v) end
+    if ImGui.IsKeyPressed(ctx, ImGui.Key_K) then move(-step_v) end
+    if step_h > 0 then
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_L) then move(step_h) end
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_H) then move(-step_h) end
+    end
+    if ImGui.IsKeyPressed(ctx, ImGui.Key_G) then
+      state.focus = shift and n or 1
+      moved = true
+    end
+    if moved then state.scroll_to_focus = true end
+    entry = state.focus > 0 and cards[state.focus] or nil
+  end
+
   if entry then
+    local path = entry.card.path
     if ImGui.IsKeyPressed(ctx, ImGui.Key_Enter) then
       if state.view == 0 then
-        state.expanded = state.expanded ~= entry.card.path and entry.card.path or nil
+        state.expanded = state.expanded ~= path and path or nil
       else
-        open_project(entry.card.path)
+        open_project(path)
       end
     end
-    if ImGui.IsKeyPressed(ctx, ImGui.Key_O) then
-      open_project(entry.card.path)
+    if ImGui.IsKeyPressed(ctx, ImGui.Key_O) then open_project(path) end
+    if ImGui.IsKeyPressed(ctx, ImGui.Key_X) then toggle_select(path) end
+    if ImGui.IsKeyPressed(ctx, ImGui.Key_P) then toggle_pin(entry.card) end
+    if shift and ImGui.IsKeyPressed(ctx, ImGui.Key_D) then
+      delete_project(entry.card)
     end
+  end
+  if ImGui.IsKeyPressed(ctx, ImGui.Key_M) and #state.sel >= 2 then
+    merge_selected()
   end
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Slash) then
     state.focus_tag_input = true
@@ -835,8 +1232,11 @@ local function handle_keys(cards, cols)
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
     if state.expanded then
       state.expanded = nil
+    elseif #state.sel > 0 then
+      state.sel = {}
     else
       state.focus = 0
+      state.kb_col, state.kb_row = 0, 0
     end
   end
 end
@@ -854,14 +1254,22 @@ local function loop()
 
     local cards = collect_cards()
     local cols = 1
-    if state.view == 0 then
-      cols = draw_grid(cards)
-    elseif state.view == 1 then
-      draw_timeline(cards)
-    else
-      draw_calendar(cards)
+    -- контент в своём child: тулбар и сортировка не скроллятся
+    local wflags = state.view == 3
+      and ImGui.WindowFlags_HorizontalScrollbar or ImGui.WindowFlags_None
+    if ImGui.BeginChild(ctx, '##content', 0, 0, ImGui.ChildFlags_None, wflags) then
+      if state.view == 0 then
+        cols = draw_grid(cards)
+      elseif state.view == 1 then
+        draw_timeline(cards)
+      elseif state.view == 2 then
+        draw_calendar(cards)
+      else
+        draw_kanban(cards)
+      end
+      handle_keys(cards, cols)
+      ImGui.EndChild(ctx)
     end
-    handle_keys(cards, cols)
     ImGui.End(ctx)
   end
   ImGui.PopFont(ctx)

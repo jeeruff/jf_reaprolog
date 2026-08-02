@@ -104,6 +104,14 @@ function drawNav(canvas, card, size) {
     g.fillStyle = hsv(((card.h + it.t * 53) % 360) / 360, 0.5, 0.85);
     g.fillRect(x0, (it.t - 1) * row + 0.5, x1 - x0, Math.max(1, row - 1));
   }
+  // полоса регионов внизу; hue (r.h) посчитан в Lua от имени региона
+  for (const r of card.regions || []) {
+    let x0 = Math.max(r.p / card.dur, 0) * size;
+    let x1 = Math.min(r.f / card.dur, 1) * size;
+    if (x1 - x0 < 1) x1 = x0 + 1;
+    g.fillStyle = hsv((r.h % 360) / 360, 0.6, 0.9);
+    g.fillRect(x0, size - 4, x1 - x0, 4);
+  }
 }
 
 const fmtDur = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
@@ -162,6 +170,16 @@ function M.export(core, entries, out_path)
       size = c.dir_size or 0,
       n_items = #(c.items or {}),
       items = c.items or {},
+      regions = (function()
+        local out = {}
+        for _, r in ipairs(c.regions or {}) do
+          out[#out + 1] = {
+            p = r.pos, f = r.fin,
+            h = fnv1a(r.name ~= '' and r.name or '?'),
+          }
+        end
+        return out
+      end)(),
       status = meta.status,
       scol = scol and string.format('#%06X', scol >> 8) or nil,
       next = meta.report_todo:match('^[^\n]+'),

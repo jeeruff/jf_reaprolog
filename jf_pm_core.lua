@@ -535,6 +535,16 @@ function M.build_card(path, old_card, dir_sizes)
   card.thumb_file = M.find_thumb(path)
   card.thumb_user = old_card and old_card.thumb_user or nil
   card.needs_report = old_card and old_card.needs_report or false
+  if old_card then
+    -- index-only поля: закреп, теги из браузера, статус из канбана
+    card.pinned = old_card.pinned
+    card.tags_extra = old_card.tags_extra
+    if old_card.status_over
+       and (old_card.status_over_base or '') == (card.ext.STATUS or '') then
+      card.status_over = old_card.status_over
+      card.status_over_base = old_card.status_over_base
+    end
+  end
   return card
 end
 
@@ -547,6 +557,129 @@ function M.build_index(paths, old_index)
     if card then idx.projects[p] = card end
   end
   return idx
+end
+
+-- ===========================================================================
+-- Слияние проектов (текстовый уровень, проекты не открываются)
+-- ===========================================================================
+-- Треки всех проектов складываются в один; айтемы и маркеры последующих
+-- сдвигаются на суммарную длительность предыдущих, каждый проект получает
+-- регион со своим именем. FILE-пути становятся абсолютными (слитый .rpp
+-- живёт в другой папке), AUXRECV-индексы смещаются на число треков до них.
+-- Ограничения: точки огибающих и BEAT-привязка не сдвигаются, темп — из
+-- первого проекта, GUID-ы не перегенерируются (self-merge — на свой риск).
+
+local function q_name(name)
+  if not name:find('"') then return '"' .. name .. '"'
+  elseif not name:find("'") then return "'" .. name .. "'"
+  else return '`' .. name .. '`' end
+end
+
+local function abs_file_line(line, dir)
+  local head, q, path, tail = line:match("^(%s*FILE%s+)([\"'`])(.-)%2(.*)$")
+  if not head then return line end
+  if path:sub(1, 1) ~= '/' and path:sub(2, 2) ~= ':' then
+    path = dir .. '/' .. path
+  end
+  return head .. q .. path .. q .. tail
+end
+
+local function read_lines(p)
+  local f = io.open(p, 'rb')
+  if not f then return nil end
+  local out = {}
+  for l in f:lines() do out[#out + 1] = l end
+  f:close()
+  return out
+end
+
+-- paths — упорядоченный список .rpp, out_path — куда писать результат.
+function M.merge_projects(paths, out_path)
+  if #paths < 2 then return nil, 'нужно минимум два проекта' end
+  local cards, durs = {}, {}
+  for i, p in ipairs(paths) do
+    local card, err = M.parse_rpp(p)
+    if not card then return nil, err end
+    cards[i], durs[i] = card, card.duration or 0
+  end
+
+  local base_dir = paths[1]:match('^(.*)[/\\]') or '.'
+  local base = read_lines(paths[1])
+  if not base then return nil, 'cannot read ' .. paths[1] end
+  local close_at
+  for i = #base, 1, -1 do
+    if base[i]:match('^%s*>%s*$') then close_at = i break end
+  end
+  if not close_at then return nil, 'нет закрывающего > : ' .. paths[1] end
+
+  local out_lines = {}
+  for i = 1, close_at - 1 do
+    out_lines[#out_lines + 1] = abs_file_line(base[i], base_dir)
+  end
+
+  local offset = durs[1]
+  local track_offset = cards[1].track_count or 0
+  local extra_markers = {}
+
+  for pi = 2, #paths do
+    local dir = paths[pi]:match('^(.*)[/\\]') or '.'
+    local lines = read_lines(paths[pi])
+    if not lines then return nil, 'cannot read ' .. paths[pi] end
+    local depth, in_track = 0, false
+    for _, line in ipairs(lines) do
+      local s = line:match('^%s*(.-)%s*$')
+      local opened = s:sub(1, 1) == '<'
+      if opened then
+        depth = depth + 1
+        if depth == 2 and s:match('^<TRACK') then in_track = true end
+      end
+      if in_track then
+        local l2 = abs_file_line(line, dir)
+        local head, num, tail = l2:match('^(%s*POSITION%s+)(%-?[%d%.]+)(.*)$')
+        if head then
+          l2 = head .. string.format('%.10g', tonumber(num) + offset) .. tail
+        else
+          local ah, an, at = l2:match('^(%s*AUXRECV%s+)(%d+)(.*)$')
+          if ah then l2 = ah .. tostring(tonumber(an) + track_offset) .. at end
+        end
+        out_lines[#out_lines + 1] = l2
+      elseif depth == 1 and s:sub(1, 7) == 'MARKER ' then
+        local mh, id, sp, pos, mt =
+          line:match('^(%s*MARKER%s+)(%d+)(%s+)(%-?[%d%.]+)(.*)$')
+        if mh then
+          extra_markers[#extra_markers + 1] = mh .. (tonumber(id) + 1000 * pi)
+            .. sp .. string.format('%.10g', tonumber(pos) + offset) .. mt
+        end
+      end
+      if s == '>' then
+        depth = depth - 1
+        if depth == 1 then in_track = false end
+      end
+    end
+    offset = offset + durs[pi]
+    track_offset = track_offset + (cards[pi].track_count or 0)
+  end
+
+  -- регион на каждый исходный проект — карта формы слитого файла
+  local start = 0
+  for i, p in ipairs(paths) do
+    local name = p:match('([^/\\]+)%.[rR][pP][pP]$') or p
+    local id = 900000 + i
+    extra_markers[#extra_markers + 1] =
+      string.format('  MARKER %d %.10g %s 1', id, start, q_name(name))
+    extra_markers[#extra_markers + 1] =
+      string.format('  MARKER %d %.10g "" 1', id, start + durs[i])
+    start = start + durs[i]
+  end
+
+  for _, m in ipairs(extra_markers) do out_lines[#out_lines + 1] = m end
+  out_lines[#out_lines + 1] = '>'
+
+  local f, err = io.open(out_path, 'wb')
+  if not f then return nil, err end
+  f:write(table.concat(out_lines, '\n'), '\n')
+  f:close()
+  return true
 end
 
 -- ===========================================================================
@@ -591,7 +724,9 @@ function M.card_meta(card)
     if t ~= '' then tags[#tags + 1] = t end
   end
   return {
-    status = ext.STATUS or '',
+    -- status_over — решение из канбана (индекс), пока проект не открыт;
+    -- сбрасывается в build_card, если STATUS в .rpp изменился после него
+    status = card.status_over or ext.STATUS or '',
     desc = ext.DESC and M.decode_ml(ext.DESC) or '',
     tags = tags,
     report_done = ext.REPORT_DONE and M.decode_ml(ext.REPORT_DONE) or '',
