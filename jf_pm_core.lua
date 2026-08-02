@@ -320,6 +320,30 @@ function M.file_size(path)
   return size
 end
 
+-- Рекурсивный размер папки (аудио, рендеры, бэкапы). Сабдиры собираются
+-- в список до рекурсии: EnumerateFiles/EnumerateSubdirectories кэшируют
+-- по одной директории, интерливинг сбрасывал бы кэш.
+function M.dir_size(dir)
+  local total, subs, i = 0, {}, 0
+  while true do
+    local fn = reaper.EnumerateFiles(dir, i)
+    if not fn then break end
+    total = total + M.file_size(dir .. '/' .. fn)
+    i = i + 1
+  end
+  i = 0
+  while true do
+    local sub = reaper.EnumerateSubdirectories(dir, i)
+    if not sub then break end
+    subs[#subs + 1] = sub
+    i = i + 1
+  end
+  for _, sub in ipairs(subs) do
+    total = total + M.dir_size(dir .. '/' .. sub)
+  end
+  return total
+end
+
 function M.file_mtime(path)
   -- js_ReaScriptAPI установлен (см. handover); формат modifiedTime проверить
   -- на железе — подстраховано разбором и unix-ts, и ISO-строки.
@@ -479,12 +503,20 @@ end
 
 -- Полная карточка одного проекта (парсинг + fs). old_card — из прежнего
 -- индекса, оттуда переносятся index-only поля (needs_report).
-function M.build_card(path, old_card)
+function M.build_card(path, old_card, dir_sizes)
   local card, err = M.parse_rpp(path)
   if not card then return nil, err end
   card.path = path
   card.name = path:match('([^/\\]+)%.[rR][pP][pP]$') or path
   card.mtime = M.file_mtime(path)
+  card.size = M.file_size(path)
+  local dir = path:match('^(.*)[/\\]') or '.'
+  if dir_sizes and dir_sizes[dir] then
+    card.dir_size = dir_sizes[dir]
+  else
+    card.dir_size = M.dir_size(dir)
+    if dir_sizes then dir_sizes[dir] = card.dir_size end
+  end
   card.fs_tags = M.finder_tags(path)
   card.backups = M.find_backups(path)
   card.thumb_file = M.find_thumb(path)
@@ -495,8 +527,9 @@ end
 function M.build_index(paths, old_index)
   local idx = { version = 1, updated = 0, projects = {} }
   local old = old_index and old_index.projects or {}
+  local dir_sizes = {} -- кэш: несколько .rpp в одной папке — один обход
   for _, p in ipairs(M.scan_projects(paths)) do
-    local card = M.build_card(p, old[p])
+    local card = M.build_card(p, old[p], dir_sizes)
     if card then idx.projects[p] = card end
   end
   return idx

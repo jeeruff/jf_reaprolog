@@ -38,7 +38,8 @@ local state = {
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
   filter_tag = '',
-  sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя
+  sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя, 5 размер
+  sort_rev = false,         -- клик по активному чипу переворачивает порядок
   expanded = nil,           -- path раскрытой карточки
   focus = 0,                -- индекс карточки в фокусе (vim), 0 = нет
   scroll_to_focus = false,
@@ -50,7 +51,9 @@ local state = {
 local STATUS_ORDER = {}
 for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 
-local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'имя' }
+local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'имя', 'размер' }
+-- естественное направление: true = по убыванию (новое/большое сверху)
+local SORT_DESC_NATURAL = { true, false, true, false, true }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь' }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -76,6 +79,7 @@ end
 
 local function fmt_size(bytes)
   if not bytes or bytes <= 0 then return '?' end
+  if bytes >= 1073741824 then return string.format('%.1f ГБ', bytes / 1073741824) end
   if bytes >= 1048576 then return string.format('%.1f МБ', bytes / 1048576) end
   return string.format('%d КБ', math.max(1, math.floor(bytes / 1024)))
 end
@@ -138,11 +142,7 @@ local function collect_cards()
   end
 
   local m = state.sort_mode
-  table.sort(cards, function(a, b)
-    -- проекты без отчёта всплывают наверх при любой сортировке
-    local na = a.card.needs_report and 1 or 0
-    local nb = b.card.needs_report and 1 or 0
-    if na ~= nb then return na > nb end
+  local function less(a, b)
     if m == 2 then
       local oa = STATUS_ORDER[a.meta.status] or 99
       local ob = STATUS_ORDER[b.meta.status] or 99
@@ -155,11 +155,23 @@ local function collect_cards()
       if a.card.name:lower() ~= b.card.name:lower() then
         return a.card.name:lower() < b.card.name:lower()
       end
+    elseif m == 5 then
+      local sa = a.card.dir_size or a.card.size or 0
+      local sb = b.card.dir_size or b.card.size or 0
+      if sa ~= sb then return sa > sb end
     end
     if (a.card.mtime or 0) ~= (b.card.mtime or 0) then
       return (a.card.mtime or 0) > (b.card.mtime or 0)
     end
     return a.card.name < b.card.name
+  end
+  table.sort(cards, function(a, b)
+    -- проекты без отчёта всплывают наверх при любой сортировке
+    local na = a.card.needs_report and 1 or 0
+    local nb = b.card.needs_report and 1 or 0
+    if na ~= nb then return na > nb end
+    if state.sort_rev then return less(b, a) end
+    return less(a, b)
   end)
   return cards
 end
@@ -344,7 +356,8 @@ local function draw_card(entry, i, card_w)
 
     ImGui.TextDisabled(ctx, fmt_date(card.mtime))
     ImGui.TextDisabled(ctx, fmt_duration(card.duration) .. '   ' ..
-      (#card.regions) .. ' рег.')
+      (#card.regions) .. ' рег.' ..
+      (card.dir_size and ('   ' .. fmt_size(card.dir_size)) or ''))
     ImGui.EndGroup(ctx)
 
     -- следующий шаг из последнего отчёта — открытая петля снаружи головы
@@ -563,24 +576,53 @@ local function chip(label, active)
   return clicked
 end
 
+-- Нативный диалог выбора папки (Finder). Модальный — defer-цикл ждёт, ок.
+local function pick_folder(title, initial)
+  if not reaper.JS_Dialog_BrowseForFolder then
+    state.status_msg = 'Finder-диалог: нужен js_ReaScriptAPI (ReaPack)'
+    return nil
+  end
+  local rv, folder = reaper.JS_Dialog_BrowseForFolder(title, initial or '')
+  if rv == 1 and folder and folder ~= '' then return folder end
+  return nil
+end
+
 local function draw_settings()
   ImGui.SeparatorText(ctx, 'Пути')
   local changed, val
 
   ImGui.Text(ctx, 'Проекты (через ;):')
-  ImGui.SetNextItemWidth(ctx, -1)
+  ImGui.SetNextItemWidth(ctx, -86)
   changed, val = ImGui.InputText(ctx, '##paths', state.scan_paths)
   if changed then state.scan_paths = val end
+  ImGui.SameLine(ctx)
+  if ImGui.Button(ctx, '+ Finder##scan') then
+    local dir = pick_folder('Папка с проектами', state.scan_paths:match('([^;]+)'))
+    if dir then
+      state.scan_paths = state.scan_paths == '' and dir
+        or (state.scan_paths .. ';' .. dir)
+    end
+  end
 
   ImGui.Text(ctx, 'Расслоение → мультитреки:')
-  ImGui.SetNextItemWidth(ctx, -1)
+  ImGui.SetNextItemWidth(ctx, -86)
   changed, val = ImGui.InputText(ctx, '##stems', state.stems_path)
   if changed then state.stems_path = val end
+  ImGui.SameLine(ctx)
+  if ImGui.Button(ctx, 'Finder##stems') then
+    local dir = pick_folder('Папка мультитреков', state.stems_path)
+    if dir then state.stems_path = dir end
+  end
 
   ImGui.Text(ctx, 'Расслоение → регионы:')
-  ImGui.SetNextItemWidth(ctx, -1)
+  ImGui.SetNextItemWidth(ctx, -86)
   changed, val = ImGui.InputText(ctx, '##regions', state.regions_path)
   if changed then state.regions_path = val end
+  ImGui.SameLine(ctx)
+  if ImGui.Button(ctx, 'Finder##regions') then
+    local dir = pick_folder('Папка регионов', state.regions_path)
+    if dir then state.regions_path = dir end
+  end
 
   ImGui.Text(ctx, 'Тамбнейлы:')
   ImGui.SameLine(ctx)
@@ -652,7 +694,21 @@ local function draw_toolbar()
   ImGui.TextDisabled(ctx, 'сорт:')
   for i, s in ipairs(SORT_CHIPS) do
     ImGui.SameLine(ctx)
-    if chip(s, state.sort_mode == i) then state.sort_mode = i end
+    local active = state.sort_mode == i
+    local label = s
+    if active then
+      local desc = SORT_DESC_NATURAL[i] ~= state.sort_rev
+      label = s .. (desc and ' ↓' or ' ↑')
+    end
+    -- повторный клик по активному чипу — переворот порядка
+    if chip(label .. '###sort' .. i, active) then
+      if active then
+        state.sort_rev = not state.sort_rev
+      else
+        state.sort_mode = i
+        state.sort_rev = false
+      end
+    end
   end
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
