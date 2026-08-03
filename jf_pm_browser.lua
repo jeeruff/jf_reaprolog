@@ -113,6 +113,7 @@ local EN = {
   ['Превью: у проекта нет ни конца, ни регионов'] =
     'Preview: project has neither an end nor regions',
   ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
+  ['Превью отрендерено'] = 'Preview rendered',
   ['Превью-батч: готово %d'] = 'Preview batch: %d done',
   ['Превью-батч: у всех уже есть аудио'] =
     'Preview batch: every project already has audio',
@@ -947,7 +948,11 @@ local function find_preview_audio(card)
   local hit = audio_cache[card.path]
   if hit ~= nil then return hit or nil end
   local dir = card.path:match('^(.*)[/\\]') or '.'
-  local cands = { dir .. '/jf_preview.wav', card.path .. '-PROX.wav' }
+  local cands = {
+    dir .. '/' .. card.name .. '_preview.wav',
+    dir .. '/jf_preview.wav', -- легаси-имя до перехода на имя проекта
+    card.path .. '-PROX.wav',
+  }
   local rf = card.render_file or ''
   if rf ~= '' then
     if not rf:match('^/') then rf = dir .. '/' .. rf end
@@ -1126,7 +1131,10 @@ local function render_preview(card)
     return
   end
   local dir = card.path:match('^(.*)[/\\]') or '.'
-  os.remove(dir .. '/jf_preview.wav') -- иначе рендер спросит про перезапись
+  -- превью зовётся по имени проекта: у двух .rpp в одной папке — свои файлы
+  local pv_name = card.name:gsub('%$', '') .. '_preview'
+  local pv_path = dir .. '/' .. pv_name .. '.wav'
+  os.remove(pv_path) -- иначе рендер спросит про перезапись
 
   -- рендер на полной скорости: RENDER_1X 0 правится в тексте .rpp до
   -- открытия (в API поля скорости нет), после закрытия возвращается
@@ -1198,13 +1206,13 @@ local function render_preview(card)
   end
 
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FILE', dir, true)
-  reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', 'jf_preview', true)
+  reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', pv_name, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', 'evaw', true)
   reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, true) -- master mix
   reaper.Main_OnCommand(41824, 0) -- File: Render project, using the most recent render settings
   -- REAPER часто видит конец проекта сильно дальше звука (огибающие,
   -- маркеры) — отрезаем цифровую тишину в хвосте, оставляя секунду
-  local trimmed, cut = core.trim_wav_tail(dir .. '/jf_preview.wav', 1.0)
+  local trimmed, cut = core.trim_wav_tail(pv_path, 1.0)
   if trimmed then
     bounds_note = bounds_note .. string.format(' · хвост −%d c', math.floor(cut + 0.5))
   end
@@ -1221,10 +1229,9 @@ local function render_preview(card)
   restore_mtime()
   audio_cache[card.path] = nil
   for k in pairs(wave_cache) do
-    if k:find(dir .. '/jf_preview.wav', 1, true) == 1 then wave_cache[k] = nil end
+    if k:find(pv_path, 1, true) == 1 then wave_cache[k] = nil end
   end
-  state.status_msg = 'Превью отрендерено' .. bounds_note .. ': '
-    .. dir .. '/jf_preview.wav'
+  state.status_msg = T('Превью отрендерено') .. bounds_note .. ': ' .. pv_path
 end
 
 -- Батч «превью всем»: очередь путей, по одному проекту на кадр defer-цикла
