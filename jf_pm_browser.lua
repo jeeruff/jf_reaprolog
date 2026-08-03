@@ -62,6 +62,7 @@ local state = {
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
   filter_text = '',         -- fzf: имя, теги, треки
   sel = {},                 -- упорядоченный список путей — порядок = порядок merge
+  basket = {},              -- корзина регионов: {path, region} для сборки проекта
   kb_col = 0, kb_row = 0,   -- фокус в канбане
   sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя, 5 размер
   sort_rev = false,         -- клик по активному чипу переворачивает порядок
@@ -498,6 +499,147 @@ local function merge_selected()
   state.status_msg = 'Merge → ' .. out
 end
 
+-- ---------------------------------------------------------------------------
+-- Сабпроекты: вставка .rpp айтемом (SOURCE RPP_PROJECT) через InsertMedia.
+-- Исходные проекты не изменяются; звук — из прокси, который REAPER рендерит
+-- при сохранении саба, открытого из родителя (поэтому 41816, а не openProject).
+
+-- Вставить path сабпроектом на текущий трек у edit-курсора активного
+-- проекта. region ~= nil — обрезать айтем до региона.
+local function insert_subproject(path, region)
+  reaper.InsertMedia(path, 0)
+  local item = reaper.GetSelectedMediaItem(0, 0)
+  if item and region then
+    reaper.SetMediaItemInfo_Value(item, 'D_LENGTH', region.fin - region.pos)
+    local take = reaper.GetActiveTake(item)
+    if take then
+      reaper.SetMediaItemTakeInfo_Value(take, 'D_STARTOFFS', region.pos)
+    end
+  end
+  return item
+end
+
+-- Авто-рендер прокси: открыть саб как associated project, сохранить
+-- (REAPER рендерит прокси), закрыть таб. Айтемы — из активного проекта.
+local function render_proxies(items)
+  for _, item in ipairs(items) do
+    reaper.Main_OnCommand(40289, 0) -- Unselect all items
+    reaper.SetMediaItemSelected(item, true)
+    reaper.Main_OnCommand(41816, 0) -- Item: Open associated project in new tab (проверить id на железе)
+    reaper.Main_SaveProject(0, false)
+    reaper.Main_OnCommand(40860, 0) -- Close current project tab
+  end
+  reaper.UpdateArrange()
+end
+
+-- «Трек на проект»: для каждого пути новый трек с именем проекта,
+-- айтемы-сабпроекты последовательно по времени. Возвращает {item, path}.
+local function subs_layout(paths)
+  local pos = reaper.GetProjectLength(0)
+  local placed = {}
+  for _, p in ipairs(paths) do
+    local card = state.index.projects[p]
+    local ntr = reaper.CountTracks(0)
+    reaper.InsertTrackAtIndex(ntr, true)
+    local tr = reaper.GetTrack(0, ntr)
+    local name = p:match('([^/\\]+)%.[rR][pP][pP]$') or p
+    reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME', name, true)
+    reaper.SetOnlyTrackSelected(tr)
+    reaper.SetEditCurPos(pos, false, false)
+    local item = insert_subproject(p)
+    if item then
+      placed[#placed + 1] = { item = item, path = p }
+      pos = pos + ((card and card.duration)
+        or reaper.GetMediaItemInfo_Value(item, 'D_LENGTH'))
+    end
+  end
+  reaper.UpdateArrange()
+  return placed
+end
+
+-- a) target_path = nil: новый таб; b) target_path: вставка в конец проекта
+local function merge_as_subprojects(target_path)
+  if #state.sel < 2 then return end
+  local paths = {}
+  for i, p in ipairs(state.sel) do paths[i] = p end
+  if target_path then
+    open_project(target_path)
+  else
+    reaper.Main_OnCommand(40859, 0) -- New project tab
+  end
+  local placed = subs_layout(paths)
+  local items = {}
+  for i, pl in ipairs(placed) do items[i] = pl.item end
+  render_proxies(items)
+  state.status_msg = string.format('Subprojects: %d%s', #placed,
+    target_path and (' → ' .. target_path) or ' в новом проекте (не сохранён)')
+  state.sel = {}
+end
+
+-- Регион кликом → сабпроект в активный проект (обрезанный до региона)
+local function insert_region_subproject(path, region)
+  local _, active_fn = reaper.EnumProjects(-1)
+  if active_fn == path then
+    state.status_msg = 'Регион из активного проекта — рекурсия, нельзя'
+    return
+  end
+  local item = insert_subproject(path, region)
+  if not item then
+    state.status_msg = 'Регион: вставка не удалась'
+    return
+  end
+  render_proxies({ item })
+  state.status_msg = 'Регион → активный проект: '
+    .. (region.name ~= '' and region.name or '(без имени)')
+end
+
+-- Корзина регионов (cmd+клик по региону): собрать новый проект — один трек,
+-- регионы последовательно; прокси — по разу на уникальный исходник
+local function basket_build()
+  if #state.basket == 0 then return end
+  reaper.Main_OnCommand(40859, 0) -- New project tab
+  reaper.InsertTrackAtIndex(0, true)
+  local tr = reaper.GetTrack(0, 0)
+  reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME', 'regions', true)
+  local pos = 0
+  local placed = {}
+  for _, b in ipairs(state.basket) do
+    reaper.SetOnlyTrackSelected(tr)
+    reaper.SetEditCurPos(pos, false, false)
+    local item = insert_subproject(b.path, b.region)
+    if item then
+      placed[#placed + 1] = { item = item, path = b.path }
+      pos = pos + (b.region.fin - b.region.pos)
+    end
+  end
+  local seen, uniq = {}, {}
+  for _, pl in ipairs(placed) do
+    if not seen[pl.path] then
+      seen[pl.path] = true
+      uniq[#uniq + 1] = pl.item
+    end
+  end
+  render_proxies(uniq)
+  state.status_msg = string.format('Проект из %d регионов (не сохранён)', #placed)
+  state.basket = {}
+end
+
+-- '#ambient #flute #+++ intro' → title='intro', tags={ambient,flute}, rating=3
+local function parse_region_name(name)
+  local tags, rating = {}, 0
+  local title = name:gsub('#([^%s#]+)', function(tok)
+    local plus = tok:match('^%++$')
+    if plus then
+      if #plus > rating then rating = #plus end
+    else
+      tags[#tags + 1] = tok
+    end
+    return ''
+  end)
+  title = title:gsub('%s+', ' '):match('^%s*(.-)%s*$')
+  return { title = title, tags = tags, rating = rating }
+end
+
 -- Правки закрытых .rpp (rename, дедлайн, чекбоксы) требуют, чтобы проект
 -- не был открыт: открытый перезапишет файл при сохранении.
 local function project_is_open(path)
@@ -797,12 +939,36 @@ local function draw_card_details(card, meta)
     end
   end
 
+  -- регионы кликабельны: клик — subproject-айтем региона в активный проект,
+  -- cmd/ctrl+клик — в корзину регионов; #хэштеги из имени цветные, #+++ рейтинг
   if #card.regions > 0 then
     ImGui.TextDisabled(ctx, 'Структура:')
-    for _, r in ipairs(card.regions) do
-      ImGui.BulletText(ctx, string.format('%s  [%s – %s]',
-        r.name ~= '' and r.name or '(без имени)',
-        fmt_duration(r.pos), fmt_duration(r.fin)))
+    for ri, r in ipairs(card.regions) do
+      local pr = parse_region_name(r.name or '')
+      local label = string.format('%s  [%s – %s]',
+        pr.title ~= '' and pr.title or '(без имени)',
+        fmt_duration(r.pos), fmt_duration(r.fin))
+      if ImGui.SmallButton(ctx, label .. '###reg' .. ri) then
+        local mods = ImGui.GetKeyMods(ctx)
+        if mods & ImGui.Mod_Ctrl ~= 0 or mods & ImGui.Mod_Super ~= 0 then
+          state.basket[#state.basket + 1] = { path = card.path, region = r }
+          state.status_msg = string.format('В корзине регионов: %d', #state.basket)
+        else
+          insert_region_subproject(card.path, r)
+        end
+      end
+      if ImGui.IsItemHovered(ctx) then
+        ImGui.SetTooltip(ctx,
+          'клик — subproject в активный проект\ncmd+клик — в корзину регионов')
+      end
+      for _, t in ipairs(pr.tags) do
+        ImGui.SameLine(ctx)
+        ImGui.TextColored(ctx, tag_color(t), '#' .. t)
+      end
+      if pr.rating > 0 then
+        ImGui.SameLine(ctx)
+        ImGui.TextColored(ctx, 0xD9B96CFF, string.rep('+', pr.rating))
+      end
     end
   end
 
@@ -993,6 +1159,12 @@ local function draw_card_details(card, meta)
     end
   end
   ImGui.SameLine(ctx)
+  if icon('↻###refr', 'обновить карточку (перечитать .rpp)') then
+    refresh_card(card.path)
+    state.status_msg = 'Обновлено: ' .. card.name
+    return
+  end
+  ImGui.SameLine(ctx)
   if icon('Aa###ren', 'переименовать проект…') then
     if state.ren_path == card.path then
       state.ren_path = nil
@@ -1051,7 +1223,18 @@ local function draw_card(entry, i, card_w)
       -- номер в выборке = позиция в merge
       ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
     end
-    -- ячейка выделения в правом верхнем углу
+    -- обновить одну карточку (перечитать .rpp) и ячейка выделения — в углу
+    ImGui.SameLine(ctx, card_w - 56)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x6A6A6AFF)
+    if ImGui.SmallButton(ctx, '↻###refr1') then
+      refresh_card(card.path)
+      state.status_msg = 'Обновлено: ' .. card.name
+      inner_click = true
+    end
+    ImGui.PopStyleColor(ctx)
+    if ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, 'обновить карточку')
+    end
     ImGui.SameLine(ctx, card_w - 30)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, si and 0xD9B96CFF or 0x6A6A6AFF)
     if ImGui.SmallButton(ctx, (si and '■' or '□') .. '###selbox') then
@@ -1542,6 +1725,14 @@ local function draw_toolbar()
       ImGui.SameLine(ctx)
       if ImGui.Button(ctx, 'merge') then merge_selected() end
       ImGui.SameLine(ctx)
+      -- сабпроектами: исходники не трогаются, звук — прокси
+      if ImGui.Button(ctx, 'merge as subs') then merge_as_subprojects(nil) end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'subs → проект…') then
+        local rv, fn = reaper.GetUserFileNameForRead('', 'Целевой проект', 'rpp')
+        if rv and fn and fn ~= '' then merge_as_subprojects(fn) end
+      end
+      ImGui.SameLine(ctx)
       if ImGui.SmallButton(ctx, 'открыть') then
         for _, p in ipairs(state.sel) do open_project(p) end
       end
@@ -1552,6 +1743,17 @@ local function draw_toolbar()
     end
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, 'сброс') then state.sel = {} end
+  end
+
+  -- корзина регионов (cmd+клик по региону в карточке)
+  if #state.basket > 0 then
+    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, 0xD9B96CFF,
+      string.format('регионов: %d', #state.basket))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, 'собрать проект') then basket_build() end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, 'сброс###bsk') then state.basket = {} end
   end
 
   ImGui.SameLine(ctx)
