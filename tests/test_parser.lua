@@ -65,6 +65,63 @@ eq(card.render_pattern, '$project_v3', 'render pattern')
 -- items: 0+32.25 и 32.25+72.5=104.75; регионы до 96 → длительность 104.75
 eq(card.duration, 104.75, 'duration from items/regions')
 
+print('== rename_project ==')
+do
+  -- стаб reaper.* поверх ls (как в рескан-харнессе)
+  local function list(dir, want_dirs)
+    local out = {}
+    local p = io.popen("ls -A '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
+    if p then
+      for name in p:lines() do
+        local pd = io.popen("test -d '" .. (dir .. '/' .. name):gsub("'", "'\\''")
+          .. "' && echo d")
+        local isdir = pd:read('*l') == 'd'
+        pd:close()
+        if isdir == want_dirs then out[#out + 1] = name end
+      end
+      p:close()
+    end
+    return out
+  end
+  _G.reaper = {
+    EnumerateFiles = function(d, i) return list(d, false)[i + 1] end,
+    EnumerateSubdirectories = function(d, i) return list(d, true)[i + 1] end,
+  }
+
+  local root = os.tmpname()
+  os.remove(root)
+  os.execute("mkdir -p '" .. root .. "/MySong/Backups'")
+  local function touch(p) io.open(p, 'wb'):close() end
+  touch(root .. '/MySong/MySong.rpp')
+  touch(root .. '/MySong/MySong.rpp-bak')
+  touch(root .. '/MySong/MySong.rpp.reapeaks')
+  touch(root .. '/MySong/MySong.png')
+  touch(root .. '/MySong/other.wav')
+  touch(root .. '/MySong/Backups/MySong-2026-01-01.rpp-bak')
+
+  local np, olddir = core.rename_project(root .. '/MySong/MySong.rpp', 'NewName')
+  eq(np, root .. '/NewName/NewName.rpp', 'new path with renamed dir')
+  eq(olddir, root .. '/MySong', 'old dir reported')
+  local function exists(p)
+    local f = io.open(p, 'rb')
+    if f then f:close() return true end
+    return false
+  end
+  check(exists(root .. '/NewName/NewName.rpp'), 'rpp renamed')
+  check(exists(root .. '/NewName/NewName.rpp-bak'), 'bak renamed')
+  check(exists(root .. '/NewName/NewName.rpp.reapeaks'), 'reapeaks renamed')
+  check(exists(root .. '/NewName/NewName.png'), 'preview renamed')
+  check(exists(root .. '/NewName/other.wav'), 'unrelated file untouched')
+  check(exists(root .. '/NewName/Backups/NewName-2026-01-01.rpp-bak'),
+    'backup in Backups/ renamed')
+  check(not exists(root .. '/MySong/MySong.rpp'), 'old path gone')
+
+  local bad = core.rename_project(root .. '/NewName/NewName.rpp', 'a/b')
+  check(bad == nil, 'slash in name rejected')
+  os.execute("rm -rf '" .. root .. "'")
+  _G.reaper = nil
+end
+
 print('== merge_projects ==')
 -- пути в индексе абсолютные — merge тоже тестируем с абсолютным
 local cwd = io.popen('pwd'):read('*l')

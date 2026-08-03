@@ -560,6 +560,72 @@ function M.build_index(paths, old_index)
 end
 
 -- ===========================================================================
+-- Переименование проекта
+-- ===========================================================================
+-- Переименовывает всё с префиксом старого имени: .rpp, бэкапы (в папке и в
+-- Backups/), пики .reapeaks, превью <имя>.png. Папку проекта — только если
+-- она названа как проект. Относительные пути внутри .rpp остаются валидными.
+-- Все коллизии проверяются ДО первого rename — либо всё, либо ничего.
+-- Возвращает (новый путь .rpp, старая папка|nil) либо (nil, err).
+
+function M.rename_project(path, new_name)
+  if not new_name or new_name == ''
+     or new_name:find('[/\\:]') or new_name:find('^%.') then
+    return nil, 'недопустимое имя'
+  end
+  local dir = path:match('^(.*)[/\\]') or '.'
+  local old_base = path:match('([^/\\]+)%.[rR][pP][pP]$')
+  if not old_base then return nil, 'не .rpp: ' .. path end
+  if new_name == old_base then return nil, 'имя не изменилось' end
+
+  local renames = {}
+  local function collect(d)
+    local i = 0
+    while true do
+      local fn = reaper.EnumerateFiles(d, i)
+      if not fn then break end
+      if fn:sub(1, #old_base) == old_base then
+        renames[#renames + 1] = {
+          d .. '/' .. fn,
+          d .. '/' .. new_name .. fn:sub(#old_base + 1),
+        }
+      end
+      i = i + 1
+    end
+  end
+  collect(dir)
+  collect(dir .. '/Backups')
+
+  local parent, dname = dir:match('^(.*)[/\\]([^/\\]+)$')
+  local rename_dir = dname == old_base
+  if rename_dir then
+    local j = 0
+    while true do
+      local sub = reaper.EnumerateSubdirectories(parent, j)
+      if not sub then break end
+      if sub == new_name then return nil, 'папка занята: ' .. new_name end
+      j = j + 1
+    end
+  end
+  for _, r in ipairs(renames) do
+    local f = io.open(r[2], 'rb')
+    if f then f:close() return nil, 'файл занят: ' .. r[2] end
+  end
+
+  for _, r in ipairs(renames) do
+    local ok, err = os.rename(r[1], r[2])
+    if not ok then return nil, tostring(err) end
+  end
+  local new_dir = dir
+  if rename_dir then
+    new_dir = parent .. '/' .. new_name
+    local ok, err = os.rename(dir, new_dir)
+    if not ok then return nil, tostring(err) end
+  end
+  return new_dir .. '/' .. new_name .. '.rpp', rename_dir and dir or nil
+end
+
+-- ===========================================================================
 -- Слияние проектов (текстовый уровень, проекты не открываются)
 -- ===========================================================================
 -- Треки всех проектов складываются в один; айтемы и маркеры последующих

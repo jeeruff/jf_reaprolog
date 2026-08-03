@@ -490,6 +490,45 @@ local function merge_selected()
   state.status_msg = 'Merge → ' .. out
 end
 
+-- Переименование: всё с префиксом имени + папка проекта (см. core).
+-- Открытый в REAPER проект переименовывать нельзя — файл под ним уедет.
+local function rename_project(card, new_name)
+  new_name = new_name:match('^%s*(.-)%s*$')
+  if new_name == '' or new_name == card.name then return end
+  local pi = 0
+  while true do
+    local proj, fn = reaper.EnumProjects(pi)
+    if not proj then break end
+    if fn == card.path then
+      state.status_msg = 'Проект открыт в REAPER — сначала закрой вкладку'
+      return
+    end
+    pi = pi + 1
+  end
+  local new_path, extra = core.rename_project(card.path, new_name)
+  if not new_path then
+    state.status_msg = 'Переименование: ' .. tostring(extra)
+    return
+  end
+  local old = state.index.projects[card.path]
+  state.index.projects[card.path] = nil
+  if old and old.thumb_user then
+    -- превью с префиксом имени переименовалось — авто-поиск найдёт новое;
+    -- уцелевший внешний файл остаётся
+    local f = io.open(old.thumb_user, 'rb')
+    if f then f:close() else old.thumb_user = nil end
+  end
+  local newcard = core.build_card(new_path, old)
+  if newcard then state.index.projects[new_path] = newcard end
+  core.save_index(state.index)
+  search_cache[card.path] = nil
+  for i, p in ipairs(state.sel) do
+    if p == card.path then state.sel[i] = new_path end
+  end
+  if state.expanded == card.path then state.expanded = new_path end
+  state.status_msg = 'Переименовано → ' .. new_path
+end
+
 -- ---------------------------------------------------------------------------
 -- Тамбнейлы
 
@@ -738,6 +777,31 @@ local function draw_card_details(card, meta)
     if icon('▧###unthumb', 'сбросить превью') then
       card.thumb_user = nil
       core.save_index(state.index)
+    end
+  end
+  ImGui.SameLine(ctx)
+  if icon('Aa###ren', 'переименовать проект…') then
+    if state.ren_path == card.path then
+      state.ren_path = nil
+    else
+      state.ren_path, state.ren_text = card.path, card.name
+      state.ren_focus = true
+    end
+  end
+  if state.ren_path == card.path then
+    ImGui.SameLine(ctx)
+    ImGui.SetNextItemWidth(ctx, 200)
+    if state.ren_focus then
+      ImGui.SetKeyboardFocusHere(ctx)
+      state.ren_focus = false
+    end
+    local done, v = ImGui.InputTextWithHint(ctx, '###rename',
+      'новое имя + Enter', state.ren_text, ImGui.InputTextFlags_EnterReturnsTrue)
+    if v then state.ren_text = v end
+    if done then
+      rename_project(card, state.ren_text)
+      state.ren_path = nil
+      return
     end
   end
 end
