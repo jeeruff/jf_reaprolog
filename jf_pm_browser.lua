@@ -68,6 +68,9 @@ local state = {
   focus_tag_input = false,
   status_msg = '',
   show_settings = false,
+  cal_scroll_end = 2,       -- кадры доскролла календаря к сегодняшнему краю
+  tag_add_path = nil,       -- карточка с открытым полем нового тега
+  tag_add_text = '',
 }
 
 local STATUS_ORDER = {}
@@ -325,8 +328,37 @@ local function toggle_pin(card)
   core.save_index(state.index)
 end
 
--- Удаление в Корзину через Finder (с возможностью «вернуть обратно»).
--- Папку целиком — только если это не корень сканирования.
+-- В Корзину (с возможностью «вернуть обратно»): Finder на macOS, gio на Linux
+local function trash_path(target)
+  local os_name = reaper.GetOS()
+  if os_name:find('OSX') or os_name:find('macOS') then
+    local scpt = os.tmpname()
+    local f = io.open(scpt, 'wb')
+    if not f then return false end
+    f:write('tell application "Finder" to delete POSIX file "' .. target .. '"')
+    f:close()
+    reaper.ExecProcess('/usr/bin/osascript "' .. scpt .. '"', 15000)
+    os.remove(scpt)
+  else
+    reaper.ExecProcess('/usr/bin/gio trash "' .. target .. '"', 15000)
+  end
+  return true
+end
+
+-- Выкинуть проект из индекса после успешного удаления; removed_dir ~= nil —
+-- удалялась папка целиком, вычищаем и соседние .rpp из неё
+local function drop_from_index(path, removed_dir)
+  for p in pairs(state.index.projects) do
+    if p == path or (removed_dir and p:sub(1, #removed_dir + 1) == removed_dir .. '/') then
+      state.index.projects[p] = nil
+    end
+  end
+  local i = sel_index(path)
+  if i then table.remove(state.sel, i) end
+  if state.expanded == path then state.expanded = nil end
+end
+
+-- Удаление в Корзину. Папку целиком — только если это не корень сканирования.
 local function delete_project(card)
   local dir = card.path:match('^(.*)[/\\]')
   local roots = {}
@@ -340,31 +372,67 @@ local function delete_project(card)
   if r ~= 6 and r ~= 7 then return end
   local target = (r == 6 and dir_ok) and dir or card.path
 
-  local scpt = os.tmpname()
-  local f = io.open(scpt, 'wb')
-  if not f then state.status_msg = 'Удаление: tmp недоступен' return end
-  f:write('tell application "Finder" to delete POSIX file "' .. target .. '"')
-  f:close()
-  reaper.ExecProcess('/usr/bin/osascript "' .. scpt .. '"', 15000)
-  os.remove(scpt)
-
+  if not trash_path(target) then
+    state.status_msg = 'Удаление: tmp недоступен'
+    return
+  end
   local still = io.open(card.path, 'rb')
   if still then
     still:close()
-    state.status_msg = 'Удаление не удалось (Finder)'
+    state.status_msg = 'Удаление не удалось'
     return
   end
-  for p in pairs(state.index.projects) do
-    if p == card.path or (target == dir and p:sub(1, #dir + 1) == dir .. '/') then
-      state.index.projects[p] = nil
-    end
-  end
-  local i = sel_index(card.path)
-  if i then table.remove(state.sel, i) end
-  if state.expanded == card.path then state.expanded = nil end
+  drop_from_index(card.path, target == dir and dir or nil)
   state.focus = 0
   core.save_index(state.index)
   state.status_msg = 'В Корзине: ' .. target
+end
+
+-- Массовое удаление выделенных: один вопрос на всех
+local function delete_selected()
+  local n = #state.sel
+  if n == 0 then return end
+  local roots = {}
+  for _, p in ipairs(core.get_scan_paths()) do roots[(p:gsub('/+$', ''))] = true end
+  local r = reaper.MB(
+    string.format('Удалить %d проект(ов) в Корзину?\n\n' ..
+      'Да — папки целиком (корни сканирования — только .rpp)\nНет — только .rpp', n),
+    'JF PM — удаление', 3)
+  if r ~= 6 and r ~= 7 then return end
+  local removed = 0
+  for _, path in ipairs({table.unpack(state.sel)}) do
+    local card = state.index.projects[path]
+    if card then
+      local dir = path:match('^(.*)[/\\]')
+      local dir_ok = r == 6 and dir and not roots[dir]
+      local target = dir_ok and dir or path
+      trash_path(target)
+      local still = io.open(path, 'rb')
+      if still then
+        still:close()
+      else
+        drop_from_index(path, dir_ok and dir or nil)
+        removed = removed + 1
+      end
+    end
+  end
+  state.focus = 0
+  core.save_index(state.index)
+  state.status_msg = string.format('В Корзине: %d из %d', removed, n)
+end
+
+-- Закрепить все выделенные; если уже все закреплены — открепить
+local function pin_selected()
+  local all = true
+  for _, p in ipairs(state.sel) do
+    local c = state.index.projects[p]
+    if c and not c.pinned then all = false end
+  end
+  for _, p in ipairs(state.sel) do
+    local c = state.index.projects[p]
+    if c then c.pinned = (not all) or nil end
+  end
+  core.save_index(state.index)
 end
 
 -- Merge: выделенные соединяются последовательно в порядке выделения.
@@ -488,13 +556,16 @@ local function draw_card_details(card, meta)
     end
   end
 
+  -- треки свёрнуты по умолчанию, как бэкапы
   if #card.track_names > 0 then
-    ImGui.TextDisabled(ctx, 'Треки:')
-    local named = {}
-    for _, n in ipairs(card.track_names) do
-      named[#named + 1] = n ~= '' and n or '(без имени)'
+    if ImGui.TreeNode(ctx, string.format('Треки (%d)###trk', #card.track_names)) then
+      local named = {}
+      for _, n in ipairs(card.track_names) do
+        named[#named + 1] = n ~= '' and n or '(без имени)'
+      end
+      ImGui.TextWrapped(ctx, table.concat(named, ', '))
+      ImGui.TreePop(ctx)
     end
-    ImGui.TextWrapped(ctx, table.concat(named, ', '))
   end
 
   if meta.report_done ~= '' or meta.report_todo ~= '' then
@@ -555,24 +626,70 @@ local function draw_card_details(card, meta)
     ImGui.PopStyleColor(ctx)
   end
 
-  ImGui.TextDisabled(ctx, card.path)
-  if ImGui.SmallButton(ctx, 'свернуть') then state.expanded = nil end
+  -- «+»: свой тег не из списка (цвет получит от хеша имени)
   ImGui.SameLine(ctx)
-  if ImGui.SmallButton(ctx, card.pinned and 'открепить' or 'закрепить') then
+  if ImGui.SmallButton(ctx, '+###tagadd') then
+    if state.tag_add_path == card.path then
+      state.tag_add_path = nil
+    else
+      state.tag_add_path, state.tag_add_text = card.path, ''
+      state.tag_add_focus = true
+    end
+  end
+  if state.tag_add_path == card.path then
+    ImGui.SameLine(ctx)
+    ImGui.SetNextItemWidth(ctx, 120)
+    if state.tag_add_focus then
+      ImGui.SetKeyboardFocusHere(ctx)
+      state.tag_add_focus = false
+    end
+    local done, v = ImGui.InputTextWithHint(ctx, '###newtag', 'тег + Enter',
+      state.tag_add_text, ImGui.InputTextFlags_EnterReturnsTrue)
+    if v then state.tag_add_text = v end
+    if done and state.tag_add_text ~= '' then
+      local t = state.tag_add_text
+      local extra, dup = card.tags_extra or {}, cur[t]
+      for _, x in ipairs(extra) do if x == t then dup = true end end
+      if not dup then
+        extra[#extra + 1] = t
+        card.tags_extra = extra
+        search_cache[card.path] = nil
+        core.save_index(state.index)
+      end
+      state.tag_add_path = nil
+    end
+  end
+
+  ImGui.TextDisabled(ctx, card.path)
+  -- команды — маленькими иконками с тултипами
+  local function icon(label, tip, col)
+    if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
+    local clicked = ImGui.SmallButton(ctx, label)
+    if col then ImGui.PopStyleColor(ctx) end
+    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, tip) end
+    return clicked
+  end
+  if icon('▲###fold', 'свернуть') then state.expanded = nil end
+  ImGui.SameLine(ctx)
+  if icon((card.pinned and '●' or '○') .. '###pin',
+      card.pinned and 'открепить' or 'закрепить',
+      card.pinned and 0xD9B96CFF or nil) then
     toggle_pin(card)
   end
   ImGui.SameLine(ctx)
-  if ImGui.SmallButton(ctx, sel_index(card.path) and 'снять выбор' or 'выбрать') then
+  local si = sel_index(card.path)
+  if icon((si and '■' or '□') .. '###sel',
+      si and 'снять выбор' or 'выбрать', si and 0xD9B96CFF or nil) then
     toggle_select(card.path)
   end
   ImGui.SameLine(ctx)
-  if ImGui.SmallButton(ctx, 'удалить…') then
+  if icon('×###del', 'удалить в Корзину…') then
     delete_project(card)
     return
   end
   ImGui.SameLine(ctx)
-  if ImGui.SmallButton(ctx, 'превью…') then
-    -- нативный Finder-диалог, без зависимостей от js_ReaScriptAPI
+  if icon('▦###thumb', 'назначить картинку-превью…') then
+    -- нативный диалог, без зависимостей от js_ReaScriptAPI
     local rv, fn = reaper.GetUserFileNameForRead('', 'Картинка-превью проекта', '')
     if rv and fn and fn ~= '' then
       card.thumb_user = fn
@@ -582,7 +699,7 @@ local function draw_card_details(card, meta)
   end
   if card.thumb_user then
     ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, 'сбросить превью') then
+    if icon('▧###unthumb', 'сбросить превью') then
       card.thumb_user = nil
       core.save_index(state.index)
     end
@@ -594,6 +711,7 @@ local function draw_card(entry, i, card_w)
   local expanded = state.expanded == card.path
   local focused = state.focus == i
   local si = sel_index(card.path)
+  local inner_click = false  -- клик по виджету внутри — не раскрывать карточку
   local h = expanded and 0 or 138  -- 0 = авто-высота по контенту
 
   local child_flags = ImGui.ChildFlags_Border
@@ -619,6 +737,14 @@ local function draw_card(entry, i, card_w)
       -- номер в выборке = позиция в merge
       ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
     end
+    -- ячейка выделения в правом верхнем углу
+    ImGui.SameLine(ctx, card_w - 30)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, si and 0xD9B96CFF or 0x6A6A6AFF)
+    if ImGui.SmallButton(ctx, (si and '■' or '□') .. '###selbox') then
+      toggle_select(card.path)
+      inner_click = true
+    end
+    ImGui.PopStyleColor(ctx)
 
     local color = core.STATUS_COLORS[meta.status]
     local stage = core.PIPELINE[meta.status]
@@ -680,7 +806,7 @@ local function draw_card(entry, i, card_w)
     local select_click = mods & ImGui.Mod_Ctrl ~= 0 or mods & ImGui.Mod_Super ~= 0
     if ImGui.IsMouseDoubleClicked(ctx, ImGui.MouseButton_Left) then
       open_project(card.path)
-    elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) then
+    elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) and not inner_click then
       if select_click then
         toggle_select(card.path) -- cmd/ctrl+клик: в выборку для merge
         state.focus = i
@@ -785,7 +911,8 @@ local function draw_timeline(cards)
 end
 
 -- ---------------------------------------------------------------------------
--- Календарь: тепловая карта активности (mtime, отчёты, бэкапы) за 26 недель
+-- Календарь: тепловая карта активности (mtime, отчёты, бэкапы) от старейшей
+-- активности до сегодня; горизонтальный скролл, старт — на текущем месяце
 
 local function day_key(ts)
   local d = os.date('*t', ts)
@@ -813,7 +940,10 @@ local function draw_calendar(cards)
     for _, b in ipairs(e.card.backups or {}) do mark(b.mtime, e.card.name) end
   end
 
-  local WEEKS = 26
+  -- диапазон: от старейшей активности (но не меньше 26 недель) до сегодня
+  local oldest = now
+  for k in pairs(act) do if k < oldest then oldest = k end end
+  local WEEKS = math.max(26, math.ceil((day_key(now) - oldest) / (7 * DAY)) + 1)
   local cell, gap = 16, 3
   local wd = (os.date('*t', now).wday + 5) % 7 -- 0 = понедельник
   local monday = day_key(now) - wd * DAY
@@ -851,6 +981,12 @@ local function draw_calendar(cards)
     end
   end
   ImGui.Dummy(ctx, WEEKS * (cell + gap), 7 * (cell + gap) + 18)
+  -- при входе в календарь скроллим к сегодняшнему краю (2 кадра:
+  -- GetScrollMaxX узнаёт новую ширину контента только со следующего)
+  if (state.cal_scroll_end or 0) > 0 then
+    ImGui.SetScrollX(ctx, ImGui.GetScrollMaxX(ctx))
+    state.cal_scroll_end = state.cal_scroll_end - 1
+  end
   ImGui.TextDisabled(ctx,
     'активность = сохранения, бэкапы, отчёты · ярче — больше проектов за день')
   if hover_key then
@@ -898,9 +1034,13 @@ local function draw_kanban(cards)
         elseif si then
           ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
         end
-        if ImGui.BeginChild(ctx, '##kbc' .. card.path, col_w - 16, 58,
+        local kx, ky = ImGui.GetCursorScreenPos(ctx)
+        if ImGui.BeginChild(ctx, '##kbc' .. card.path, col_w - 16, 64,
             ImGui.ChildFlags_Border) then
-          ImGui.Text(ctx, trunc(card.name, 18))
+          draw_thumb(card, 46)
+          ImGui.SameLine(ctx)
+          ImGui.BeginGroup(ctx)
+          ImGui.Text(ctx, trunc(card.name, 14))
           if card.pinned then
             ImGui.SameLine(ctx)
             ImGui.TextColored(ctx, 0xD9B96CFF, '●')
@@ -912,8 +1052,9 @@ local function draw_kanban(cards)
           ImGui.TextDisabled(ctx, fmt_date(card.mtime))
           local na = e.meta.report_todo:match('^[^\n]+')
           if na then
-            ImGui.TextColored(ctx, 0xD9B96CFF, trunc('→ ' .. na, 24))
+            ImGui.TextColored(ctx, 0xD9B96CFF, trunc('→ ' .. na, 16))
           end
+          ImGui.EndGroup(ctx)
           ImGui.EndChild(ctx)
         end
         if focused or si then ImGui.PopStyleColor(ctx) end
@@ -921,6 +1062,10 @@ local function draw_kanban(cards)
           ImGui.SetScrollHereY(ctx, 0.5)
           state.scroll_to_focus = false
         end
+        -- невидимая кнопка поверх: child-окно — не item, без неё
+        -- drag&drop с карточки не стартует
+        ImGui.SetCursorScreenPos(ctx, kx, ky)
+        ImGui.InvisibleButton(ctx, '##drag' .. card.path, col_w - 16, 64)
         if ImGui.BeginDragDropSource(ctx) then
           ImGui.SetDragDropPayload(ctx, 'JF_PM_CARD', card.path)
           ImGui.Text(ctx, card.name)
@@ -1040,13 +1185,22 @@ local function draw_toolbar()
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, 'галерея') then export_gallery() end
 
-  -- блок выборки: порядок номеров = порядок склейки
+  -- блок выборки: порядок номеров = порядок склейки; при нескольких
+  -- выделенных — те же команды, что на карточке, но на всю выборку
   if #state.sel > 0 then
     ImGui.SameLine(ctx)
     ImGui.TextColored(ctx, 0xD9B96CFF, string.format('выбрано: %d', #state.sel))
     if #state.sel >= 2 then
       ImGui.SameLine(ctx)
       if ImGui.Button(ctx, 'merge') then merge_selected() end
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, 'открыть') then
+        for _, p in ipairs(state.sel) do open_project(p) end
+      end
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, 'закрепить') then pin_selected() end
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, 'удалить…') then delete_selected() end
     end
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, 'сброс') then state.sel = {} end
@@ -1059,6 +1213,7 @@ local function draw_toolbar()
     if chip(label, state.view == i - 1) then
       state.view = i - 1
       state.focus = 0
+      state.cal_scroll_end = 2
     end
   end
 
@@ -1230,7 +1385,9 @@ local function handle_keys(cards, cols)
     state.focus_tag_input = true
   end
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
-    if state.expanded then
+    if state.tag_add_path then
+      state.tag_add_path = nil
+    elseif state.expanded then
       state.expanded = nil
     elseif #state.sel > 0 then
       state.sel = {}
@@ -1255,7 +1412,7 @@ local function loop()
     local cards = collect_cards()
     local cols = 1
     -- контент в своём child: тулбар и сортировка не скроллятся
-    local wflags = state.view == 3
+    local wflags = (state.view == 2 or state.view == 3)
       and ImGui.WindowFlags_HorizontalScrollbar or ImGui.WindowFlags_None
     if ImGui.BeginChild(ctx, '##content', 0, 0, ImGui.ChildFlags_None, wflags) then
       if state.view == 0 then
