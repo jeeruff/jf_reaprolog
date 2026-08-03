@@ -11,6 +11,8 @@
 -- g/G — в начало/конец, Esc — свернуть → сброс выборки → сброс фокуса.
 -- Канбан: Shift+H/L — перенести карточку в соседний статус, drag&drop мышью.
 
+local VERSION = '0.2'
+
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
 local core = dofile(SCRIPT_DIR .. '/jf_pm_core.lua')
@@ -1231,10 +1233,6 @@ local function draw_toolbar()
     ImGui.SameLine(ctx)
     ImGui.TextColored(ctx, 0xE06060FF, string.format('без отчёта: %d', no_report))
   end
-  if state.status_msg ~= '' then
-    ImGui.SameLine(ctx)
-    ImGui.TextDisabled(ctx, state.status_msg)
-  end
 
   -- ряд фильтров
   if chip('активные', state.filter_status == 0) then state.filter_status = 0 end
@@ -1411,10 +1409,12 @@ local function loop()
 
     local cards = collect_cards()
     local cols = 1
-    -- контент в своём child: тулбар и сортировка не скроллятся
+    -- контент в своём child: тулбар не скроллится, внизу место под статусбар
+    local footer_h = ImGui.GetTextLineHeightWithSpacing(ctx) + 8
     local wflags = (state.view == 2 or state.view == 3)
       and ImGui.WindowFlags_HorizontalScrollbar or ImGui.WindowFlags_None
-    if ImGui.BeginChild(ctx, '##content', 0, 0, ImGui.ChildFlags_None, wflags) then
+    if ImGui.BeginChild(ctx, '##content', 0, -footer_h,
+        ImGui.ChildFlags_None, wflags) then
       if state.view == 0 then
         cols = draw_grid(cards)
       elseif state.view == 1 then
@@ -1427,6 +1427,17 @@ local function loop()
       handle_keys(cards, cols)
       ImGui.EndChild(ctx)
     end
+
+    -- статусбар: слева сообщение или сводка, справа версия
+    ImGui.Separator(ctx)
+    local total = 0
+    for _ in pairs(state.index.projects) do total = total + 1 end
+    ImGui.TextDisabled(ctx, state.status_msg ~= '' and state.status_msg
+      or string.format('%d из %d проектов', #cards, total))
+    local ver = 'JF PM v' .. VERSION
+    ImGui.SameLine(ctx,
+      ImGui.GetWindowWidth(ctx) - ImGui.CalcTextSize(ctx, ver) - 12)
+    ImGui.TextDisabled(ctx, ver)
     ImGui.End(ctx)
   end
   ImGui.PopFont(ctx)
