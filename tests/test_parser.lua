@@ -143,9 +143,10 @@ do
   wf:write('RIFF', string.pack('<I4', #body), body)
   wf:close()
 
-  local ok2, cut = core.trim_wav_tail(wav_path, 1.0)
+  local ok2, lead_cut, tail_cut = core.trim_wav_silence(wav_path, 0.5, 1.0)
   eq(ok2, true, 'trim сработал')
-  eq(cut, 2.0, 'отрезано 2 c (из 3 c хвоста осталась 1)')
+  eq(lead_cut, 0.0, 'в начале тишины не было')
+  eq(tail_cut, 2.0, 'отрезано 2 c (из 3 c хвоста осталась 1)')
   local sz = io.open(wav_path, 'rb'):seek('end')
   eq(sz, 44 + 2 * srate * balign, 'файл = заголовок + 2 c аудио')
   -- заголовок консистентен: data-размер совпадает с фактическим
@@ -154,8 +155,24 @@ do
   eq(string.unpack('<I4', all, 41), 2 * srate * balign, 'data-размер обновлён')
   eq(string.unpack('<I4', all, 5), #all - 8, 'RIFF-размер обновлён')
   -- повторный вызов: резать больше нечего
-  eq(core.trim_wav_tail(wav_path, 1.0), false, 'повторный trim — no-op')
+  eq(core.trim_wav_silence(wav_path, 0.5, 1.0), false, 'повторный trim — no-op')
   os.remove(wav_path)
+
+  -- тишина в начале: 2 c нулей + 1 c звука + 3 c нулей → 0.5 + 1 + 1 = 2.5 c
+  local pcm2 = string.rep('\0', 2 * srate * balign) .. sound .. silence
+  local body2 = 'WAVE' .. 'fmt ' .. string.pack('<I4', #fmt) .. fmt
+    .. 'data' .. string.pack('<I4', #pcm2) .. pcm2
+  local wav2 = os.tmpname()
+  local wf2 = io.open(wav2, 'wb')
+  wf2:write('RIFF', string.pack('<I4', #body2), body2)
+  wf2:close()
+  local ok3, l3, t3 = core.trim_wav_silence(wav2, 0.5, 1.0)
+  eq(ok3, true, 'trim начала сработал')
+  eq(l3, 1.5, 'в начале срезано 1.5 c (осталось 0.5)')
+  eq(t3, 2.0, 'в хвосте срезано 2 c')
+  local sz2 = io.open(wav2, 'rb'):seek('end')
+  eq(sz2, 44 + math.floor(2.5 * srate) * balign, 'файл = 2.5 c аудио')
+  os.remove(wav2)
 end
 
 print('== rename_project ==')

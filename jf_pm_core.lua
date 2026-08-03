@@ -750,11 +750,12 @@ function M.set_project_notes(path, text)
   return write_lines(path, out)
 end
 
--- Обрезает цифровую тишину (нулевые сэмплы) в хвосте WAV, оставляя
--- max_tail_sec. Хвост рендера за последним айтемом — точные нули при любом
--- формате сэмплов (дизеринг в пустоту не пишется), поэтому порог не нужен.
--- Возвращает (true, отрезано_сек) | false (нечего резать) | nil, err.
-function M.trim_wav_tail(path, max_tail_sec)
+-- Обрезает цифровую тишину (нулевые сэмплы) в начале и хвосте WAV,
+-- оставляя max_lead_sec воздуха в начале и max_tail_sec в конце. Тишина
+-- рендера — точные нули при любом формате сэмплов (дизеринг в пустоту не
+-- пишется), поэтому порог не нужен.
+-- Возвращает (true, срезано_в_начале, срезано_в_конце) | false | nil, err.
+function M.trim_wav_silence(path, max_lead_sec, max_tail_sec)
   local f = io.open(path, 'rb')
   if not f then return nil, 'cannot open: ' .. tostring(path) end
   local data = f:read('*a')
@@ -781,10 +782,21 @@ function M.trim_wav_tail(path, max_tail_sec)
   end
   if doff + dsize - 1 > #data then dsize = #data - doff + 1 end
 
-  -- последний ненулевой байт, с конца мегабайтными блоками
-  local last_nz = 0
-  local i = doff + dsize - 1
   local BLOCK = 1 << 20
+  -- первый ненулевой байт, с начала блоками
+  local first_nz = 0
+  local i = doff
+  local dend = doff + dsize - 1
+  while i <= dend do
+    local j = math.min(dend, i + BLOCK - 1)
+    local k = data:sub(i, j):find('[^%z]')
+    if k then first_nz = i + k - 1 break end
+    i = j + 1
+  end
+  if first_nz == 0 then return false end -- сплошная тишина — не трогаем
+  -- последний ненулевой байт, с конца блоками
+  local last_nz = 0
+  i = dend
   while i >= doff do
     local j = math.max(doff, i - BLOCK + 1)
     local chunk = data:sub(j, i)
@@ -799,23 +811,26 @@ function M.trim_wav_tail(path, max_tail_sec)
     end
     i = j - 1
   end
-  if last_nz == 0 then return false end -- сплошная тишина — не трогаем
 
-  local frames_sound = math.ceil((last_nz - doff + 1) / balign)
   local frames_total = math.floor(dsize / balign)
-  local frames_keep = math.min(frames_total,
-    frames_sound + math.floor(srate * (max_tail_sec or 1)))
-  if frames_keep >= frames_total then return false end
+  local first_frame = math.floor((first_nz - doff) / balign)      -- 0-based
+  local sound_end = math.ceil((last_nz - doff + 1) / balign)      -- счёт кадров
+  local skip = math.max(0,
+    first_frame - math.floor(srate * (max_lead_sec or 0.5)))
+  local keep_end = math.min(frames_total,
+    sound_end + math.floor(srate * (max_tail_sec or 1)))
+  if skip == 0 and keep_end >= frames_total then return false end
 
-  local new_dsize = frames_keep * balign
+  local new_dsize = (keep_end - skip) * balign
   local new_head = data:sub(1, doff - 5) .. string.pack('<I4', new_dsize)
   local riff_size = #new_head - 8 + new_dsize
   local out, err = io.open(path, 'wb')
   if not out then return nil, err end
   out:write('RIFF', string.pack('<I4', riff_size), new_head:sub(9))
-  out:write(data:sub(doff, doff + new_dsize - 1))
+  local start = doff + skip * balign
+  out:write(data:sub(start, start + new_dsize - 1))
   out:close()
-  return true, (frames_total - frames_keep) / srate
+  return true, skip / srate, (frames_total - keep_end) / srate
 end
 
 -- ===========================================================================

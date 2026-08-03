@@ -114,6 +114,7 @@ local EN = {
     'Preview: project has neither an end nor regions',
   ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
   ['Превью отрендерено'] = 'Preview rendered',
+  [' · тишина −%d c'] = ' · silence −%d s',
   ['Превью-батч: готово %d'] = 'Preview batch: %d done',
   ['Превью-батч: у всех уже есть аудио'] =
     'Preview batch: every project already has audio',
@@ -1154,6 +1155,9 @@ local function render_preview(card)
     settings = reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, false),
     spos = reaper.GetSetProjectInfo(proj, 'RENDER_STARTPOS', 0, false),
     epos = reaper.GetSetProjectInfo(proj, 'RENDER_ENDPOS', 0, false),
+    norm = reaper.GetSetProjectInfo(proj, 'RENDER_NORMALIZE', 0, false),
+    norm_t = reaper.GetSetProjectInfo(proj, 'RENDER_NORMALIZE_TARGET', 0, false),
+    brick = reaper.GetSetProjectInfo(proj, 'RENDER_BRICKWALL', 0, false),
   }
   local function restore_1x()
     core.set_project_token(card.path, 'RENDER_1X',
@@ -1209,12 +1213,19 @@ local function render_preview(card)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', pv_name, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', 'evaw', true)
   reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, true) -- master mix
+  -- нормализация -18 LUFS-I + брикволл-лимит -0.5 dBTP («клипануть»);
+  -- флаги: &1 норм. вкл (режим 0 = LUFS-I), &64 брикволл, &128 true peak —
+  -- проверить биты на железе. Значения — линейные, не dB.
+  reaper.GetSetProjectInfo(proj, 'RENDER_NORMALIZE', 1 | 64 | 128, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_NORMALIZE_TARGET', 10 ^ (-18 / 20), true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_BRICKWALL', 10 ^ (-0.5 / 20), true)
   reaper.Main_OnCommand(41824, 0) -- File: Render project, using the most recent render settings
   -- REAPER часто видит конец проекта сильно дальше звука (огибающие,
   -- маркеры) — отрезаем цифровую тишину в хвосте, оставляя секунду
-  local trimmed, cut = core.trim_wav_tail(pv_path, 1.0)
+  local trimmed, lead_cut, tail_cut = core.trim_wav_silence(pv_path, 0.5, 1.0)
   if trimmed then
-    bounds_note = bounds_note .. string.format(' · хвост −%d c', math.floor(cut + 0.5))
+    bounds_note = bounds_note .. string.format(T(' · тишина −%d c'),
+      math.floor(lead_cut + tail_cut + 0.5))
   end
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FILE', old.file, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', old.pat, true)
@@ -1223,6 +1234,9 @@ local function render_preview(card)
   reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', old.settings, true)
   reaper.GetSetProjectInfo(proj, 'RENDER_STARTPOS', old.spos, true)
   reaper.GetSetProjectInfo(proj, 'RENDER_ENDPOS', old.epos, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_NORMALIZE', old.norm, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_NORMALIZE_TARGET', old.norm_t, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_BRICKWALL', old.brick, true)
   reaper.Main_SaveProject(0, false)
   reaper.Main_OnCommand(40860, 0) -- Close current project tab
   restore_1x()
