@@ -1,5 +1,10 @@
 <REAPER_PROJECT 0.1 "7.15/macOS-arm64" 1722345678
   RIPPLE 0
+  <NOTES 0 2
+    |Ночная вещь, серия dungeon.
+    |- [ ] дописать интро
+    |- [x] выбрать темп
+  >
   GROUPOVERRIDE 0 0 0
   AUTOXFADE 129
   ENVATTACH 3
@@ -83,6 +88,9 @@
   >
   <TRACK {B1111111-1111-1111-1111-111111111111}
     NAME "flute main"
+    <NOTES
+      |дубль 3 лучший, дубль 1 запасной
+    >
     PEAKCOL 16576
     BEAT -1
     AUTOMODE 0
@@ -126,6 +134,9 @@
       SNAPOFFS 0
       LENGTH 32.25
       LOOP 1
+      <NOTES
+        |поправить дыхание на 1:12
+      >
       ALLTAKES 0
       FADEIN 1 0.01 0 1 0 0 0
       FADEOUT 1 0.01 0 1 0 0 0

@@ -490,22 +490,42 @@ local function merge_selected()
   state.status_msg = 'Merge → ' .. out
 end
 
+-- Правки закрытых .rpp (rename, дедлайн, чекбоксы) требуют, чтобы проект
+-- не был открыт: открытый перезапишет файл при сохранении.
+local function project_is_open(path)
+  local i = 0
+  while true do
+    local proj, fn = reaper.EnumProjects(i)
+    if not proj then break end
+    if fn == path then return true end
+    i = i + 1
+  end
+  return false
+end
+
+local function warn_open(card, action)
+  reaper.MB('Проект «' .. card.name .. '» открыт в REAPER.\n\n' ..
+    'Закрой вкладку проекта и повтори: ' .. action .. '.',
+    'JF PM', 0)
+end
+
+-- Перечитать карточку с диска после текстовой правки .rpp
+local function refresh_card(path)
+  local old = state.index.projects[path]
+  local nc = core.build_card(path, old)
+  if nc then state.index.projects[path] = nc end
+  core.save_index(state.index)
+  search_cache[path] = nil
+  return nc
+end
+
 -- Переименование: всё с префиксом имени + папка проекта (см. core).
--- Открытый в REAPER проект переименовывать нельзя — файл под ним уедет.
 local function rename_project(card, new_name)
   new_name = new_name:match('^%s*(.-)%s*$')
   if new_name == '' or new_name == card.name then return end
-  local pi = 0
-  while true do
-    local proj, fn = reaper.EnumProjects(pi)
-    if not proj then break end
-    if fn == card.path then
-      reaper.MB('Проект «' .. card.name .. '» открыт в REAPER.\n\n' ..
-        'Закрой вкладку проекта и повтори переименование.',
-        'JF PM — переименование', 0)
-      return
-    end
-    pi = pi + 1
+  if project_is_open(card.path) then
+    warn_open(card, 'переименование')
+    return
   end
   local new_path, extra = core.rename_project(card.path, new_name)
   if not new_path then
@@ -529,6 +549,74 @@ local function rename_project(card, new_name)
   end
   if state.expanded == card.path then state.expanded = new_path end
   state.status_msg = 'Переименовано → ' .. new_path
+end
+
+-- Переключить чекбокс todo: правка источника (REPORT_TODO либо project
+-- notes) в тексте .rpp, затем перечитать карточку.
+local function toggle_todo(card, meta, todo)
+  if project_is_open(card.path) then
+    warn_open(card, 'правка todo')
+    return
+  end
+  local src_text
+  if todo.src == 'todo' then
+    src_text = core.decode_ml((card.ext or {}).REPORT_TODO or '')
+  else
+    src_text = card.notes or ''
+  end
+  local out, ln = {}, 0
+  for line in (src_text .. '\n'):gmatch('(.-)\n') do
+    ln = ln + 1
+    if ln == todo.line then
+      local toggled = line:gsub('%[([ xXхХ])%]', function(m)
+        return m == ' ' and '[x]' or '[ ]'
+      end, 1)
+      out[#out + 1] = toggled
+    else
+      out[#out + 1] = line
+    end
+  end
+  while #out > 0 and out[#out] == '' do out[#out] = nil end
+  local new_text = table.concat(out, '\n')
+  local ok, err
+  if todo.src == 'todo' then
+    ok, err = core.set_ext_in_rpp(card.path, 'REPORT_TODO',
+      core.encode_ml(new_text))
+  else
+    ok, err = core.set_project_notes(card.path, new_text)
+  end
+  if not ok then
+    state.status_msg = 'Todo: ' .. tostring(err)
+    return
+  end
+  refresh_card(card.path)
+end
+
+-- Дедлайн с карточки: пишется в extstate закрытого .rpp
+local function set_deadline(card, text)
+  text = text:match('^%s*(.-)%s*$')
+  if project_is_open(card.path) then
+    warn_open(card, 'дедлайн')
+    return
+  end
+  local val = ''
+  if text ~= '' then
+    local ts = core.parse_date(text)
+    if not ts then
+      reaper.MB('Не понял дату «' .. text .. '».\nФормат: дд.мм или дд.мм.гг',
+        'JF PM — дедлайн', 0)
+      return
+    end
+    val = tostring(ts)
+  end
+  local ok, err = core.set_ext_in_rpp(card.path, 'DEADLINE', val)
+  if not ok then
+    state.status_msg = 'Дедлайн: ' .. tostring(err)
+    return
+  end
+  refresh_card(card.path)
+  state.status_msg = val == '' and 'Дедлайн снят'
+    or ('Дедлайн: ' .. os.date('%d.%m.%y', tonumber(val)))
 end
 
 -- ---------------------------------------------------------------------------
@@ -614,6 +702,30 @@ end
 -- ---------------------------------------------------------------------------
 -- Сетка карточек
 
+-- md-lite: # заголовки, - буллеты; строки-чекбоксы пропускаются
+-- (они рисуются интерактивно в блоке TODO)
+local function draw_md(text)
+  for line in (text .. '\n'):gmatch('(.-)\n') do
+    local todo = line:match('^%s*[-*]%s*%[[ xXхХ]%]')
+    local h = line:match('^#+%s*(.+)')
+    local b = line:match('^%s*[-*]%s+(.+)')
+    if todo then -- пропуск
+    elseif h then
+      ImGui.TextColored(ctx, 0xD9B96CFF, h)
+    elseif b then
+      ImGui.BulletText(ctx, b)
+    elseif line ~= '' then
+      ImGui.TextWrapped(ctx, line)
+    end
+  end
+end
+
+local function deadline_color(ts, now)
+  if ts < now then return 0xE06060FF end                -- просрочен
+  if ts < now + 7 * 86400 then return 0xD9B96CFF end    -- неделя
+  return 0x8A8F93FF
+end
+
 local function draw_card_details(card, meta)
   ImGui.Separator(ctx)
   ImGui.Text(ctx, string.format('%s BPM · %d/%d · %d трек(ов)',
@@ -622,6 +734,59 @@ local function draw_card_details(card, meta)
 
   if meta.desc ~= '' then
     ImGui.TextWrapped(ctx, meta.desc)
+  end
+
+  -- дедлайн: показ + инлайн-правка (пишется в .rpp закрытого проекта)
+  local now = os.time()
+  ImGui.TextDisabled(ctx, 'Дедлайн:')
+  ImGui.SameLine(ctx)
+  if meta.deadline > 0 then
+    local left = math.floor((meta.deadline - now) / 86400)
+    ImGui.TextColored(ctx, deadline_color(meta.deadline, now),
+      os.date('%d.%m.%y', meta.deadline) ..
+      (left < 0 and '  (просрочен)' or ('  (' .. left .. ' дн.)')))
+    ImGui.SameLine(ctx)
+  end
+  if state.dl_path == card.path then
+    ImGui.SetNextItemWidth(ctx, 110)
+    if state.dl_focus then
+      ImGui.SetKeyboardFocusHere(ctx)
+      state.dl_focus = false
+    end
+    local done, v = ImGui.InputTextWithHint(ctx, '###dl', 'дд.мм[.гг]',
+      state.dl_text, ImGui.InputTextFlags_EnterReturnsTrue)
+    if v then state.dl_text = v end
+    if done then
+      set_deadline(card, state.dl_text)
+      state.dl_path = nil
+      return
+    end
+  else
+    if ImGui.SmallButton(ctx, meta.deadline > 0 and 'изменить###dl'
+        or 'назначить###dl') then
+      state.dl_path = card.path
+      state.dl_text = meta.deadline > 0 and os.date('%d.%m.%y', meta.deadline) or ''
+      state.dl_focus = true
+    end
+    if meta.deadline > 0 then
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, 'снять###dlx') then
+        set_deadline(card, '')
+        return
+      end
+    end
+  end
+
+  -- TODO: чекбоксы из отчёта и project notes (md: - [ ] / - [x])
+  if #meta.todos > 0 then
+    ImGui.TextDisabled(ctx, 'TODO:')
+    for ti, td in ipairs(meta.todos) do
+      local changed = ImGui.Checkbox(ctx, td.text .. '###td' .. ti, td.done)
+      if changed then
+        toggle_todo(card, meta, td)
+        return
+      end
+    end
   end
 
   if #card.regions > 0 then
@@ -645,13 +810,51 @@ local function draw_card_details(card, meta)
     end
   end
 
+  -- заметки: проект / треки / айтемы — свёрнуты, как бэкапы
+  if (card.notes or '') ~= '' then
+    if ImGui.TreeNode(ctx, 'Заметки проекта###pnotes') then
+      draw_md(card.notes)
+      ImGui.TreePop(ctx)
+    end
+  end
+  local tnotes = card.track_notes or {}
+  if #tnotes > 0 then
+    if ImGui.TreeNode(ctx, string.format('Заметки треков (%d)###tnotes',
+        #tnotes)) then
+      for _, n in ipairs(tnotes) do
+        local tname = (card.track_names or {})[n.t] or ''
+        ImGui.BulletText(ctx, (tname ~= '' and tname or ('трек ' .. n.t)) .. ':')
+        ImGui.Indent(ctx)
+        draw_md(n.s)
+        ImGui.Unindent(ctx)
+      end
+      ImGui.TreePop(ctx)
+    end
+  end
+  local inotes = card.item_notes or {}
+  if #inotes > 0 then
+    if ImGui.TreeNode(ctx, string.format('Заметки айтемов (%d)###inotes',
+        #inotes)) then
+      for _, n in ipairs(inotes) do
+        ImGui.BulletText(ctx, string.format('[%s, трек %d]',
+          fmt_duration(n.p), n.t))
+        ImGui.Indent(ctx)
+        draw_md(n.s)
+        ImGui.Unindent(ctx)
+      end
+      ImGui.TreePop(ctx)
+    end
+  end
+
   if meta.report_done ~= '' or meta.report_todo ~= '' then
     ImGui.TextDisabled(ctx, 'Отчёт (' .. fmt_date(meta.report_ts) .. '):')
     if meta.report_done ~= '' then
-      ImGui.TextWrapped(ctx, 'Сделано: ' .. meta.report_done)
+      ImGui.TextDisabled(ctx, 'Сделано:')
+      draw_md(meta.report_done)
     end
     if meta.report_todo ~= '' then
-      ImGui.TextWrapped(ctx, 'Дальше: ' .. meta.report_todo)
+      ImGui.TextDisabled(ctx, 'Дальше:')
+      draw_md(meta.report_todo)
     end
   else
     ImGui.TextDisabled(ctx, 'Отчёта нет')
@@ -868,6 +1071,11 @@ local function draw_card(entry, i, card_w)
     end
 
     ImGui.TextDisabled(ctx, fmt_date(card.mtime))
+    if (meta.deadline or 0) > 0 then
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, deadline_color(meta.deadline, os.time()),
+        '→ ' .. os.date('%d.%m', meta.deadline))
+    end
     ImGui.TextDisabled(ctx, fmt_duration(card.duration) .. '   ' ..
       (#card.regions) .. ' рег.' ..
       (card.dir_size and ('   ' .. fmt_size(card.dir_size)) or ''))
@@ -1036,42 +1244,64 @@ local function draw_calendar(cards)
       a.n = a.n + 1
     end
   end
+  -- дедлайны — отдельным слоем, они в будущем
+  local dl_days = {}
   for _, e in ipairs(cards) do
     mark(e.card.mtime, e.card.name)
     mark(e.meta.report_ts, e.card.name)
     for _, b in ipairs(e.card.backups or {}) do mark(b.mtime, e.card.name) end
+    if (e.meta.deadline or 0) > 0 then
+      local key = day_key(e.meta.deadline)
+      local t = dl_days[key]
+      if not t then t = {} dl_days[key] = t end
+      t[#t + 1] = e.card.name
+    end
   end
 
-  -- диапазон: от старейшей активности (но не меньше 26 недель) до сегодня
-  local oldest = now
+  -- диапазон: от старейшей активности (но не меньше 26 недель) до сегодня,
+  -- дальше в будущее — до самого позднего дедлайна (минимум 2 недели)
+  local oldest, latest = now, now + 13 * DAY
   for k in pairs(act) do if k < oldest then oldest = k end end
+  for k in pairs(dl_days) do if k > latest then latest = k end end
   local WEEKS = math.max(26, math.ceil((day_key(now) - oldest) / (7 * DAY)) + 1)
   local cell, gap = 16, 3
   local wd = (os.date('*t', now).wday + 5) % 7 -- 0 = понедельник
   local monday = day_key(now) - wd * DAY
   local start = monday - (WEEKS - 1) * 7 * DAY
+  local FUT_WEEKS = math.ceil((day_key(latest) - monday) / (7 * DAY)) + 1
+  WEEKS = WEEKS + FUT_WEEKS
 
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
   y0 = y0 + 16 -- место под метки месяцев
   local dl = ImGui.GetWindowDrawList(ctx)
   local mx, my = ImGui.GetMousePos(ctx)
-  local hover_key, hover_act
+  local hover_key, hover_act, hover_dl
   local prev_month = ''
+  local today_key = day_key(now)
   for w = 0, WEEKS - 1 do
     for d = 0, 6 do
       local ts = start + (w * 7 + d) * DAY + DAY / 2
-      if ts > now + DAY then break end
+      if ts > day_key(latest) + DAY then break end
       local key = day_key(ts)
       local cx = x0 + w * (cell + gap)
       local cy = y0 + d * (cell + gap)
       local a = act[key]
-      local col = 0x1B1B1BFF
+      local future = key > today_key
+      local col = future and 0x141414FF or 0x1B1B1BFF
       if a then
         col = a.n >= 3 and 0xE8E8E8FF or (a.n == 2 and 0x9A9A9AFF or 0x5C5C5CFF)
       end
       ImGui.DrawList_AddRectFilled(dl, cx, cy, cx + cell, cy + cell, col, 2)
+      if dl_days[key] then
+        -- дедлайн: янтарная рамка (просроченный — красная)
+        ImGui.DrawList_AddRect(dl, cx, cy, cx + cell, cy + cell,
+          key < today_key and 0xE06060FF or 0xD9B96CFF, 2, 0, 2)
+      end
+      if key == today_key then
+        ImGui.DrawList_AddRect(dl, cx, cy, cx + cell, cy + cell, 0xE8E8E8FF, 2)
+      end
       if mx >= cx and mx < cx + cell and my >= cy and my < cy + cell then
-        hover_key, hover_act = key, a
+        hover_key, hover_act, hover_dl = key, a, dl_days[key]
       end
       if d == 0 then
         local m = os.date('%m', ts)
@@ -1083,16 +1313,23 @@ local function draw_calendar(cards)
     end
   end
   ImGui.Dummy(ctx, WEEKS * (cell + gap), 7 * (cell + gap) + 18)
-  -- при входе в календарь скроллим к сегодняшнему краю (2 кадра:
-  -- GetScrollMaxX узнаёт новую ширину контента только со следующего)
+  -- при входе в календарь скроллим к сегодняшнему дню (2 кадра:
+  -- GetScrollMaxX узнаёт новую ширину контента только со следующего);
+  -- будущее с дедлайнами остаётся справа за краем
   if (state.cal_scroll_end or 0) > 0 then
-    ImGui.SetScrollX(ctx, ImGui.GetScrollMaxX(ctx))
+    local today_x = (WEEKS - FUT_WEEKS + 2) * (cell + gap)
+    local target = math.max(0, today_x - ImGui.GetWindowWidth(ctx) + 60)
+    ImGui.SetScrollX(ctx, math.min(target, ImGui.GetScrollMaxX(ctx)))
     state.cal_scroll_end = state.cal_scroll_end - 1
   end
   ImGui.TextDisabled(ctx,
-    'активность = сохранения, бэкапы, отчёты · ярче — больше проектов за день')
+    'активность = сохранения, бэкапы, отчёты · ярче — больше проектов ' ..
+    '· рамка — дедлайн · белая рамка — сегодня')
   if hover_key then
     local txt = os.date('%d.%m.%Y', hover_key + 3600)
+    if hover_dl then
+      txt = txt .. '\nдедлайн: ' .. table.concat(hover_dl, ', ')
+    end
     if hover_act then
       local names = {}
       for n in pairs(hover_act.names) do names[#names + 1] = n end

@@ -65,6 +65,55 @@ eq(card.render_pattern, '$project_v3', 'render pattern')
 -- items: 0+32.25 и 32.25+72.5=104.75; регионы до 96 → длительность 104.75
 eq(card.duration, 104.75, 'duration from items/regions')
 
+print('== notes / todos / deadline ==')
+eq(card.notes, 'Ночная вещь, серия dungeon.\n- [ ] дописать интро\n- [x] выбрать темп',
+  'project notes parsed')
+eq(#card.track_notes, 1, 'track notes count')
+eq(card.track_notes[1].t, 1, 'track note on track 1')
+eq(card.track_notes[1].s, 'дубль 3 лучший, дубль 1 запасной', 'track note text')
+eq(#card.item_notes, 1, 'item notes count')
+eq(card.item_notes[1].t, 1, 'item note on track 1')
+eq(card.item_notes[1].s, 'поправить дыхание на 1:12', 'item note text')
+
+local nmeta = core.card_meta(card)
+eq(#nmeta.todos, 2, 'todos from project notes')
+eq(nmeta.todos[1].done, false, 'todo 1 open')
+eq(nmeta.todos[1].text, 'дописать интро', 'todo 1 text')
+eq(nmeta.todos[2].done, true, 'todo 2 done')
+eq(nmeta.todos[2].src, 'notes', 'todo src')
+
+local ts = core.parse_date('15.08.26')
+local dt = os.date('*t', ts)
+check(dt.day == 15 and dt.month == 8 and dt.year == 2026, 'parse_date full')
+check(core.parse_date('32.01') == nil, 'parse_date bad day')
+check(core.parse_date('abc') == nil, 'parse_date garbage')
+
+print('== set_ext_in_rpp / set_project_notes ==')
+do
+  local tmp = os.tmpname()
+  local src = io.open('tests/fixtures/test_project.rpp', 'rb'):read('*a')
+  io.open(tmp, 'wb'):write(src):close()
+  -- существующий ключ заменяется, новый добавляется
+  assert(core.set_ext_in_rpp(tmp, 'STATUS', 'готово'))
+  assert(core.set_ext_in_rpp(tmp, 'DEADLINE', '1766000000'))
+  local c2 = core.parse_rpp(tmp)
+  eq(c2.ext.STATUS, 'готово', 'ext key replaced')
+  eq(c2.ext.DEADLINE, '1766000000', 'ext key added')
+  eq(core.card_meta(c2).deadline, 1766000000, 'meta deadline')
+  local _, dup = src:gsub('STATUS', '')
+  local txt = io.open(tmp, 'rb'):read('*a')
+  local _, dup2 = txt:gsub('\n      STATUS ', '')
+  eq(dup2, 1, 'STATUS not duplicated')
+  -- notes: замена блока, чекбокс переключён
+  assert(core.set_project_notes(tmp,
+    'Ночная вещь, серия dungeon.\n- [x] дописать интро\n- [x] выбрать темп'))
+  local c3 = core.parse_rpp(tmp)
+  local m3 = core.card_meta(c3)
+  eq(m3.todos[1].done, true, 'todo toggled via set_project_notes')
+  eq(c3.track_count, 4, 'project still parses after edits')
+  os.remove(tmp)
+end
+
 print('== rename_project ==')
 do
   -- стаб reaper.* поверх ls (как в рескан-харнессе)

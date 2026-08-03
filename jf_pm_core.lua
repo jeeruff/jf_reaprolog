@@ -226,8 +226,11 @@ function M.parse_rpp(path)
     track_names = {}, regions = {}, markers = {},
     render_file = '', render_pattern = '',
     duration = 0, ext = {}, items = {},
+    notes = '', track_notes = {}, item_notes = {},
   }
-  local MAX_ITEMS = 800 -- кап карты айтемов, чтобы индекс не разбухал
+  local MAX_ITEMS = 800      -- кап карты айтемов, чтобы индекс не разбухал
+  local MAX_NOTE_ITEMS = 200 -- кап заметок айтемов
+  local note_buf, note_parent = nil, nil
   local stack = {}
   local region_open = {}   -- id -> запись региона, ждущая парной строки-конца
   local cur_item = nil
@@ -243,9 +246,26 @@ function M.parse_rpp(path)
         card.track_names[#card.track_names + 1] = ''
       elseif tag == 'ITEM' then
         cur_item = { pos = 0, len = 0, tr = #card.track_names }
+      elseif tag == 'NOTES' then
+        -- заметки: |строки; хозяин — проект, трек или айтем
+        note_buf, note_parent = {}, parent
       end
     elseif s == '>' then
       local top = stack[#stack]
+      if top == 'NOTES' and note_buf then
+        local text = table.concat(note_buf, '\n')
+        if text ~= '' then
+          if note_parent == 'REAPER_PROJECT' then
+            card.notes = text
+          elseif note_parent == 'TRACK' then
+            card.track_notes[#card.track_notes + 1] =
+              { t = #card.track_names, s = text }
+          elseif note_parent == 'ITEM' and cur_item then
+            cur_item.note = text
+          end
+        end
+        note_buf, note_parent = nil, nil
+      end
       if top == 'ITEM' and cur_item then
         local fin = cur_item.pos + cur_item.len
         if fin > card.duration then card.duration = fin end
@@ -255,6 +275,13 @@ function M.parse_rpp(path)
             t = cur_item.tr,
             p = math.floor(cur_item.pos * 10 + 0.5) / 10,
             l = math.floor(cur_item.len * 10 + 0.5) / 10,
+          }
+        end
+        if cur_item.note and #card.item_notes < MAX_NOTE_ITEMS then
+          card.item_notes[#card.item_notes + 1] = {
+            t = cur_item.tr,
+            p = math.floor(cur_item.pos * 10 + 0.5) / 10,
+            s = cur_item.note:sub(1, 400),
           }
         end
         cur_item = nil
@@ -302,6 +329,8 @@ function M.parse_rpp(path)
         elseif s:sub(1, 7) == 'LENGTH ' then
           cur_item.len = tonumber(s:sub(8)) or 0
         end
+      elseif top == 'NOTES' and note_buf then
+        if s:sub(1, 1) == '|' then note_buf[#note_buf + 1] = s:sub(2) end
       elseif top == M.NAMESPACE and stack[depth - 1] == 'EXTSTATE' then
         local t = M.tokenize_rpp_line(s)
         if t[1] then card.ext[t[1]] = t[2] or '' end
@@ -560,6 +589,122 @@ function M.build_index(paths, old_index)
 end
 
 -- ===========================================================================
+-- Правка закрытого .rpp (текстовый уровень)
+-- ===========================================================================
+-- Для дедлайнов и чекбоксов из карточки: extstate и project notes меняются
+-- прямо в тексте файла. Вызывающий обязан проверить, что проект не открыт
+-- в REAPER (открытый перезапишет файл при сохранении).
+
+local function read_lines(p)
+  local f = io.open(p, 'rb')
+  if not f then return nil end
+  local out = {}
+  for l in f:lines() do out[#out + 1] = l end
+  f:close()
+  return out
+end
+
+local function write_lines(path, lines)
+  local f, err = io.open(path, 'wb')
+  if not f then return nil, err end
+  f:write(table.concat(lines, '\n'), '\n')
+  f:close()
+  return true
+end
+
+local function rpp_quote(v)
+  if not v:find('"') then return '"' .. v .. '"'
+  elseif not v:find("'") then return "'" .. v .. "'"
+  else return '`' .. v .. '`' end
+end
+
+-- Ставит key value в блок <EXTSTATE><JF_PM> (создаёт блоки при отсутствии).
+function M.set_ext_in_rpp(path, key, value)
+  local lines = read_lines(path)
+  if not lines then return nil, 'cannot read: ' .. path end
+  local depth, in_ext, in_ns = 0, false, false
+  local key_line, ns_close, ext_close, proj_close
+  for i, line in ipairs(lines) do
+    local s = line:match('^%s*(.-)%s*$')
+    if s:sub(1, 1) == '<' then
+      depth = depth + 1
+      local tag = s:match('^<([%u%d_]+)')
+      if depth == 2 and tag == 'EXTSTATE' then in_ext = true end
+      if depth == 3 and in_ext and tag == M.NAMESPACE then in_ns = true end
+    elseif s == '>' then
+      if in_ns and depth == 3 then in_ns = false ns_close = ns_close or i end
+      if in_ext and depth == 2 then in_ext = false ext_close = ext_close or i end
+      if depth == 1 then proj_close = i end
+      depth = depth - 1
+    elseif in_ns and depth == 3 then
+      local t = M.tokenize_rpp_line(s)
+      if t[1] == key and not key_line then key_line = i end
+    end
+  end
+  if not proj_close then return nil, 'нет закрывающего >' end
+
+  local kv = key .. ' ' .. rpp_quote(value)
+  if key_line then
+    local indent = lines[key_line]:match('^(%s*)') or '      '
+    lines[key_line] = indent .. kv
+  elseif ns_close then
+    table.insert(lines, ns_close, '      ' .. kv)
+  elseif ext_close then
+    table.insert(lines, ext_close, '    <' .. M.NAMESPACE)
+    table.insert(lines, ext_close + 1, '      ' .. kv)
+    table.insert(lines, ext_close + 2, '    >')
+  else
+    table.insert(lines, proj_close, '  <EXTSTATE')
+    table.insert(lines, proj_close + 1, '    <' .. M.NAMESPACE)
+    table.insert(lines, proj_close + 2, '      ' .. kv)
+    table.insert(lines, proj_close + 3, '    >')
+    table.insert(lines, proj_close + 4, '  >')
+  end
+  return write_lines(path, lines)
+end
+
+-- Заменяет project notes (top-level <NOTES>) на text; создаёт блок при
+-- отсутствии.
+function M.set_project_notes(path, text)
+  local lines = read_lines(path)
+  if not lines then return nil, 'cannot read: ' .. path end
+  local depth = 0
+  local n_open, n_close, proj_close
+  for i, line in ipairs(lines) do
+    local s = line:match('^%s*(.-)%s*$')
+    if s:sub(1, 1) == '<' then
+      depth = depth + 1
+      if depth == 2 and s:match('^<NOTES') and not n_open then n_open = i end
+    elseif s == '>' then
+      if depth == 2 and n_open and not n_close then n_close = i end
+      if depth == 1 then proj_close = i end
+      depth = depth - 1
+    end
+  end
+  if not proj_close then return nil, 'нет закрывающего >' end
+
+  local block = {}
+  for l in (text .. '\n'):gmatch('(.-)\n') do
+    block[#block + 1] = '    |' .. l
+  end
+  while #block > 0 and block[#block] == '    |' do block[#block] = nil end
+
+  local out = {}
+  if n_open then
+    for i = 1, n_open do out[#out + 1] = lines[i] end
+    for _, b in ipairs(block) do out[#out + 1] = b end
+    for i = n_close, #lines do out[#out + 1] = lines[i] end
+  else
+    for i = 1, proj_close - 1 do out[#out + 1] = lines[i] end
+    out[#out + 1] = '  <NOTES 0 2'
+    for _, b in ipairs(block) do out[#out + 1] = b end
+    out[#out + 1] = '  >'
+    for i = proj_close, #lines do out[#out + 1] = lines[i] end
+  end
+  return write_lines(path, out)
+end
+
+-- ===========================================================================
 -- Переименование проекта
 -- ===========================================================================
 -- Переименовывает всё с префиксом старого имени: .rpp, бэкапы (в папке и в
@@ -648,15 +793,6 @@ local function abs_file_line(line, dir)
     path = dir .. '/' .. path
   end
   return head .. q .. path .. q .. tail
-end
-
-local function read_lines(p)
-  local f = io.open(p, 'rb')
-  if not f then return nil end
-  local out = {}
-  for l in f:lines() do out[#out + 1] = l end
-  f:close()
-  return out
 end
 
 -- paths — упорядоченный список .rpp, out_path — куда писать результат.
@@ -781,6 +917,38 @@ function M.get_scan_paths()
   return out
 end
 
+-- 'дд.мм[.гг[гг]]' → unix ts (12:00). Без года — ближайшая будущая дата.
+function M.parse_date(s)
+  local d, m, y = s:match('^%s*(%d%d?)%.(%d%d?)%.?(%d*)%s*$')
+  if not d then return nil end
+  d, m = tonumber(d), tonumber(m)
+  if d < 1 or d > 31 or m < 1 or m > 12 then return nil end
+  local year
+  if y == '' then
+    year = os.date('*t').year
+    if os.time{ year = year, month = m, day = d, hour = 12 }
+       < os.time() - 86400 then
+      year = year + 1
+    end
+  else
+    year = tonumber(y)
+    if year < 100 then year = year + 2000 end
+  end
+  return os.time{ year = year, month = m, day = d, hour = 12 }
+end
+
+-- Чекбоксы '- [ ] текст' / '- [x] текст' из текста (md-синтаксис)
+local function scan_todos(text, src, out)
+  local ln = 0
+  for line in (text .. '\n'):gmatch('(.-)\n') do
+    ln = ln + 1
+    local mark, rest = line:match('^%s*[-*]%s*%[([ xXхХ])%]%s*(.*)')
+    if mark then
+      out[#out + 1] = { done = mark ~= ' ', text = rest, src = src, line = ln }
+    end
+  end
+end
+
 -- Расшифровка полей extstate карточки в удобный вид
 function M.card_meta(card)
   local ext = card.ext or {}
@@ -789,7 +957,14 @@ function M.card_meta(card)
     t = t:match('^%s*(.-)%s*$')
     if t ~= '' then tags[#tags + 1] = t end
   end
+  local todo_text = ext.REPORT_TODO and M.decode_ml(ext.REPORT_TODO) or ''
+  -- todo из отчёта и из project notes, src помнит источник (для toggle)
+  local todos = {}
+  scan_todos(todo_text, 'todo', todos)
+  scan_todos(card.notes or '', 'notes', todos)
   return {
+    deadline = tonumber(ext.DEADLINE) or 0,
+    todos = todos,
     -- status_over — решение из канбана (индекс), пока проект не открыт;
     -- сбрасывается в build_card, если STATUS в .rpp изменился после него
     status = card.status_over or ext.STATUS or '',

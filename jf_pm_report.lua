@@ -42,6 +42,8 @@ local st = {
   desc = get_ext('DESC') ~= '' and core.decode_ml(get_ext('DESC')) or '',
   done = '',
   todo = prev_todo ~= '' and core.decode_ml(prev_todo) or '',
+  deadline = tonumber(get_ext('DEADLINE'))
+    and os.date('%d.%m.%y', tonumber(get_ext('DEADLINE'))) or '',
 }
 for i, s in ipairs(core.STATUSES) do
   if s == prev_status then st.status_idx = i end
@@ -77,12 +79,31 @@ local function save_report()
   reaper.SetProjExtState(proj, NS, 'REPORT_TODO', core.encode_ml(st.todo))
   reaper.SetProjExtState(proj, NS, 'REPORT_TS', tostring(os.time()))
 
+  local dl_ts = st.deadline ~= '' and core.parse_date(st.deadline) or nil
+  reaper.SetProjExtState(proj, NS, 'DEADLINE', dl_ts and tostring(dl_ts) or '')
+
   local log = get_ext('REPORT_LOG')
   log = log ~= '' and core.decode_ml(log) .. '\n\n' or ''
   log = log .. os.date('== %d.%m.%Y %H:%M ==')
   if st.done ~= '' then log = log .. '\nсделано: ' .. st.done end
   if st.todo ~= '' then log = log .. '\nдальше: ' .. st.todo end
   reaper.SetProjExtState(proj, NS, 'REPORT_LOG', core.encode_ml(log))
+
+  -- фьючурпруф-зеркало в project notes: читается без скрипта, в самом
+  -- REAPER (View → Project notes). Свой текст пользователя выше маркера
+  -- сохраняется, заменяется только блок ниже маркера.
+  local MARK = '--- JF PM ---'
+  local cur = reaper.GetSetProjectNotes(proj, false, '')
+  local head = cur:match('^(.-)%s*' .. MARK:gsub('%-', '%%-')) or cur
+  head = head:gsub('%s+$', '')
+  local mirror = MARK .. '\n' .. os.date('%d.%m.%Y')
+    .. (status ~= '' and (' · ' .. status) or '')
+    .. (dl_ts and (' · дедлайн ' .. os.date('%d.%m.%y', dl_ts)) or '')
+  if st.desc ~= '' then mirror = mirror .. '\n' .. st.desc end
+  if st.done ~= '' then mirror = mirror .. '\n\nсделано:\n' .. st.done end
+  if st.todo ~= '' then mirror = mirror .. '\n\nдальше:\n' .. st.todo end
+  reaper.GetSetProjectNotes(proj, true,
+    (head ~= '' and (head .. '\n\n') or '') .. mirror)
 
   reaper.Main_SaveProject(proj, false)
   refresh_index_card(false)
@@ -106,10 +127,18 @@ local function loop()
     rv, st.done = ImGui.InputTextMultiline(ctx, '##done', st.done, -1, 90)
 
     ImGui.Text(ctx, 'Что надо сделать:')
+    ImGui.SameLine(ctx)
+    ImGui.TextDisabled(ctx, '(«- [ ] пункт» станет чекбоксом в карточке)')
     rv, st.todo = ImGui.InputTextMultiline(ctx, '##todo', st.todo, -1, 90)
 
     ImGui.SetNextItemWidth(ctx, 160)
     rv, st.status_idx = ImGui.Combo(ctx, 'статус', st.status_idx, STATUS_LABELS)
+    ImGui.SameLine(ctx)
+    ImGui.SetNextItemWidth(ctx, 100)
+    rv, st.deadline = ImGui.InputTextWithHint(ctx, '##dl', 'дедлайн', st.deadline)
+    if ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, 'дд.мм[.гг], пусто — снять')
+    end
     ImGui.SameLine(ctx)
     ImGui.SetNextItemWidth(ctx, -1)
     rv, st.tags = ImGui.InputTextWithHint(ctx, '##tags',
