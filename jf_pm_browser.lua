@@ -108,6 +108,20 @@ local EN = {
     'click — subproject into the active project\nCmd+click — into the region basket',
   ['В корзине регионов: %d'] = 'Region basket: %d',
   ['Язык / Language:'] = 'Язык / Language:',
+  ['первый регион: '] = 'first region: ',
+  [' (первые 5 мин)'] = ' (first 5 min)',
+  ['Превью: у проекта нет ни конца, ни регионов'] =
+    'Preview: project has neither an end nor regions',
+  ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
+  ['Превью-батч: готово %d'] = 'Preview batch: %d done',
+  ['Превью-батч: у всех уже есть аудио'] =
+    'Preview batch: every project already has audio',
+  ['Превью-батч остановлен'] = 'Preview batch stopped',
+  ['стоп превью-батча (%d/%d)'] = 'stop preview batch (%d/%d)',
+  ['Сделать превью всем проектам (у кого нет аудио)'] =
+    'Render previews for all projects (missing audio)',
+  ['лимит 5 мин · рендер offline · можно остановить'] =
+    '5 min limit · offline render · can be stopped',
   ['активность = сохранения, бэкапы, отчёты · ярче — больше проектов' ..
    ' · рамка — дедлайн · белая рамка — сегодня'] =
     'activity = saves, backups, reports · brighter — more projects' ..
@@ -1137,12 +1151,22 @@ local function render_preview(card)
     core.set_project_token(card.path, 'RENDER_1X',
       old_1x ~= false and old_1x or nil)
   end
+  -- вернуть mtime .rpp как был: рендер превью (и правка RENDER_1X) — не
+  -- «работа над проектом», батч не должен ломать сортировку по дате
+  local function restore_mtime()
+    if card.mtime and card.mtime > 0 then
+      reaper.ExecProcess('/usr/bin/touch -m -t '
+        .. os.date('%Y%m%d%H%M.%S', card.mtime)
+        .. ' "' .. card.path .. '"', 5000)
+    end
+  end
 
-  -- границы: весь проект; если конца нет (нулевая длина) или проект
-  -- бесконечно длинный — первый регион
+  -- границы: весь проект, но не длиннее лимита превью; если конца нет
+  -- (нулевая длина) — первый регион (тоже с лимитом)
+  local PREVIEW_MAX = 300 -- лимит длины превью: 5 минут
   local plen = reaper.GetProjectLength(proj)
   local bounds_note = ''
-  if plen <= 0.05 or plen > 3600 then
+  if plen <= 0.05 then
     local rgn_start, rgn_end, rgn_name
     local idx = 0
     while true do
@@ -1154,14 +1178,21 @@ local function render_preview(card)
     if not rgn_start then
       reaper.Main_OnCommand(40860, 0) -- закрыть таб, рендерить нечего
       restore_1x()
-      state.status_msg = 'Превью: у проекта нет ни конца, ни регионов'
+      restore_mtime()
+      state.status_msg = T('Превью: у проекта нет ни конца, ни регионов')
       return
     end
+    rgn_end = math.min(rgn_end, rgn_start + PREVIEW_MAX)
     reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 0, true) -- custom
     reaper.GetSetProjectInfo(proj, 'RENDER_STARTPOS', rgn_start, true)
     reaper.GetSetProjectInfo(proj, 'RENDER_ENDPOS', rgn_end, true)
-    bounds_note = ' (первый регион: ' ..
+    bounds_note = ' (' .. T('первый регион: ') ..
       (rgn_name ~= '' and rgn_name or '?') .. ')'
+  elseif plen > PREVIEW_MAX then
+    reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 0, true) -- custom
+    reaper.GetSetProjectInfo(proj, 'RENDER_STARTPOS', 0, true)
+    reaper.GetSetProjectInfo(proj, 'RENDER_ENDPOS', PREVIEW_MAX, true)
+    bounds_note = T(' (первые 5 мин)')
   else
     reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 1, true) -- весь проект
   end
@@ -1187,12 +1218,49 @@ local function render_preview(card)
   reaper.Main_SaveProject(0, false)
   reaper.Main_OnCommand(40860, 0) -- Close current project tab
   restore_1x()
+  restore_mtime()
   audio_cache[card.path] = nil
   for k in pairs(wave_cache) do
     if k:find(dir .. '/jf_preview.wav', 1, true) == 1 then wave_cache[k] = nil end
   end
   state.status_msg = 'Превью отрендерено' .. bounds_note .. ': '
     .. dir .. '/jf_preview.wav'
+end
+
+-- Батч «превью всем»: очередь путей, по одному проекту на кадр defer-цикла
+-- (каждый рендер — модальный, но между ними UI дышит и кнопка «стоп» жива)
+local function batch_step()
+  local bq = state.batch
+  if not bq then return end
+  local path = table.remove(bq.queue, 1)
+  if not path then
+    state.status_msg = string.format(T('Превью-батч: готово %d'), bq.done)
+    state.batch = nil
+    return
+  end
+  local card = state.index.projects[path]
+  if card and not project_is_open(path) then
+    render_preview(card)
+    bq.done = bq.done + 1
+  end
+  state.status_msg = string.format(T('Превью-батч: %d/%d'),
+    bq.done, bq.total)
+end
+
+local function batch_start()
+  local queue = {}
+  for path, card in pairs(state.index.projects) do
+    if not find_preview_audio(card) then queue[#queue + 1] = path end
+  end
+  table.sort(queue, function(a, b)
+    return (state.index.projects[a].mtime or 0)
+         > (state.index.projects[b].mtime or 0)
+  end)
+  if #queue == 0 then
+    state.status_msg = T('Превью-батч: у всех уже есть аудио')
+    return
+  end
+  state.batch = { queue = queue, done = 0, total = #queue }
 end
 
 -- ---------------------------------------------------------------------------
@@ -2281,6 +2349,19 @@ local function draw_settings()
     LANG = 'en'
     core.set_setting('lang', 'en')
   end
+  if state.batch then
+    if ImGui.Button(ctx, string.format(T('стоп превью-батча (%d/%d)'),
+        state.batch.done, state.batch.total)) then
+      state.batch = nil
+      state.status_msg = T('Превью-батч остановлен')
+    end
+  else
+    if ImGui.Button(ctx, T('Сделать превью всем проектам (у кого нет аудио)')) then
+      batch_start()
+    end
+    ImGui.SameLine(ctx)
+    ImGui.TextDisabled(ctx, T('лимит 5 мин · рендер offline · можно остановить'))
+  end
 
   if ImGui.Button(ctx, T('Сохранить настройки')) then
     core.set_setting('scan_paths', state.scan_paths)
@@ -2615,6 +2696,7 @@ local function loop()
       end
       handle_keys(cards, cols)
       ImGui.EndChild(ctx)
+      batch_step() -- очередь «превью всем»: один проект за кадр
     end
 
     -- статусбар: слева сообщение или сводка, справа версия
