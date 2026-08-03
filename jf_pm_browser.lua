@@ -500,7 +500,9 @@ local function rename_project(card, new_name)
     local proj, fn = reaper.EnumProjects(pi)
     if not proj then break end
     if fn == card.path then
-      state.status_msg = 'Проект открыт в REAPER — сначала закрой вкладку'
+      reaper.MB('Проект «' .. card.name .. '» открыт в REAPER.\n\n' ..
+        'Закрой вкладку проекта и повтори переименование.',
+        'JF PM — переименование', 0)
       return
     end
     pi = pi + 1
