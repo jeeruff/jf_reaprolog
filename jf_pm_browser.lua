@@ -11,7 +11,7 @@
 -- g/G — в начало/конец, Esc — свернуть → сброс выборки → сброс фокуса.
 -- Канбан: Shift+H/L — перенести карточку в соседний статус, drag&drop мышью.
 
-local VERSION = '0.2'
+local VERSION = '0.3'
 
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
@@ -73,6 +73,7 @@ local state = {
   cal_scroll_end = 2,       -- кадры доскролла календаря к сегодняшнему краю
   tag_add_path = nil,       -- карточка с открытым полем нового тега
   tag_add_text = '',
+  filter_tags = {},         -- активные теги-фильтры (AND)
 }
 
 local STATUS_ORDER = {}
@@ -184,14 +185,34 @@ local function fuzzy_match(needle_codes, hay)
   return false
 end
 
+-- запрос из нескольких слов: каждое слово — своя подпоследовательность,
+-- порядок слов не важен (как в fzf)
+local function fuzzy_match_all(tokens, hay)
+  for _, tk in ipairs(tokens) do
+    if not fuzzy_match(tk, hay) then return false end
+  end
+  return true
+end
+
 -- кэш поисковой строки на карточку (не пересобирать каждый кадр);
--- инвалидация: rescan и правка тегов
+-- инвалидация: rescan, правка тегов, смена статуса
 local search_cache = {}
 local function search_text(card, meta)
   local s = search_cache[card.path]
   if not s then
-    s = ulower(card.name .. ' ' .. table.concat(all_tags(card, meta), ' ')
-      .. ' ' .. table.concat(card.track_names or {}, ' '))
+    local regions = {}
+    for _, r in ipairs(card.regions or {}) do regions[#regions + 1] = r.name end
+    s = ulower(table.concat({
+      card.name,
+      table.concat(all_tags(card, meta), ' '),
+      table.concat(card.track_names or {}, ' '),
+      table.concat(regions, ' '),
+      meta.status or '',
+      meta.desc or '',
+      meta.report_done or '',
+      meta.report_todo or '',
+      card.path,
+    }, ' '))
     search_cache[card.path] = s
   end
   return s
@@ -214,10 +235,14 @@ end
 
 local function collect_cards()
   local cards = {}
-  local needle_codes
+  local needle_tokens
   if state.filter_text ~= '' then
-    local okc, codes = pcall(to_codes, ulower(state.filter_text))
-    needle_codes = okc and codes or nil
+    needle_tokens = {}
+    for word in state.filter_text:gmatch('%S+') do
+      local okc, codes = pcall(to_codes, ulower(word))
+      if okc then needle_tokens[#needle_tokens + 1] = codes end
+    end
+    if #needle_tokens == 0 then needle_tokens = nil end
   end
   for _, card in pairs(state.index.projects) do
     local meta = core.card_meta(card)
@@ -230,8 +255,16 @@ local function collect_cards()
     elseif f >= 3 then
       ok = meta.status == core.STATUSES[f - 2]
     end
-    if ok and needle_codes then
-      local okm, m = pcall(fuzzy_match, needle_codes, search_text(card, meta))
+    -- фильтр по тегам-чипам: карточка должна иметь все активные (AND)
+    if ok and next(state.filter_tags) then
+      local have = {}
+      for _, t in ipairs(all_tags(card, meta)) do have[t] = true end
+      for t in pairs(state.filter_tags) do
+        if not have[t] then ok = false break end
+      end
+    end
+    if ok and needle_tokens then
+      local okm, m = pcall(fuzzy_match_all, needle_tokens, search_text(card, meta))
       ok = okm and m
     end
     if ok then cards[#cards + 1] = { card = card, meta = meta } end
@@ -322,6 +355,7 @@ local function set_status(card, status)
     card.status_over = status
     card.status_over_base = (card.ext or {}).STATUS or ''
   end
+  search_cache[card.path] = nil -- статус входит в поисковую строку
   core.save_index(state.index)
 end
 
@@ -1276,8 +1310,33 @@ local function draw_toolbar()
     state.focus_tag_input = false
   end
   local changed, val = ImGui.InputTextWithHint(ctx, '##tag',
-    'fzf: имя, теги, треки ( / )', state.filter_text)
+    'fzf: всё — имя, треки, регионы, отчёты… ( / )', state.filter_text)
   if changed then state.filter_text = val end
+
+  -- все теги (из списка + встретившиеся в проектах) чипами справа от поиска:
+  -- клик — фильтр (AND по нескольким), повторный клик — снять
+  local seen, tags_all = {}, {}
+  for _, e in ipairs(TAGS) do
+    seen[e[1]] = true; tags_all[#tags_all + 1] = e[1]
+  end
+  for _, card in pairs(state.index.projects) do
+    for _, t in ipairs(all_tags(card, core.card_meta(card))) do
+      if not seen[t] then seen[t] = true; tags_all[#tags_all + 1] = t end
+    end
+  end
+  for _, t in ipairs(tags_all) do
+    local label = '#' .. t
+    local active = state.filter_tags[t]
+    ImGui.SameLine(ctx)
+    if ImGui.CalcTextSize(ctx, label) + 12 > ImGui.GetContentRegionAvail(ctx) then
+      ImGui.NewLine(ctx)
+    end
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, active and tag_color(t) or 0x777777FF)
+    if ImGui.SmallButton(ctx, label .. '###ftag' .. t) then
+      state.filter_tags[t] = not active or nil
+    end
+    ImGui.PopStyleColor(ctx)
+  end
 end
 
 -- ---------------------------------------------------------------------------
