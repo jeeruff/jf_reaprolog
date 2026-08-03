@@ -8,7 +8,7 @@
 -- Vim-навигация: h/j/k/l — фокус, Enter — раскрыть (вне сетки — открыть),
 -- o — открыть, x — в выборку (порядок = порядок merge), p — закрепить,
 -- Shift+D — удалить в Корзину, m — merge выборки, / — в поле fzf,
--- g/G — в начало/конец, Esc — свернуть → сброс выборки → сброс фокуса.
+-- g/G — в начало/конец, Esc — свернуть → сброс выборки → фокус → закрыть окно.
 -- Канбан: Shift+H/L — перенести карточку в соседний статус, drag&drop мышью.
 
 local VERSION = '0.3'
@@ -57,6 +57,7 @@ local state = {
   stems_path = core.get_setting('stems_path'),
   regions_path = core.get_setting('regions_path'),
   thumb_style = tonumber(core.get_setting('thumb_style')) or 0, -- 0 калейдоскоп, 1 иероглиф
+  card_size = tonumber(core.get_setting('card_size')) or 2,     -- 1 S / 2 M / 3 L
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
   filter_text = '',         -- fzf: имя, теги, треки
@@ -83,6 +84,13 @@ local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'и
 -- естественное направление: true = по убыванию (новое/большое сверху)
 local SORT_DESC_NATURAL = { true, false, true, false, true }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
+
+-- размеры карточек в сетке: ширина, высота, тамбнейл, макс. символов имени
+local CARD_SIZES = {
+  { label = 'S', w = 220, h = 106, thumb = 40, name = 15 },
+  { label = 'M', w = 300, h = 138, thumb = 64, name = 22 },
+  { label = 'L', w = 390, h = 176, thumb = 96, name = 30 },
+}
 
 -- радикалы Канси для тамбнейлов-иероглифов
 local RADICALS = {
@@ -1017,7 +1025,8 @@ local function draw_card(entry, i, card_w)
   local focused = state.focus == i
   local si = sel_index(card.path)
   local inner_click = false  -- клик по виджету внутри — не раскрывать карточку
-  local h = expanded and 0 or 138  -- 0 = авто-высота по контенту
+  local cs = CARD_SIZES[state.card_size]
+  local h = expanded and 0 or cs.h  -- 0 = авто-высота по контенту
 
   local child_flags = ImGui.ChildFlags_Border
   if expanded then
@@ -1029,10 +1038,10 @@ local function draw_card(entry, i, card_w)
     ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
   end
   if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags) then
-    draw_thumb(card, 64)
+    draw_thumb(card, cs.thumb)
     ImGui.SameLine(ctx)
     ImGui.BeginGroup(ctx)
-    ImGui.Text(ctx, trunc(card.name, 22))
+    ImGui.Text(ctx, trunc(card.name, cs.name))
     if card.pinned then
       ImGui.SameLine(ctx)
       ImGui.TextColored(ctx, 0xD9B96CFF, '●') -- закреплён
@@ -1134,7 +1143,7 @@ local function draw_grid(cards)
     return 1
   end
   local avail = ImGui.GetContentRegionAvail(ctx)
-  local card_w = 300
+  local card_w = CARD_SIZES[state.card_size].w
   local cols = math.max(1, math.floor(avail / (card_w + 8)))
   for i, entry in ipairs(cards) do
     if (i - 1) % cols ~= 0 then ImGui.SameLine(ctx) end
@@ -1584,7 +1593,7 @@ local function draw_toolbar()
     if chip(s, state.filter_status == i + 2) then state.filter_status = i + 2 end
   end
 
-  -- ряд сортировки + тег
+  -- ряд сортировки + размер карточек + тег
   ImGui.TextDisabled(ctx, 'сорт:')
   for i, s in ipairs(SORT_CHIPS) do
     ImGui.SameLine(ctx)
@@ -1602,6 +1611,16 @@ local function draw_toolbar()
         state.sort_mode = i
         state.sort_rev = false
       end
+    end
+  end
+  -- размер карточек в сетке
+  ImGui.SameLine(ctx)
+  ImGui.TextDisabled(ctx, '|')
+  for i, cs in ipairs(CARD_SIZES) do
+    ImGui.SameLine(ctx)
+    if chip(cs.label .. '###csize' .. i, state.card_size == i) then
+      state.card_size = i
+      core.set_setting('card_size', tostring(i))
     end
   end
   ImGui.SameLine(ctx)
@@ -1745,15 +1764,18 @@ local function handle_keys(cards, cols)
     state.focus_tag_input = true
   end
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
-    if state.tag_add_path then
-      state.tag_add_path = nil
+    -- каскад: инпут → карточка → выборка → фокус → закрыть окно
+    if state.tag_add_path or state.dl_path or state.ren_path then
+      state.tag_add_path, state.dl_path, state.ren_path = nil, nil, nil
     elseif state.expanded then
       state.expanded = nil
     elseif #state.sel > 0 then
       state.sel = {}
-    else
+    elseif state.focus > 0 or state.kb_col > 0 then
       state.focus = 0
       state.kb_col, state.kb_row = 0, 0
+    else
+      state.quit = true
     end
   end
 end
@@ -1803,7 +1825,7 @@ local function loop()
     ImGui.End(ctx)
   end
   ImGui.PopFont(ctx)
-  if open then reaper.defer(loop) end
+  if open and not state.quit then reaper.defer(loop) end
 end
 
 reaper.defer(loop)
