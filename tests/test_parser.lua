@@ -104,16 +104,19 @@ do
   local txt = io.open(tmp, 'rb'):read('*a')
   local _, dup2 = txt:gsub('\n      STATUS ', '')
   eq(dup2, 1, 'STATUS not duplicated')
-  -- top-level токен: вставка (не было), замена, чтение старого, удаление
+  -- top-level токен: замена существующего (RENDER_1X есть в фикстуре),
+  -- вставка нового, удаление
   local old1 = core.set_project_token(tmp, 'RENDER_1X', '0')
-  eq(old1, false, 'RENDER_1X: не было — вставлен')
-  local old2 = core.set_project_token(tmp, 'RENDER_1X', '1')
+  check(old1 ~= false and old1 ~= nil, 'RENDER_1X был в фикстуре: ' .. tostring(old1))
+  local old2 = core.set_project_token(tmp, 'RENDER_1X', old1)
   eq(old2, '0', 'RENDER_1X: старое значение возвращено')
+  local ins = core.set_project_token(tmp, 'JF_TEST_TOKEN', '42')
+  eq(ins, false, 'нового токена не было — вставлен')
   local ctok = core.parse_rpp(tmp)
-  eq(ctok.track_count, 4, 'проект парсится после токена')
-  core.set_project_token(tmp, 'RENDER_1X', nil)
+  eq(ctok.track_count, 4, 'проект парсится после токенов')
+  core.set_project_token(tmp, 'JF_TEST_TOKEN', nil)
   local txt_tok = io.open(tmp, 'rb'):read('*a')
-  check(not txt_tok:find('RENDER_1X', 1, true), 'RENDER_1X удалён')
+  check(not txt_tok:find('JF_TEST_TOKEN', 1, true), 'токен удалён')
 
   -- notes: замена блока, чекбокс переключён
   assert(core.set_project_notes(tmp,
