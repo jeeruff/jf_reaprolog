@@ -43,6 +43,85 @@ local TAGS = {
 local TAG_COLOR_MAP = {}
 for _, e in ipairs(TAGS) do TAG_COLOR_MAP[e[1]] = e[2] end
 
+-- ===========================================================================
+-- ЯЗЫК: 'ru' | 'en' — чипы в настройках. Данные (.rpp, индекс) каноничны
+-- (русские классы), переводится только отображение.
+-- ===========================================================================
+local LANG = core.get_setting('lang') == 'en' and 'en' or 'ru'
+local EN = {
+  ['настройки'] = 'settings', ['галерея'] = 'gallery',
+  ['выбрано: %d'] = 'selected: %d', ['сброс'] = 'clear',
+  ['открыть'] = 'open', ['закрепить'] = 'pin', ['открепить'] = 'unpin',
+  ['удалить…'] = 'delete…', ['subs → проект…'] = 'subs → project…',
+  ['регионов: %d'] = 'regions: %d', ['собрать проект'] = 'build project',
+  ['без отчёта: %d'] = 'no report: %d',
+  ['активные'] = 'active', ['все'] = 'all', ['без отчёта'] = 'no report',
+  ['сетка'] = 'grid', ['таймлайн'] = 'timeline', ['календарь'] = 'calendar',
+  ['канбан'] = 'kanban',
+  ['сорт:'] = 'sort:', ['дата'] = 'date', ['статус'] = 'class',
+  ['длительность'] = 'length', ['имя'] = 'name', ['размер'] = 'size',
+  ['fzf: всё — имя, треки, регионы, отчёты… ( / )'] =
+    'fzf: everything — name, tracks, regions, reports… ( / )',
+  ['Пути'] = 'Paths', ['Проекты (через ;):'] = 'Projects (separated by ;):',
+  ['Расслоение → мультитреки:'] = 'Harvest → multitracks:',
+  ['Расслоение → регионы:'] = 'Harvest → regions:',
+  ['Тамбнейлы:'] = 'Thumbnails:', ['калейдоскоп'] = 'kaleidoscope',
+  ['иероглиф'] = 'glyph', ['навигатор'] = 'navigator',
+  ['или <имя проекта>.png / jf_thumb.png в папке проекта'] =
+    'or <project name>.png / jf_thumb.png in the project folder',
+  ['Аудио-пики:'] = 'Audio peaks:', ['волна'] = 'wave', ['спектр'] = 'spectrum',
+  ['Сохранить настройки'] = 'Save settings',
+  ['Настройки сохранены'] = 'Settings saved',
+  ['Пусто. Rescan, или ослабь фильтры.'] = 'Empty. Rescan, or relax filters.',
+  ['старше полугода'] = 'older than half a year',
+  ['· без отчёта'] = '· no report',
+  ['Дедлайн:'] = 'Deadline:', ['назначить'] = 'set', ['изменить'] = 'edit',
+  ['снять'] = 'clear', ['просрочен'] = 'overdue', ['дн.'] = 'd.',
+  ['ID трека:'] = 'Track ID:', ['Семплы:'] = 'Samples:',
+  ['добавить'] = 'add',
+  ['Структура:'] = 'Structure:', ['Треки'] = 'Tracks', ['Бэкапы'] = 'Backups',
+  ['Заметки проекта'] = 'Project notes', ['Заметки треков'] = 'Track notes',
+  ['Заметки айтемов'] = 'Item notes',
+  ['Отчёт'] = 'Report', ['Отчёта нет'] = 'No report yet',
+  ['Сделано:'] = 'Done:', ['Дальше:'] = 'Next:', ['Теги:'] = 'Tags:',
+  ['Тег из .rpp/Finder — снимай в проекте'] =
+    'Tag comes from .rpp/Finder — remove it at the source',
+  ['тег + Enter'] = 'tag + Enter', ['новое имя + Enter'] = 'new name + Enter',
+  ['свернуть'] = 'collapse', ['выбрать'] = 'select',
+  ['снять выбор'] = 'deselect', ['удалить в Корзину…'] = 'move to Trash…',
+  ['назначить картинку-превью…'] = 'set preview image…',
+  ['сбросить превью'] = 'reset preview',
+  ['отрендерить аудио-превью (jf_preview.wav)'] =
+    'render audio preview (jf_preview.wav)',
+  ['обновить карточку (перечитать .rpp)'] = 'refresh card (re-read .rpp)',
+  ['обновить карточку'] = 'refresh card',
+  ['переименовать проект…'] = 'rename project…',
+  ['Обновлено: '] = 'Refreshed: ',
+  ['нет аудио · ▸ в карточке отрендерит превью'] =
+    'no audio · ▸ in the card renders a preview',
+  ['пики не построились'] = 'peaks failed to build',
+  ['клик — сик · пкм — стоп'] = 'click — seek · right click — stop',
+  ['играть: '] = 'play: ',
+  ['клик — с места клика · пкм — стоп'] =
+    'click — play from here · right click — stop',
+  ['клик — subproject в активный проект\nCmd+клик — в корзину регионов'] =
+    'click — subproject into the active project\nCmd+click — into the region basket',
+  ['В корзине регионов: %d'] = 'Region basket: %d',
+  ['Язык / Language:'] = 'Язык / Language:',
+  ['активность = сохранения, бэкапы, отчёты · ярче — больше проектов' ..
+   ' · рамка — дедлайн · белая рамка — сегодня'] =
+    'activity = saves, backups, reports · brighter — more projects' ..
+    ' · frame — deadline · white frame — today',
+}
+local function T(s)
+  if LANG ~= 'en' then return s end
+  return EN[s] or s
+end
+local function status_label(s)
+  if LANG == 'en' then return core.STATUS_EN[s] or s end
+  return s
+end
+
 local ctx = ImGui.CreateContext('JF PM')
 local font = ImGui.CreateFont('sans-serif', 14)
 local big_font = ImGui.CreateFont('sans-serif', 44) -- для иероглифов-тамбнейлов
@@ -89,8 +168,18 @@ local SORT_DESC_NATURAL = { true, false, true, false, true }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
 -- лейблы выпадашки классов: «—» + core.STATUSES (исключение из правила
--- «без выпадашек» — по просьбе владельца)
-local CLASS_LABELS = '—\0' .. table.concat(core.STATUSES, '\0') .. '\0'
+-- «без выпадашек» — по просьбе владельца); кэш на язык
+local CLASS_LABELS_CACHE = {}
+local function class_labels()
+  local l = CLASS_LABELS_CACHE[LANG]
+  if not l then
+    local names = {}
+    for i, s in ipairs(core.STATUSES) do names[i] = status_label(s) end
+    l = '—\0' .. table.concat(names, '\0') .. '\0'
+    CLASS_LABELS_CACHE[LANG] = l
+  end
+  return l
+end
 
 -- размеры карточек в сетке: ширина, высота, тамбнейл, макс. символов имени
 local CARD_SIZES = {
@@ -959,7 +1048,7 @@ local function draw_wave_strip(card, width, height)
   local clicked = false
   if not audio then
     ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
-      'нет аудио · ▸ в карточке отрендерит превью')
+      T('нет аудио · ▸ в карточке отрендерит превью'))
     ImGui.Dummy(ctx, width, height)
     return false
   end
@@ -989,7 +1078,7 @@ local function draw_wave_strip(card, width, height)
     end
   else
     ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
-      'пики не построились')
+      T('пики не построились'))
   end
   ImGui.InvisibleButton(ctx, '###wave' .. card.path, width, height)
   -- клик — играть с места клика / сик; правый клик — стоп
@@ -1008,9 +1097,9 @@ local function draw_wave_strip(card, width, height)
   end
   if ImGui.IsItemHovered(ctx) then
     ImGui.SetTooltip(ctx, playing.audio == audio
-      and 'клик — сик · пкм — стоп'
-      or ('играть: ' .. (audio:match('([^/\\]+)$') or audio)
-        .. '\nклик — с места клика · пкм — стоп'))
+      and T('клик — сик · пкм — стоп')
+      or (T('играть: ') .. (audio:match('([^/\\]+)$') or audio)
+        .. '\n' .. T('клик — с места клика · пкм — стоп')))
   end
   return clicked
 end
@@ -1082,6 +1171,12 @@ local function render_preview(card)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', 'evaw', true)
   reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, true) -- master mix
   reaper.Main_OnCommand(41824, 0) -- File: Render project, using the most recent render settings
+  -- REAPER часто видит конец проекта сильно дальше звука (огибающие,
+  -- маркеры) — отрезаем цифровую тишину в хвосте, оставляя секунду
+  local trimmed, cut = core.trim_wav_tail(dir .. '/jf_preview.wav', 1.0)
+  if trimmed then
+    bounds_note = bounds_note .. string.format(' · хвост −%d c', math.floor(cut + 0.5))
+  end
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FILE', old.file, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', old.pat, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', old.fmt, true)
@@ -1284,13 +1379,13 @@ local function draw_card_details(card, meta)
 
   -- дедлайн: показ + инлайн-правка (пишется в .rpp закрытого проекта)
   local now = os.time()
-  ImGui.TextDisabled(ctx, 'Дедлайн:')
+  ImGui.TextDisabled(ctx, T('Дедлайн:'))
   ImGui.SameLine(ctx)
   if meta.deadline > 0 then
     local left = math.floor((meta.deadline - now) / 86400)
     ImGui.TextColored(ctx, deadline_color(meta.deadline, now),
       os.date('%d.%m.%y', meta.deadline) ..
-      (left < 0 and '  (просрочен)' or ('  (' .. left .. ' дн.)')))
+      (left < 0 and ('  (' .. T('просрочен') .. ')') or ('  (' .. left .. ' ' .. T('дн.') .. ')')))
     ImGui.SameLine(ctx)
   end
   if state.dl_path == card.path then
@@ -1308,15 +1403,15 @@ local function draw_card_details(card, meta)
       return
     end
   else
-    if ImGui.SmallButton(ctx, meta.deadline > 0 and 'изменить###dl'
-        or 'назначить###dl') then
+    if ImGui.SmallButton(ctx, (meta.deadline > 0 and T('изменить')
+        or T('назначить')) .. '###dl') then
       state.dl_path = card.path
       state.dl_text = meta.deadline > 0 and os.date('%d.%m.%y', meta.deadline) or ''
       state.dl_focus = true
     end
     if meta.deadline > 0 then
       ImGui.SameLine(ctx)
-      if ImGui.SmallButton(ctx, 'снять###dlx') then
+      if ImGui.SmallButton(ctx, T('снять') .. '###dlx') then
         set_deadline(card, '')
         return
       end
@@ -1354,14 +1449,14 @@ local function draw_card_details(card, meta)
         ImGui.SameLine(ctx)
       end
       if ImGui.SmallButton(ctx,
-          (val ~= '' and 'изменить' or 'добавить') .. '###ef' .. key) then
+          (val ~= '' and T('изменить') or T('добавить')) .. '###ef' .. key) then
         state.ext_edit, state.ext_text, state.ext_focus = ek, val, true
       end
     end
     return false
   end
-  if ext_field('ID трека:', 'TRACKID', meta.track_id) then return end
-  if ext_field('Семплы:', 'SAMPLES', meta.samples) then return end
+  if ext_field(T('ID трека:'), 'TRACKID', meta.track_id) then return end
+  if ext_field(T('Семплы:'), 'SAMPLES', meta.samples) then return end
 
   -- TODO: чекбоксы из отчёта и project notes (md: - [ ] / - [x])
   if #meta.todos > 0 then
@@ -1378,7 +1473,7 @@ local function draw_card_details(card, meta)
   -- регионы кликабельны: клик — subproject-айтем региона в активный проект,
   -- cmd/ctrl+клик — в корзину регионов; #хэштеги из имени цветные, #+++ рейтинг
   if #card.regions > 0 then
-    ImGui.TextDisabled(ctx, 'Структура:')
+    ImGui.TextDisabled(ctx, T('Структура:'))
     for ri, r in ipairs(card.regions) do
       local pr = parse_region_name(r.name or '')
       local label = string.format('%s  [%s – %s]',
@@ -1388,14 +1483,14 @@ local function draw_card_details(card, meta)
         local mods = ImGui.GetKeyMods(ctx)
         if mods & ImGui.Mod_Ctrl ~= 0 or mods & ImGui.Mod_Super ~= 0 then
           state.basket[#state.basket + 1] = { path = card.path, region = r }
-          state.status_msg = string.format('В корзине регионов: %d', #state.basket)
+          state.status_msg = string.format(T('В корзине регионов: %d'), #state.basket)
         else
           insert_region_subproject(card.path, r)
         end
       end
       if ImGui.IsItemHovered(ctx) then
         ImGui.SetTooltip(ctx,
-          'клик — subproject в активный проект\ncmd+клик — в корзину регионов')
+          T('клик — subproject в активный проект\nCmd+клик — в корзину регионов'))
       end
       for _, t in ipairs(pr.tags) do
         ImGui.SameLine(ctx)
@@ -1410,7 +1505,7 @@ local function draw_card_details(card, meta)
 
   -- треки свёрнуты по умолчанию, как бэкапы
   if #card.track_names > 0 then
-    if ImGui.TreeNode(ctx, string.format('Треки (%d)###trk', #card.track_names)) then
+    if ImGui.TreeNode(ctx, string.format('%s (%d)###trk', T('Треки'), #card.track_names)) then
       local named = {}
       for _, n in ipairs(card.track_names) do
         named[#named + 1] = n ~= '' and n or '(без имени)'
@@ -1422,14 +1517,14 @@ local function draw_card_details(card, meta)
 
   -- заметки: проект / треки / айтемы — свёрнуты, как бэкапы
   if (card.notes or '') ~= '' then
-    if ImGui.TreeNode(ctx, 'Заметки проекта###pnotes') then
+    if ImGui.TreeNode(ctx, T('Заметки проекта') .. '###pnotes') then
       draw_md(card.notes)
       ImGui.TreePop(ctx)
     end
   end
   local tnotes = card.track_notes or {}
   if #tnotes > 0 then
-    if ImGui.TreeNode(ctx, string.format('Заметки треков (%d)###tnotes',
+    if ImGui.TreeNode(ctx, string.format('%s (%d)###tnotes', T('Заметки треков'),
         #tnotes)) then
       for _, n in ipairs(tnotes) do
         local tname = (card.track_names or {})[n.t] or ''
@@ -1443,7 +1538,7 @@ local function draw_card_details(card, meta)
   end
   local inotes = card.item_notes or {}
   if #inotes > 0 then
-    if ImGui.TreeNode(ctx, string.format('Заметки айтемов (%d)###inotes',
+    if ImGui.TreeNode(ctx, string.format('%s (%d)###inotes', T('Заметки айтемов'),
         #inotes)) then
       for _, n in ipairs(inotes) do
         ImGui.BulletText(ctx, string.format('[%s, трек %d]',
@@ -1457,23 +1552,23 @@ local function draw_card_details(card, meta)
   end
 
   if meta.report_done ~= '' or meta.report_todo ~= '' then
-    ImGui.TextDisabled(ctx, 'Отчёт (' .. fmt_date(meta.report_ts) .. '):')
+    ImGui.TextDisabled(ctx, T('Отчёт') .. ' (' .. fmt_date(meta.report_ts) .. '):')
     if meta.report_done ~= '' then
-      ImGui.TextDisabled(ctx, 'Сделано:')
+      ImGui.TextDisabled(ctx, T('Сделано:'))
       draw_md(meta.report_done)
     end
     if meta.report_todo ~= '' then
-      ImGui.TextDisabled(ctx, 'Дальше:')
+      ImGui.TextDisabled(ctx, T('Дальше:'))
       draw_md(meta.report_todo)
     end
   else
-    ImGui.TextDisabled(ctx, 'Отчёта нет')
+    ImGui.TextDisabled(ctx, T('Отчёта нет'))
   end
 
   -- скрытая ветка: бэкапы (свёрнута по умолчанию)
   local backups = card.backups or {}
   if #backups > 0 then
-    if ImGui.TreeNode(ctx, string.format('Бэкапы (%d)###bak', #backups)) then
+    if ImGui.TreeNode(ctx, string.format('%s (%d)###bak', T('Бэкапы'), #backups)) then
       for _, b in ipairs(backups) do
         ImGui.BulletText(ctx, string.format('%s — %s, %s',
           b.file, fmt_date(b.mtime), fmt_size(b.size)))
@@ -1487,7 +1582,7 @@ local function draw_card_details(card, meta)
   end
   -- назначение тегов: клик по чипу включает/выключает (хранится в индексе);
   -- теги из .rpp и Finder отсюда не снимаются
-  ImGui.TextDisabled(ctx, 'Теги:')
+  ImGui.TextDisabled(ctx, T('Теги:'))
   local cur = {}
   for _, t in ipairs(all_tags(card, meta)) do cur[t] = true end
   for i, e in ipairs(TAGS) do
@@ -1507,7 +1602,7 @@ local function draw_card_details(card, meta)
       elseif not cur[t] then
         extra[#extra + 1] = t
       else
-        state.status_msg = 'Тег из .rpp/Finder — снимай в проекте'
+        state.status_msg = T('Тег из .rpp/Finder — снимай в проекте')
       end
       card.tags_extra = #extra > 0 and extra or nil
       search_cache[card.path] = nil
@@ -1533,7 +1628,7 @@ local function draw_card_details(card, meta)
       ImGui.SetKeyboardFocusHere(ctx)
       state.tag_add_focus = false
     end
-    local done, v = ImGui.InputTextWithHint(ctx, '###newtag', 'тег + Enter',
+    local done, v = ImGui.InputTextWithHint(ctx, '###newtag', T('тег + Enter'),
       state.tag_add_text, ImGui.InputTextFlags_EnterReturnsTrue)
     if v then state.tag_add_text = v end
     if done and state.tag_add_text ~= '' then
@@ -1571,26 +1666,26 @@ local function draw_card_details(card, meta)
     if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, tip) end
     return clicked
   end
-  if icon('▲###fold', 'свернуть') then state.expanded = nil end
+  if icon('▲###fold', T('свернуть')) then state.expanded = nil end
   ImGui.SameLine(ctx)
   if icon((card.pinned and '●' or '○') .. '###pin',
-      card.pinned and 'открепить' or 'закрепить',
+      card.pinned and T('открепить') or T('закрепить'),
       card.pinned and 0xD9B96CFF or nil) then
     toggle_pin(card)
   end
   ImGui.SameLine(ctx)
   local si = sel_index(card.path)
   if icon((si and '■' or '□') .. '###sel',
-      si and 'снять выбор' or 'выбрать', si and 0xD9B96CFF or nil) then
+      si and T('снять выбор') or T('выбрать'), si and 0xD9B96CFF or nil) then
     toggle_select(card.path)
   end
   ImGui.SameLine(ctx)
-  if icon('×###del', 'удалить в Корзину…') then
+  if icon('×###del', T('удалить в Корзину…')) then
     delete_project(card)
     return
   end
   ImGui.SameLine(ctx)
-  if icon('▦###thumb', 'назначить картинку-превью…') then
+  if icon('▦###thumb', T('назначить картинку-превью…')) then
     -- нативный диалог, без зависимостей от js_ReaScriptAPI
     local rv, fn = reaper.GetUserFileNameForRead('', 'Картинка-превью проекта', '')
     if rv and fn and fn ~= '' then
@@ -1601,24 +1696,24 @@ local function draw_card_details(card, meta)
   end
   if card.thumb_user then
     ImGui.SameLine(ctx)
-    if icon('▧###unthumb', 'сбросить превью') then
+    if icon('▧###unthumb', T('сбросить превью')) then
       card.thumb_user = nil
       core.save_index(state.index)
     end
   end
   ImGui.SameLine(ctx)
-  if icon('▸###rprev', 'отрендерить аудио-превью (jf_preview.wav)') then
+  if icon('▸###rprev', T('отрендерить аудио-превью (jf_preview.wav)')) then
     render_preview(card)
     return
   end
   ImGui.SameLine(ctx)
-  if icon('↻###refr', 'обновить карточку (перечитать .rpp)') then
+  if icon('↻###refr', T('обновить карточку (перечитать .rpp)')) then
     refresh_card(card.path)
-    state.status_msg = 'Обновлено: ' .. card.name
+    state.status_msg = T('Обновлено: ') .. card.name
     return
   end
   ImGui.SameLine(ctx)
-  if icon('Aa###ren', 'переименовать проект…') then
+  if icon('Aa###ren', T('переименовать проект…')) then
     if state.ren_path == card.path then
       state.ren_path = nil
     else
@@ -1634,7 +1729,7 @@ local function draw_card_details(card, meta)
       state.ren_focus = false
     end
     local done, v = ImGui.InputTextWithHint(ctx, '###rename',
-      'новое имя + Enter', state.ren_text, ImGui.InputTextFlags_EnterReturnsTrue)
+      T('новое имя + Enter'), state.ren_text, ImGui.InputTextFlags_EnterReturnsTrue)
     if v then state.ren_text = v end
     if done then
       rename_project(card, state.ren_text)
@@ -1681,12 +1776,12 @@ local function draw_card(entry, i, card_w)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x6A6A6AFF)
     if ImGui.SmallButton(ctx, '↻###refr1') then
       refresh_card(card.path)
-      state.status_msg = 'Обновлено: ' .. card.name
+      state.status_msg = T('Обновлено: ') .. card.name
       inner_click = true
     end
     ImGui.PopStyleColor(ctx)
     if ImGui.IsItemHovered(ctx) then
-      ImGui.SetTooltip(ctx, 'обновить карточку')
+      ImGui.SetTooltip(ctx, T('обновить карточку'))
     end
     ImGui.SameLine(ctx, card_w - 30)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, si and 0xD9B96CFF or 0x6A6A6AFF)
@@ -1712,7 +1807,7 @@ local function draw_card(entry, i, card_w)
     end
     ImGui.SetNextItemWidth(ctx, 96)
     ImGui.PushStyleColor(ctx, ImGui.Col_Text, color or 0x9A9A9AFF)
-    local chg, ni = ImGui.Combo(ctx, '###cls' .. i, cur_idx, CLASS_LABELS)
+    local chg, ni = ImGui.Combo(ctx, '###cls' .. i, cur_idx, class_labels())
     ImGui.PopStyleColor(ctx)
     if ImGui.IsItemHovered(ctx) or ImGui.IsItemActive(ctx) then
       inner_click = true
@@ -1723,7 +1818,7 @@ local function draw_card(entry, i, card_w)
     end
     if card.needs_report then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0xE06060FF, '· без отчёта')
+      ImGui.TextColored(ctx, 0xE06060FF, T('· без отчёта'))
     end
 
     ImGui.TextDisabled(ctx, fmt_date(card.mtime))
@@ -1791,7 +1886,7 @@ end
 
 local function draw_grid(cards)
   if #cards == 0 then
-    ImGui.TextDisabled(ctx, 'Пусто. Rescan, или ослабь фильтры.')
+    ImGui.TextDisabled(ctx, T('Пусто. Rescan, или ослабь фильтры.'))
     return 1
   end
   local avail = ImGui.GetContentRegionAvail(ctx)
@@ -1811,7 +1906,7 @@ local TIMELINE_SPAN = 183 * 86400 -- полгода
 
 local function draw_timeline(cards)
   if #cards == 0 then
-    ImGui.TextDisabled(ctx, 'Пусто. Rescan, или ослабь фильтры.')
+    ImGui.TextDisabled(ctx, T('Пусто. Rescan, или ослабь фильтры.'))
     return
   end
   local now = os.time()
@@ -1876,7 +1971,7 @@ local function draw_timeline(cards)
       ImGui.DrawList_AddRectFilled(dl, bx0, ry + 4, bx1, ry + 15, col, 2)
     else
       ImGui.DrawList_AddText(dl, rx + label_w, ry + 1, 0x555555FF,
-        'старше полугода')
+        T('старше полугода'))
     end
   end
 end
@@ -1983,9 +2078,8 @@ local function draw_calendar(cards)
     ImGui.SetScrollX(ctx, math.min(target, ImGui.GetScrollMaxX(ctx)))
     state.cal_scroll_end = state.cal_scroll_end - 1
   end
-  ImGui.TextDisabled(ctx,
-    'активность = сохранения, бэкапы, отчёты · ярче — больше проектов ' ..
-    '· рамка — дедлайн · белая рамка — сегодня')
+  ImGui.TextDisabled(ctx, T('активность = сохранения, бэкапы, отчёты' ..
+    ' · ярче — больше проектов · рамка — дедлайн · белая рамка — сегодня'))
   if hover_key then
     local txt = os.date('%d.%m.%Y', hover_key + 3600)
     if hover_dl then
@@ -2023,7 +2117,8 @@ local function draw_kanban(cards)
     if ci > 1 then ImGui.SameLine(ctx) end
     if ImGui.BeginChild(ctx, '##kb' .. ci, col_w, 0, ImGui.ChildFlags_Border) then
       ImGui.TextColored(ctx, core.STATUS_COLORS[c.status] or 0x8A8A8AFF,
-        string.format('%s (%d)', c.label, #c.entries))
+        string.format('%s (%d)', c.status ~= '' and status_label(c.status)
+          or c.label, #c.entries))
       ImGui.Separator(ctx)
       for ei, e in ipairs(c.entries) do
         local card = e.card
@@ -2119,10 +2214,10 @@ local function pick_folder(title, initial)
 end
 
 local function draw_settings()
-  ImGui.SeparatorText(ctx, 'Пути')
+  ImGui.SeparatorText(ctx, T('Пути'))
   local changed, val
 
-  ImGui.Text(ctx, 'Проекты (через ;):')
+  ImGui.Text(ctx, T('Проекты (через ;):'))
   ImGui.SetNextItemWidth(ctx, -86)
   changed, val = ImGui.InputText(ctx, '##paths', state.scan_paths)
   if changed then state.scan_paths = val end
@@ -2135,7 +2230,7 @@ local function draw_settings()
     end
   end
 
-  ImGui.Text(ctx, 'Расслоение → мультитреки:')
+  ImGui.Text(ctx, T('Расслоение → мультитреки:'))
   ImGui.SetNextItemWidth(ctx, -86)
   changed, val = ImGui.InputText(ctx, '##stems', state.stems_path)
   if changed then state.stems_path = val end
@@ -2145,7 +2240,7 @@ local function draw_settings()
     if dir then state.stems_path = dir end
   end
 
-  ImGui.Text(ctx, 'Расслоение → регионы:')
+  ImGui.Text(ctx, T('Расслоение → регионы:'))
   ImGui.SetNextItemWidth(ctx, -86)
   changed, val = ImGui.InputText(ctx, '##regions', state.regions_path)
   if changed then state.regions_path = val end
@@ -2155,34 +2250,45 @@ local function draw_settings()
     if dir then state.regions_path = dir end
   end
 
-  ImGui.Text(ctx, 'Тамбнейлы:')
+  ImGui.Text(ctx, T('Тамбнейлы:'))
   ImGui.SameLine(ctx)
-  if chip('калейдоскоп', state.thumb_style == 0) then state.thumb_style = 0 end
+  if chip(T('калейдоскоп') .. '###th0', state.thumb_style == 0) then state.thumb_style = 0 end
   ImGui.SameLine(ctx)
-  if chip('иероглиф', state.thumb_style == 1) then state.thumb_style = 1 end
+  if chip(T('иероглиф') .. '###th1', state.thumb_style == 1) then state.thumb_style = 1 end
   ImGui.SameLine(ctx)
-  if chip('навигатор', state.thumb_style == 2) then state.thumb_style = 2 end
+  if chip(T('навигатор') .. '###th2', state.thumb_style == 2) then state.thumb_style = 2 end
   ImGui.SameLine(ctx)
-  ImGui.TextDisabled(ctx, 'или <имя проекта>.png / jf_thumb.png в папке проекта')
-  ImGui.Text(ctx, 'Аудио-пики:')
+  ImGui.TextDisabled(ctx, T('или <имя проекта>.png / jf_thumb.png в папке проекта'))
+  ImGui.Text(ctx, T('Аудио-пики:'))
   ImGui.SameLine(ctx)
-  if chip('волна', state.peak_style == 0) then
+  if chip(T('волна') .. '###pk0', state.peak_style == 0) then
     state.peak_style = 0
     core.set_setting('peak_style', '0')
   end
   ImGui.SameLine(ctx)
-  if chip('спектр', state.peak_style == 1) then
+  if chip(T('спектр') .. '###pk1', state.peak_style == 1) then
     state.peak_style = 1
     core.set_setting('peak_style', '1')
   end
+  ImGui.Text(ctx, T('Язык / Language:'))
+  ImGui.SameLine(ctx)
+  if chip('RU###lru', LANG == 'ru') then
+    LANG = 'ru'
+    core.set_setting('lang', 'ru')
+  end
+  ImGui.SameLine(ctx)
+  if chip('EN###len', LANG == 'en') then
+    LANG = 'en'
+    core.set_setting('lang', 'en')
+  end
 
-  if ImGui.Button(ctx, 'Сохранить настройки') then
+  if ImGui.Button(ctx, T('Сохранить настройки')) then
     core.set_setting('scan_paths', state.scan_paths)
     core.set_setting('stems_path', state.stems_path)
     core.set_setting('regions_path', state.regions_path)
     core.set_setting('thumb_style', tostring(state.thumb_style))
     state.show_settings = false
-    state.status_msg = 'Настройки сохранены'
+    state.status_msg = T('Настройки сохранены')
   end
   ImGui.Separator(ctx)
 end
@@ -2190,11 +2296,11 @@ end
 local function draw_toolbar()
   if ImGui.Button(ctx, 'Rescan') then rescan() end
   ImGui.SameLine(ctx)
-  if ImGui.Button(ctx, 'настройки') then
+  if ImGui.Button(ctx, T('настройки')) then
     state.show_settings = not state.show_settings
   end
   ImGui.SameLine(ctx)
-  if ImGui.Button(ctx, 'галерея') then export_gallery() end
+  if ImGui.Button(ctx, T('галерея')) then export_gallery() end
   -- громкость превью (слайдер — согласованное исключение, как выпадашка)
   ImGui.SameLine(ctx)
   ImGui.SetNextItemWidth(ctx, 90)
@@ -2214,7 +2320,7 @@ local function draw_toolbar()
   -- выделенных — те же команды, что на карточке, но на всю выборку
   if #state.sel > 0 then
     ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xD9B96CFF, string.format('выбрано: %d', #state.sel))
+    ImGui.TextColored(ctx, 0xD9B96CFF, string.format(T('выбрано: %d'), #state.sel))
     if #state.sel >= 2 then
       ImGui.SameLine(ctx)
       if ImGui.Button(ctx, 'merge') then merge_selected() end
@@ -2222,39 +2328,39 @@ local function draw_toolbar()
       -- сабпроектами: исходники не трогаются, звук — прокси
       if ImGui.Button(ctx, 'merge as subs') then merge_as_subprojects(nil) end
       ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'subs → проект…') then
+      if ImGui.Button(ctx, T('subs → проект…')) then
         local rv, fn = reaper.GetUserFileNameForRead('', 'Целевой проект', 'rpp')
         if rv and fn and fn ~= '' then merge_as_subprojects(fn) end
       end
       ImGui.SameLine(ctx)
-      if ImGui.SmallButton(ctx, 'открыть') then
+      if ImGui.SmallButton(ctx, T('открыть') .. '###selopen') then
         for _, p in ipairs(state.sel) do open_project(p) end
       end
       ImGui.SameLine(ctx)
-      if ImGui.SmallButton(ctx, 'закрепить') then pin_selected() end
+      if ImGui.SmallButton(ctx, T('закрепить') .. '###selpin') then pin_selected() end
       ImGui.SameLine(ctx)
-      if ImGui.SmallButton(ctx, 'удалить…') then delete_selected() end
+      if ImGui.SmallButton(ctx, T('удалить…') .. '###seldel') then delete_selected() end
     end
     ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, 'сброс') then state.sel = {} end
+    if ImGui.SmallButton(ctx, T('сброс') .. '###selclr') then state.sel = {} end
   end
 
   -- корзина регионов (cmd+клик по региону в карточке)
   if #state.basket > 0 then
     ImGui.SameLine(ctx)
     ImGui.TextColored(ctx, 0xD9B96CFF,
-      string.format('регионов: %d', #state.basket))
+      string.format(T('регионов: %d'), #state.basket))
     ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, 'собрать проект') then basket_build() end
+    if ImGui.SmallButton(ctx, T('собрать проект') .. '###bskgo') then basket_build() end
     ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, 'сброс###bsk') then state.basket = {} end
+    if ImGui.SmallButton(ctx, T('сброс') .. '###bsk') then state.basket = {} end
   end
 
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
   for i, label in ipairs(VIEW_CHIPS) do
     ImGui.SameLine(ctx)
-    if chip(label, state.view == i - 1) then
+    if chip(T(label) .. '###view' .. i, state.view == i - 1) then
       state.view = i - 1
       state.focus = 0
       state.cal_scroll_end = 2
@@ -2274,31 +2380,33 @@ local function draw_toolbar()
     string.format('WIP: %d', wip))
   if no_report > 0 then
     ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xE06060FF, string.format('без отчёта: %d', no_report))
+    ImGui.TextColored(ctx, 0xE06060FF, string.format(T('без отчёта: %d'), no_report))
   end
 
   -- ряд фильтров
-  if chip('активные', state.filter_status == 0) then state.filter_status = 0 end
+  if chip(T('активные') .. '###fact', state.filter_status == 0) then state.filter_status = 0 end
   ImGui.SameLine(ctx)
-  if chip('все', state.filter_status == 1) then state.filter_status = 1 end
+  if chip(T('все') .. '###fall', state.filter_status == 1) then state.filter_status = 1 end
   ImGui.SameLine(ctx)
-  if chip('без отчёта', state.filter_status == 2) then state.filter_status = 2 end
+  if chip(T('без отчёта') .. '###fnr', state.filter_status == 2) then state.filter_status = 2 end
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
   for i, s in ipairs(core.STATUSES) do
     ImGui.SameLine(ctx)
-    if chip(s, state.filter_status == i + 2) then state.filter_status = i + 2 end
+    if chip(status_label(s) .. '###fst' .. i, state.filter_status == i + 2) then
+      state.filter_status = i + 2
+    end
   end
 
   -- ряд сортировки + размер карточек + тег
-  ImGui.TextDisabled(ctx, 'сорт:')
+  ImGui.TextDisabled(ctx, T('сорт:'))
   for i, s in ipairs(SORT_CHIPS) do
     ImGui.SameLine(ctx)
     local active = state.sort_mode == i
-    local label = s
+    local label = T(s)
     if active then
       local desc = SORT_DESC_NATURAL[i] ~= state.sort_rev
-      label = s .. (desc and ' ↓' or ' ↑')
+      label = T(s) .. (desc and ' ↓' or ' ↑')
     end
     -- повторный клик по активному чипу — переворот порядка
     if chip(label .. '###sort' .. i, active) then
@@ -2329,7 +2437,7 @@ local function draw_toolbar()
     state.focus_tag_input = false
   end
   local changed, val = ImGui.InputTextWithHint(ctx, '##tag',
-    'fzf: всё — имя, треки, регионы, отчёты… ( / )', state.filter_text)
+    T('fzf: всё — имя, треки, регионы, отчёты… ( / )'), state.filter_text)
   if changed then state.filter_text = val end
 
   -- все теги (из списка + встретившиеся в проектах) чипами справа от поиска:

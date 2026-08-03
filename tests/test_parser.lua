@@ -128,6 +128,36 @@ do
   os.remove(tmp)
 end
 
+print('== trim_wav_tail ==')
+do
+  -- синтетический WAV: 16-бит моно 8кГц, 1 c звука + 3 c нулевого хвоста
+  local srate, balign = 8000, 2
+  local sound = string.pack('<i2', 1000):rep(srate)
+  local silence = string.rep('\0', 3 * srate * balign)
+  local pcm = sound .. silence
+  local fmt = string.pack('<I2I2I4I4I2I2', 1, 1, srate, srate * balign, balign, 16)
+  local body = 'WAVE' .. 'fmt ' .. string.pack('<I4', #fmt) .. fmt
+    .. 'data' .. string.pack('<I4', #pcm) .. pcm
+  local wav_path = os.tmpname()
+  local wf = io.open(wav_path, 'wb')
+  wf:write('RIFF', string.pack('<I4', #body), body)
+  wf:close()
+
+  local ok2, cut = core.trim_wav_tail(wav_path, 1.0)
+  eq(ok2, true, 'trim сработал')
+  eq(cut, 2.0, 'отрезано 2 c (из 3 c хвоста осталась 1)')
+  local sz = io.open(wav_path, 'rb'):seek('end')
+  eq(sz, 44 + 2 * srate * balign, 'файл = заголовок + 2 c аудио')
+  -- заголовок консистентен: data-размер совпадает с фактическим
+  local rf = io.open(wav_path, 'rb')
+  local all = rf:read('*a') rf:close()
+  eq(string.unpack('<I4', all, 41), 2 * srate * balign, 'data-размер обновлён')
+  eq(string.unpack('<I4', all, 5), #all - 8, 'RIFF-размер обновлён')
+  -- повторный вызов: резать больше нечего
+  eq(core.trim_wav_tail(wav_path, 1.0), false, 'повторный trim — no-op')
+  os.remove(wav_path)
+end
+
 print('== rename_project ==')
 do
   -- стаб reaper.* поверх ls (как в рескан-харнессе)

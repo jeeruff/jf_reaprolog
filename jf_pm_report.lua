@@ -51,7 +51,37 @@ for i, s in ipairs(core.STATUSES) do
   if s == prev_status then st.status_idx = i end
 end
 
-local STATUS_LABELS = '(нет)\0' .. table.concat(core.STATUSES, '\0') .. '\0'
+-- язык — общая настройка с браузером; классы в данных каноничны
+local LANG = core.get_setting('lang') == 'en' and 'en' or 'ru'
+local RT = {
+  ['Что сделано:'] = 'Done:',
+  ['Что надо сделать:'] = 'To do:',
+  ['(«- [ ] пункт» станет чекбоксом в карточке)'] =
+    '("- [ ] item" becomes a checkbox on the card)',
+  ['статус'] = 'class', ['дедлайн'] = 'deadline',
+  ['дд.мм[.гг], пусто — снять'] = 'dd.mm[.yy], empty — clear',
+  ['теги через запятую (флейта, dungeon, EP-кандидат…)'] =
+    'comma-separated tags (flute, dungeon, EP-candidate…)',
+  ['короткое описание проекта'] = 'short project description',
+  ['Сохранить и закрыть'] = 'Save & close', ['Сохранить'] = 'Save',
+  ['Закрыть без отчёта'] = 'Close without report',
+  ['Отчёт — '] = 'Report — ', ['без имени'] = 'untitled',
+  ['(нет)'] = '(none)',
+}
+local function T(s)
+  if LANG ~= 'en' then return s end
+  return RT[s] or s
+end
+local function status_label(s)
+  if LANG == 'en' then return core.STATUS_EN[s] or s end
+  return s
+end
+local STATUS_LABELS
+do
+  local names = {}
+  for i, s in ipairs(core.STATUSES) do names[i] = status_label(s) end
+  STATUS_LABELS = T('(нет)') .. '\0' .. table.concat(names, '\0') .. '\0'
+end
 
 local ctx = ImGui.CreateContext('JF PM Report')
 local font = ImGui.CreateFont('sans-serif', 14)
@@ -120,42 +150,42 @@ local done_action = nil -- 'save_close' | 'save' | 'skip' | 'cancel'
 local function loop()
   ImGui.PushFont(ctx, font)
   ImGui.SetNextWindowSize(ctx, 560, 0, ImGui.Cond_FirstUseEver)
-  local visible, open = ImGui.Begin(ctx, 'Отчёт — ' ..
-    (proj_fn ~= '' and proj_fn:match('([^/\\]+)%.[rR][pP][pP]$') or 'без имени'),
+  local visible, open = ImGui.Begin(ctx, T('Отчёт — ') ..
+    (proj_fn ~= '' and proj_fn:match('([^/\\]+)%.[rR][pP][pP]$') or T('без имени')),
     true, ImGui.WindowFlags_NoCollapse)
   if visible then
-    ImGui.Text(ctx, 'Что сделано:')
+    ImGui.Text(ctx, T('Что сделано:'))
     local rv
     rv, st.done = ImGui.InputTextMultiline(ctx, '##done', st.done, -1, 90)
 
-    ImGui.Text(ctx, 'Что надо сделать:')
+    ImGui.Text(ctx, T('Что надо сделать:'))
     ImGui.SameLine(ctx)
-    ImGui.TextDisabled(ctx, '(«- [ ] пункт» станет чекбоксом в карточке)')
+    ImGui.TextDisabled(ctx, T('(«- [ ] пункт» станет чекбоксом в карточке)'))
     rv, st.todo = ImGui.InputTextMultiline(ctx, '##todo', st.todo, -1, 90)
 
     ImGui.SetNextItemWidth(ctx, 160)
-    rv, st.status_idx = ImGui.Combo(ctx, 'статус', st.status_idx, STATUS_LABELS)
+    rv, st.status_idx = ImGui.Combo(ctx, T('статус'), st.status_idx, STATUS_LABELS)
     ImGui.SameLine(ctx)
     ImGui.SetNextItemWidth(ctx, 100)
-    rv, st.deadline = ImGui.InputTextWithHint(ctx, '##dl', 'дедлайн', st.deadline)
+    rv, st.deadline = ImGui.InputTextWithHint(ctx, '##dl', T('дедлайн'), st.deadline)
     if ImGui.IsItemHovered(ctx) then
-      ImGui.SetTooltip(ctx, 'дд.мм[.гг], пусто — снять')
+      ImGui.SetTooltip(ctx, T('дд.мм[.гг], пусто — снять'))
     end
     ImGui.SameLine(ctx)
     ImGui.SetNextItemWidth(ctx, -1)
     rv, st.tags = ImGui.InputTextWithHint(ctx, '##tags',
-      'теги через запятую (флейта, dungeon, EP-кандидат…)', st.tags)
+      T('теги через запятую (флейта, dungeon, EP-кандидат…)'), st.tags)
 
     ImGui.SetNextItemWidth(ctx, -1)
     rv, st.desc = ImGui.InputTextWithHint(ctx, '##desc',
-      'короткое описание проекта', st.desc)
+      T('короткое описание проекта'), st.desc)
 
     ImGui.Separator(ctx)
-    if ImGui.Button(ctx, 'Сохранить и закрыть') then done_action = 'save_close' end
+    if ImGui.Button(ctx, T('Сохранить и закрыть')) then done_action = 'save_close' end
     ImGui.SameLine(ctx)
-    if ImGui.Button(ctx, 'Сохранить') then done_action = 'save' end
+    if ImGui.Button(ctx, T('Сохранить')) then done_action = 'save' end
     ImGui.SameLine(ctx)
-    if ImGui.Button(ctx, 'Закрыть без отчёта') then done_action = 'skip' end
+    if ImGui.Button(ctx, T('Закрыть без отчёта')) then done_action = 'skip' end
     if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then done_action = 'cancel' end
     ImGui.End(ctx)
   end

@@ -11,7 +11,8 @@ M.INDEX_FILENAME = 'jf_pm_index.json'
 -- Класс — это решение о судьбе проекта, а не полка.
 -- Пайплайн (прогресс): идея → доделать → отмиксить → мастеринг → издано.
 -- Вне пайплайна: «архив» (проект закрыт / разобран на семплы).
-M.STATUSES = { 'идея', 'доделать', 'отмиксить', 'мастеринг', 'издано', 'архив' }
+M.STATUSES = { 'идея', 'доделать', 'отмиксить', 'мастеринг', 'издано',
+               'семплпак', 'архив' }
 M.PIPELINE = { ['идея'] = 1, ['доделать'] = 2, ['отмиксить'] = 3,
                ['мастеринг'] = 4, ['издано'] = 5 }
 M.PIPELINE_STEPS = 5
@@ -22,13 +23,20 @@ M.STATUS_COLORS = {
   ['отмиксить'] = 0xD9B96CFF,
   ['мастеринг'] = 0xC98AD9FF,
   ['издано']    = 0x7FD98AFF,
+  ['семплпак']  = 0x7BD9D0FF,
   ['архив']     = 0x5F5F5FFF,
+}
+-- отображение классов на английском (данные в .rpp остаются каноничными)
+M.STATUS_EN = {
+  ['идея'] = 'idea', ['доделать'] = 'finish', ['отмиксить'] = 'mix',
+  ['мастеринг'] = 'master', ['издано'] = 'released',
+  ['семплпак'] = 'samplepack', ['архив'] = 'archive',
 }
 -- легаси-статусы из старых .rpp → новые классы (нормализуются в card_meta)
 M.STATUS_ALIASES = {
   ['набросок'] = 'идея',      ['в работе'] = 'доделать',
   ['к миксу'] = 'отмиксить',  ['готово'] = 'издано',
-  ['на расслоение'] = 'архив', ['заморожено'] = 'архив',
+  ['на расслоение'] = 'семплпак', ['заморожено'] = 'архив',
 }
 
 -- ===========================================================================
@@ -740,6 +748,74 @@ function M.set_project_notes(path, text)
     for i = proj_close, #lines do out[#out + 1] = lines[i] end
   end
   return write_lines(path, out)
+end
+
+-- Обрезает цифровую тишину (нулевые сэмплы) в хвосте WAV, оставляя
+-- max_tail_sec. Хвост рендера за последним айтемом — точные нули при любом
+-- формате сэмплов (дизеринг в пустоту не пишется), поэтому порог не нужен.
+-- Возвращает (true, отрезано_сек) | false (нечего резать) | nil, err.
+function M.trim_wav_tail(path, max_tail_sec)
+  local f = io.open(path, 'rb')
+  if not f then return nil, 'cannot open: ' .. tostring(path) end
+  local data = f:read('*a')
+  f:close()
+  if data:sub(1, 4) ~= 'RIFF' or data:sub(9, 12) ~= 'WAVE' then
+    return nil, 'не WAV'
+  end
+  local pos = 13
+  local srate, balign, doff, dsize
+  while pos + 8 <= #data do
+    local id = data:sub(pos, pos + 3)
+    local sz = string.unpack('<I4', data, pos + 4)
+    if id == 'fmt ' then
+      srate = string.unpack('<I4', data, pos + 12)
+      balign = string.unpack('<I2', data, pos + 20)
+    elseif id == 'data' then
+      doff, dsize = pos + 8, sz
+      break -- data обычно последний; чанки после него не сохраняем
+    end
+    pos = pos + 8 + sz + (sz % 2)
+  end
+  if not (srate and balign and doff) or balign == 0 or srate == 0 then
+    return nil, 'нет fmt/data'
+  end
+  if doff + dsize - 1 > #data then dsize = #data - doff + 1 end
+
+  -- последний ненулевой байт, с конца мегабайтными блоками
+  local last_nz = 0
+  local i = doff + dsize - 1
+  local BLOCK = 1 << 20
+  while i >= doff do
+    local j = math.max(doff, i - BLOCK + 1)
+    local chunk = data:sub(j, i)
+    if chunk:find('[^%z]') then
+      for k = #chunk, 1, -1 do
+        if chunk:byte(k) ~= 0 then
+          last_nz = j + k - 1
+          break
+        end
+      end
+      break
+    end
+    i = j - 1
+  end
+  if last_nz == 0 then return false end -- сплошная тишина — не трогаем
+
+  local frames_sound = math.ceil((last_nz - doff + 1) / balign)
+  local frames_total = math.floor(dsize / balign)
+  local frames_keep = math.min(frames_total,
+    frames_sound + math.floor(srate * (max_tail_sec or 1)))
+  if frames_keep >= frames_total then return false end
+
+  local new_dsize = frames_keep * balign
+  local new_head = data:sub(1, doff - 5) .. string.pack('<I4', new_dsize)
+  local riff_size = #new_head - 8 + new_dsize
+  local out, err = io.open(path, 'wb')
+  if not out then return nil, err end
+  out:write('RIFF', string.pack('<I4', riff_size), new_head:sub(9))
+  out:write(data:sub(doff, doff + new_dsize - 1))
+  out:close()
+  return true, (frames_total - frames_keep) / srate
 end
 
 -- ===========================================================================
