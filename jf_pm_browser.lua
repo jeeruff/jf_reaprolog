@@ -58,6 +58,7 @@ local state = {
   regions_path = core.get_setting('regions_path'),
   thumb_style = tonumber(core.get_setting('thumb_style')) or 0, -- 0 калейдоскоп, 1 иероглиф
   card_size = tonumber(core.get_setting('card_size')) or 2,     -- 1 S / 2 M / 3 L
+  peak_style = tonumber(core.get_setting('peak_style')) or 0,   -- 0 волна / 1 спектр
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
   filter_text = '',         -- fzf: имя, теги, треки
@@ -86,11 +87,15 @@ local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'и
 local SORT_DESC_NATURAL = { true, false, true, false, true }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
+-- лейблы выпадашки классов: «—» + core.STATUSES (исключение из правила
+-- «без выпадашек» — по просьбе владельца)
+local CLASS_LABELS = '—\0' .. table.concat(core.STATUSES, '\0') .. '\0'
+
 -- размеры карточек в сетке: ширина, высота, тамбнейл, макс. символов имени
 local CARD_SIZES = {
-  { label = 'S', w = 220, h = 106, thumb = 40, name = 15 },
-  { label = 'M', w = 300, h = 138, thumb = 64, name = 22 },
-  { label = 'L', w = 390, h = 176, thumb = 96, name = 30 },
+  { label = 'S', w = 220, h = 130, thumb = 40, name = 15 },
+  { label = 'M', w = 300, h = 162, thumb = 64, name = 22 },
+  { label = 'L', w = 390, h = 200, thumb = 96, name = 30 },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -206,6 +211,8 @@ end
 -- кэш поисковой строки на карточку (не пересобирать каждый кадр);
 -- инвалидация: rescan, правка тегов, смена статуса
 local search_cache = {}
+-- кэши превью/DAW-ссылок (объявлены здесь: их чистят rescan и refresh_card)
+local audio_cache, wave_cache, daw_cache = {}, {}, {}
 local function search_text(card, meta)
   local s = search_cache[card.path]
   if not s then
@@ -217,6 +224,8 @@ local function search_text(card, meta)
       table.concat(card.track_names or {}, ' '),
       table.concat(regions, ' '),
       meta.status or '',
+      meta.track_id or '',
+      meta.samples or '',
       meta.desc or '',
       meta.report_done or '',
       meta.report_todo or '',
@@ -327,7 +336,7 @@ local function rescan()
   local t0 = reaper.time_precise()
   state.index = core.build_index(paths, state.index)
   core.save_index(state.index)
-  search_cache = {}
+  search_cache, audio_cache, wave_cache, daw_cache = {}, {}, {}, {}
   local n = 0
   for _ in pairs(state.index.projects) do n = n + 1 end
   state.status_msg = string.format('Rescan: %d проектов за %.1f c', n,
@@ -507,6 +516,7 @@ end
 -- Вставить path сабпроектом на текущий трек у edit-курсора активного
 -- проекта. region ~= nil — обрезать айтем до региона.
 local function insert_subproject(path, region)
+  reaper.Main_OnCommand(40289, 0) -- Unselect all items: InsertMedia выделит свой
   reaper.InsertMedia(path, 0)
   local item = reaper.GetSelectedMediaItem(0, 0)
   if item and region then
@@ -519,17 +529,68 @@ local function insert_subproject(path, region)
   return item
 end
 
--- Авто-рендер прокси: открыть саб как associated project, сохранить
--- (REAPER рендерит прокси), закрыть таб. Айтемы — из активного проекта.
-local function render_proxies(items)
-  for _, item in ipairs(items) do
-    reaper.Main_OnCommand(40289, 0) -- Unselect all items
-    reaper.SetMediaItemSelected(item, true)
-    reaper.Main_OnCommand(41816, 0) -- Item: Open associated project in new tab (проверить id на железе)
-    reaper.Main_SaveProject(0, false)
-    reaper.Main_OnCommand(40860, 0) -- Close current project tab
+-- «Item: Open associated project in new tab»: сверяем имя по id, при
+-- несовпадении ищем перебором — id различается между версиями REAPER.
+local open_assoc_cmd
+local function find_open_assoc()
+  if open_assoc_cmd then return open_assoc_cmd end
+  local function name(id)
+    return (reaper.kbd_getTextFromCmd and reaper.kbd_getTextFromCmd(id, 0) or ''):lower()
+  end
+  if name(41816):find('associated project') then
+    open_assoc_cmd = 41816
+    return open_assoc_cmd
+  end
+  for id = 40000, 46000 do
+    local n = name(id)
+    if n:find('open associated project') then
+      open_assoc_cmd = id
+      return id
+    end
+  end
+  return nil
+end
+
+-- Авто-рендер прокси: открыть саб именно как associated project (это
+-- помечает таб сабпроектом), сохранить — REAPER рендерит прокси — закрыть.
+-- Если таб не переключился на саб, НИЧЕГО не сохраняем и не закрываем.
+local function render_proxies(placed)
+  local cmd = find_open_assoc()
+  if not cmd then
+    reaper.MB('Не нашёл экшн «Item: Open associated project in new tab».\n' ..
+      'Прокси не отрендерены: открой каждый саб двойным кликом и сохрани.',
+      'JF PM — subprojects', 0)
+    return
+  end
+  local parent = reaper.EnumProjects(-1)
+  local done, fail = 0, 0
+  local seen = {}
+  for _, pl in ipairs(placed) do
+    if not seen[pl.path] then
+      seen[pl.path] = true
+      reaper.Main_OnCommand(40289, 0) -- Unselect all items
+      reaper.SetMediaItemSelected(pl.item, true)
+      reaper.UpdateArrange()
+      reaper.Main_OnCommand(cmd, 0)
+      local sub, sub_fn = reaper.EnumProjects(-1)
+      if sub ~= parent and sub_fn == pl.path then
+        reaper.Main_SaveProject(0, false) -- сохранение саба рендерит прокси
+        reaper.Main_OnCommand(40860, 0)   -- Close current project tab
+        done = done + 1
+      else
+        -- саб не открылся — не трогаем активный таб
+        if sub ~= parent then reaper.Main_OnCommand(40860, 0) end
+        fail = fail + 1
+      end
+    end
   end
   reaper.UpdateArrange()
+  if fail > 0 then
+    reaper.MB(string.format(
+      'Прокси: %d ок, %d не удалось.\nДля оставшихся: двойной клик по айтему' ..
+      ' (откроется саб) и Cmd+S — REAPER отрендерит прокси.', done, fail),
+      'JF PM — subprojects', 0)
+  end
 end
 
 -- «Трек на проект»: для каждого пути новый трек с именем проекта,
@@ -665,7 +726,7 @@ local function refresh_card(path)
   local nc = core.build_card(path, old)
   if nc then state.index.projects[path] = nc end
   core.save_index(state.index)
-  search_cache[path] = nil
+  search_cache[path], audio_cache[path], daw_cache[path] = nil, nil, nil
   return nc
 end
 
@@ -767,6 +828,285 @@ local function set_deadline(card, text)
   refresh_card(card.path)
   state.status_msg = val == '' and 'Дедлайн снят'
     or ('Дедлайн: ' .. os.date('%d.%m.%y', tonumber(val)))
+end
+
+-- ---------------------------------------------------------------------------
+-- Аудио-превью: микро-плеер на карточке. Волна/спектральные пики — из
+-- PCM_Source_GetPeaks (кэш на файл), плейбек — SWS CF_Preview.
+-- Источник звука: jf_preview.wav → прокси саба → RENDER_FILE проекта.
+
+local AUDIO_EXT = { wav = true, aiff = true, aif = true, flac = true,
+                    mp3 = true, ogg = true }
+
+-- audio_cache: card.path -> путь к аудио | false (объявлен выше)
+local function find_preview_audio(card)
+  local hit = audio_cache[card.path]
+  if hit ~= nil then return hit or nil end
+  local dir = card.path:match('^(.*)[/\\]') or '.'
+  local cands = { dir .. '/jf_preview.wav', card.path .. '-PROX.wav' }
+  local rf = card.render_file or ''
+  if rf ~= '' then
+    if not rf:match('^/') then rf = dir .. '/' .. rf end
+    local ext = rf:lower():match('%.([%w]+)$')
+    if ext and AUDIO_EXT[ext] then cands[#cands + 1] = rf end
+  end
+  for _, p in ipairs(cands) do
+    local f = io.open(p, 'rb')
+    if f then
+      f:close()
+      audio_cache[card.path] = p
+      return p
+    end
+  end
+  audio_cache[card.path] = false
+  return nil
+end
+
+-- пики: {n, max={}, min={}, spec={}|nil, len}; кэш на аудиофайл+режим (объявлен выше)
+local WAVE_COLS = 160
+local function get_wave(audio)
+  local key = audio .. '|' .. state.peak_style
+  local w = wave_cache[key]
+  if w ~= nil then return w or nil end
+  local src = reaper.PCM_Source_CreateFromFile(audio)
+  if not src then wave_cache[key] = false return nil end
+  local len = reaper.GetMediaSourceLength(src)
+  if len <= 0 then
+    reaper.PCM_Source_Destroy(src)
+    wave_cache[key] = false
+    return nil
+  end
+  local want_spec = state.peak_style == 1
+  local mult = want_spec and 3 or 2
+  local buf = reaper.new_array(WAVE_COLS * mult)
+  local function fetch()
+    buf.clear()
+    local rv = reaper.PCM_Source_GetPeaks(src, WAVE_COLS / len, 0, 1,
+      WAVE_COLS, want_spec and 115 or 0, buf)
+    return rv & 0xfffff
+  end
+  local spl = fetch()
+  if spl == 0 then
+    -- пиков нет (.reapeaks не построен) — строим, с потолком итераций
+    reaper.PCM_Source_BuildPeaks(src, 0)
+    for _ = 1, 3000 do
+      if reaper.PCM_Source_BuildPeaks(src, 1) == 0 then break end
+    end
+    reaper.PCM_Source_BuildPeaks(src, 2)
+    spl = fetch()
+  end
+  if spl == 0 then
+    reaper.PCM_Source_Destroy(src)
+    wave_cache[key] = false
+    return nil
+  end
+  local t = buf.table()
+  local w2 = { n = spl, max = {}, min = {}, len = len,
+               spec = want_spec and {} or nil }
+  for i = 1, spl do
+    w2.max[i] = t[i]
+    w2.min[i] = t[spl + i]
+    if want_spec then w2.spec[i] = t[2 * spl + i] end
+  end
+  reaper.PCM_Source_Destroy(src)
+  wave_cache[key] = w2
+  return w2
+end
+
+-- плейбек через SWS CF_Preview; одновременно играет один
+local playing = { audio = nil, cfp = nil }
+local function preview_stop()
+  if playing.cfp then
+    reaper.CF_Preview_Stop(playing.cfp)
+    playing.audio, playing.cfp = nil, nil
+  end
+end
+
+local function preview_toggle(audio)
+  if not reaper.CF_CreatePreview then
+    state.status_msg = 'Плеер: нужен SWS (CF_Preview)'
+    return
+  end
+  if playing.audio == audio then
+    preview_stop()
+    return
+  end
+  preview_stop()
+  local src = reaper.PCM_Source_CreateFromFile(audio)
+  if not src then return end
+  local cfp = reaper.CF_CreatePreview(src)
+  reaper.PCM_Source_Destroy(src) -- CF_Preview держит свою копию
+  reaper.CF_Preview_SetValue(cfp, 'D_VOLUME', 1.0)
+  reaper.CF_Preview_Play(cfp)
+  playing.audio, playing.cfp = audio, cfp
+end
+
+-- цвет спектрального пика: частота (нижние 15 бит) → hue от красного к синему
+local function spec_color(spec)
+  local freq = math.max(spec & 0x7FFF, 30)
+  local h = math.min(math.log(freq / 60) / math.log(16000 / 60), 1)
+  return hash_color(10 + h * 230, 0.6, 0.95)
+end
+
+-- полоска-плеер: клик — play/stop; вернуть true, если клик был по полоске
+local function draw_wave_strip(card, width, height)
+  local audio = find_preview_audio(card)
+  local x0, y0 = ImGui.GetCursorScreenPos(ctx)
+  local dl = ImGui.GetWindowDrawList(ctx)
+  ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + width, y0 + height,
+    0x141414FF, 3)
+  local clicked = false
+  if not audio then
+    ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
+      'нет аудио · ▸ в карточке отрендерит превью')
+    ImGui.Dummy(ctx, width, height)
+    return false
+  end
+  local w = get_wave(audio)
+  if w then
+    local mid = y0 + height / 2
+    local step = width / w.n
+    local is_playing = playing.audio == audio
+    for i = 1, w.n do
+      local x = x0 + (i - 1) * step
+      local col = w.spec and spec_color(w.spec[i])
+        or (is_playing and 0xD9B96CFF or 0x8A8F93FF)
+      local hi = math.min(math.max(w.max[i], 0), 1) * (height / 2 - 1)
+      local lo = math.min(math.max(-w.min[i], 0), 1) * (height / 2 - 1)
+      ImGui.DrawList_AddRectFilled(dl, x, mid - hi, x + math.max(step - 1, 1),
+        mid + lo + 1, col)
+    end
+    if is_playing and playing.cfp then
+      local ok, pos = reaper.CF_Preview_GetValue(playing.cfp, 'D_POSITION')
+      if ok and w.len > 0 then
+        local px = x0 + math.min(pos / w.len, 1) * width
+        ImGui.DrawList_AddLine(dl, px, y0, px, y0 + height, 0xFFFFFFDD, 1)
+      end
+      -- дошёл до конца — сброс
+      local ok2, st2 = reaper.CF_Preview_GetValue(playing.cfp, 'B_PLAY')
+      if ok2 and st2 == 0 then preview_stop() end
+    end
+  else
+    ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
+      'пики не построились')
+  end
+  ImGui.InvisibleButton(ctx, '###wave' .. card.path, width, height)
+  if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) then
+    preview_toggle(audio)
+    clicked = true
+  end
+  if ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, playing.audio == audio and 'стоп' or
+      ('играть: ' .. (audio:match('([^/\\]+)$') or audio)))
+  end
+  return clicked
+end
+
+-- «Грамотный рендер»: открыть проект, отрендерить jf_preview.wav целиком,
+-- вернуть рендер-настройки на место, сохранить, закрыть таб.
+local function render_preview(card)
+  if project_is_open(card.path) then
+    warn_open(card, 'рендер превью')
+    return
+  end
+  local dir = card.path:match('^(.*)[/\\]') or '.'
+  os.remove(dir .. '/jf_preview.wav') -- иначе рендер спросит про перезапись
+  reaper.Main_OnCommand(40859, 0)
+  reaper.Main_openProject(card.path)
+  local proj = reaper.EnumProjects(-1)
+  local function gets(k)
+    local _, v = reaper.GetSetProjectInfo_String(proj, k, '', false)
+    return v
+  end
+  local old = {
+    file = gets('RENDER_FILE'), pat = gets('RENDER_PATTERN'),
+    fmt = gets('RENDER_FORMAT'),
+    bounds = reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 0, false),
+    settings = reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, false),
+  }
+  reaper.GetSetProjectInfo_String(proj, 'RENDER_FILE', dir, true)
+  reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', 'jf_preview', true)
+  reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', 'evaw', true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 1, true) -- весь проект
+  reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, true)   -- master mix
+  reaper.Main_OnCommand(41824, 0) -- File: Render project, using the most recent render settings
+  reaper.GetSetProjectInfo_String(proj, 'RENDER_FILE', old.file, true)
+  reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', old.pat, true)
+  reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', old.fmt, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', old.bounds, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', old.settings, true)
+  reaper.Main_SaveProject(0, false)
+  reaper.Main_OnCommand(40860, 0) -- Close current project tab
+  audio_cache[card.path] = nil
+  for k in pairs(wave_cache) do
+    if k:find(dir .. '/jf_preview.wav', 1, true) == 1 then wave_cache[k] = nil end
+  end
+  state.status_msg = 'Превью отрендерено: ' .. dir .. '/jf_preview.wav'
+end
+
+-- ---------------------------------------------------------------------------
+-- dawsync: ссылки на проекты других DAW в заметках и именах регионов.
+-- «мой трек.als» в item/track/project notes или имени региона → кнопка,
+-- открывающая связанный проект (папка проекта, иначе mdfind).
+
+local DAW_EXTS = 'als|ptx|ptf|logicx|lpx|rns|reason|flp|cpr|song|bwproject|dawproject'
+
+local function daw_links(card)
+  local hit = daw_cache[card.path]
+  if hit then return hit end
+  local seen, out = {}, {}
+  local function scan(text)
+    if not text or text == '' then return end
+    for line in (text .. '\n'):gmatch('(.-)\n') do
+      for ext in DAW_EXTS:gmatch('[^|]+') do
+        for name in line:gmatch('([^%s#][^#|]-%.' .. ext .. ')') do
+          name = name:match('^%s*(.-)%s*$')
+          if name ~= '' and not seen[name:lower()] then
+            seen[name:lower()] = true
+            out[#out + 1] = name
+          end
+        end
+      end
+    end
+  end
+  scan(card.notes)
+  for _, r in ipairs(card.regions or {}) do scan(r.name) end
+  for _, n in ipairs(card.track_notes or {}) do scan(n.s) end
+  for _, n in ipairs(card.item_notes or {}) do scan(n.s) end
+  daw_cache[card.path] = out
+  return out
+end
+
+local function open_daw_project(card, name)
+  local path
+  if name:match('^/') then
+    path = name
+  else
+    local dir = card.path:match('^(.*)[/\\]') or '.'
+    local local_p = dir .. '/' .. name
+    local f = io.open(local_p, 'rb')
+    if f then
+      f:close()
+      path = local_p
+    else
+      -- Spotlight: ищем по имени файла по всему диску
+      local out = reaper.ExecProcess(
+        '/usr/bin/mdfind -name "' .. name .. '"', 5000)
+      if out then
+        path = out:gsub('^%d+\n', ''):match('([^\n]+)')
+      end
+    end
+  end
+  if not path or path == '' then
+    state.status_msg = 'DAW-проект не найден: ' .. name
+    return
+  end
+  if reaper.CF_ShellExecute then
+    reaper.CF_ShellExecute(path)
+  else
+    reaper.ExecProcess('/usr/bin/open "' .. path .. '"', -1)
+  end
+  state.status_msg = 'Открываю: ' .. path
 end
 
 -- ---------------------------------------------------------------------------
@@ -926,6 +1266,46 @@ local function draw_card_details(card, meta)
       end
     end
   end
+
+  -- ID трека (каталожный/площадка) и использованные семплы — extstate,
+  -- пишется в закрытый .rpp; семплы ищутся в fzf
+  local function ext_field(title, key, val)
+    ImGui.TextDisabled(ctx, title)
+    ImGui.SameLine(ctx)
+    local ek = card.path .. '|' .. key
+    if state.ext_edit == ek then
+      ImGui.SetNextItemWidth(ctx, -70)
+      if state.ext_focus then
+        ImGui.SetKeyboardFocusHere(ctx)
+        state.ext_focus = false
+      end
+      local done, v = ImGui.InputText(ctx, '###ef' .. key, state.ext_text,
+        ImGui.InputTextFlags_EnterReturnsTrue)
+      if v then state.ext_text = v end
+      if done then
+        if project_is_open(card.path) then
+          warn_open(card, title)
+        else
+          core.set_ext_in_rpp(card.path, key, state.ext_text)
+          refresh_card(card.path)
+        end
+        state.ext_edit = nil
+        return true -- карточка перечитана — перерисовать
+      end
+    else
+      if val ~= '' then
+        ImGui.Text(ctx, val)
+        ImGui.SameLine(ctx)
+      end
+      if ImGui.SmallButton(ctx,
+          (val ~= '' and 'изменить' or 'добавить') .. '###ef' .. key) then
+        state.ext_edit, state.ext_text, state.ext_focus = ek, val, true
+      end
+    end
+    return false
+  end
+  if ext_field('ID трека:', 'TRACKID', meta.track_id) then return end
+  if ext_field('Семплы:', 'SAMPLES', meta.samples) then return end
 
   -- TODO: чекбоксы из отчёта и project notes (md: - [ ] / - [x])
   if #meta.todos > 0 then
@@ -1114,6 +1494,18 @@ local function draw_card_details(card, meta)
     end
   end
 
+  -- dawsync: связанные проекты других DAW из заметок/регионов
+  local links = daw_links(card)
+  if #links > 0 then
+    ImGui.TextDisabled(ctx, 'DAW:')
+    for li, name in ipairs(links) do
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, name .. '###daw' .. li) then
+        open_daw_project(card, name)
+      end
+    end
+  end
+
   ImGui.TextDisabled(ctx, card.path)
   -- команды — маленькими иконками с тултипами
   local function icon(label, tip, col)
@@ -1157,6 +1549,11 @@ local function draw_card_details(card, meta)
       card.thumb_user = nil
       core.save_index(state.index)
     end
+  end
+  ImGui.SameLine(ctx)
+  if icon('▸###rprev', 'отрендерить аудио-превью (jf_preview.wav)') then
+    render_preview(card)
+    return
   end
   ImGui.SameLine(ctx)
   if icon('↻###refr', 'обновить карточку (перечитать .rpp)') then
@@ -1246,16 +1643,27 @@ local function draw_card(entry, i, card_w)
     local color = core.STATUS_COLORS[meta.status]
     local stage = core.PIPELINE[meta.status]
     if stage then
-      -- прогресс по пайплайну: ●●○○ = «в работе»
+      -- прогресс по пайплайну: ●●○○○ = «отмиксить»
       local dots = string.rep('●', stage) ..
                    string.rep('○', core.PIPELINE_STEPS - stage)
       ImGui.TextColored(ctx, color or 0xAAAAAAFF, dots)
       ImGui.SameLine(ctx)
     end
-    if meta.status ~= '' then
-      ImGui.TextColored(ctx, color or 0xAAAAAAFF, meta.status)
-    else
-      ImGui.TextDisabled(ctx, '—')
+    -- класс — выпадашкой прямо на карточке (пишется в индекс, как канбан)
+    local cur_idx = 0
+    for si2, s2 in ipairs(core.STATUSES) do
+      if s2 == meta.status then cur_idx = si2 end
+    end
+    ImGui.SetNextItemWidth(ctx, 96)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, color or 0x9A9A9AFF)
+    local chg, ni = ImGui.Combo(ctx, '###cls' .. i, cur_idx, CLASS_LABELS)
+    ImGui.PopStyleColor(ctx)
+    if ImGui.IsItemHovered(ctx) or ImGui.IsItemActive(ctx) then
+      inner_click = true
+    end
+    if chg then
+      set_status(card, ni == 0 and '' or core.STATUSES[ni])
+      inner_click = true
     end
     if card.needs_report then
       ImGui.SameLine(ctx)
@@ -1290,6 +1698,11 @@ local function draw_card(entry, i, card_w)
         end
       end
       ImGui.TextColored(ctx, tag_color(t), label)
+    end
+
+    -- микро-плеер: волна/спектр, клик — play/stop
+    if draw_wave_strip(card, ImGui.GetContentRegionAvail(ctx), 20) then
+      inner_click = true
     end
 
     if expanded then draw_card_details(card, meta) end
@@ -1695,6 +2108,17 @@ local function draw_settings()
   if chip('навигатор', state.thumb_style == 2) then state.thumb_style = 2 end
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, 'или <имя проекта>.png / jf_thumb.png в папке проекта')
+  ImGui.Text(ctx, 'Аудио-пики:')
+  ImGui.SameLine(ctx)
+  if chip('волна', state.peak_style == 0) then
+    state.peak_style = 0
+    core.set_setting('peak_style', '0')
+  end
+  ImGui.SameLine(ctx)
+  if chip('спектр', state.peak_style == 1) then
+    state.peak_style = 1
+    core.set_setting('peak_style', '1')
+  end
 
   if ImGui.Button(ctx, 'Сохранить настройки') then
     core.set_setting('scan_paths', state.scan_paths)
@@ -1767,11 +2191,12 @@ local function draw_toolbar()
     end
   end
 
-  -- WIP-счётчик: >3 в работе — многовато, внимание расползается
+  -- WIP-счётчик: >3 в активной работе — многовато, внимание расползается
   local wip, no_report = 0, 0
   for _, card in pairs(state.index.projects) do
     local s = (card.ext or {}).STATUS or ''
-    if s == 'в работе' or s == 'к миксу' then wip = wip + 1 end
+    s = core.STATUS_ALIASES[s] or s
+    if s == 'доделать' or s == 'отмиксить' or s == 'мастеринг' then wip = wip + 1 end
     if card.needs_report then no_report = no_report + 1 end
   end
   ImGui.SameLine(ctx)
@@ -2027,7 +2452,11 @@ local function loop()
     ImGui.End(ctx)
   end
   ImGui.PopFont(ctx)
-  if open and not state.quit then reaper.defer(loop) end
+  if open and not state.quit then
+    reaper.defer(loop)
+  else
+    preview_stop() -- не оставлять играющий плеер после закрытия окна
+  end
 end
 
 reaper.defer(loop)

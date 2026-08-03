@@ -35,6 +35,8 @@ end
 -- история не теряется (REPORT_LOG только дописывается)
 local prev_todo = get_ext('REPORT_TODO')
 local prev_status = get_ext('STATUS')
+-- легаси-статус из старого проекта → новый класс, чтобы комбо его нашёл
+prev_status = core.STATUS_ALIASES[prev_status] or prev_status
 
 local st = {
   status_idx = 0,
