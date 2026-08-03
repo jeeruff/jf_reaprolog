@@ -666,6 +666,41 @@ function M.set_ext_in_rpp(path, key, value)
   return write_lines(path, lines)
 end
 
+-- Ставит/заменяет top-level строку «TOKEN value» (внутри REAPER_PROJECT,
+-- вне под-блоков). value = nil — удалить строку. Возвращает старое значение
+-- (строку после токена), false — если строки не было, nil+err — ошибка.
+function M.set_project_token(path, token, value)
+  local lines = read_lines(path)
+  if not lines then return nil, 'cannot read: ' .. path end
+  local depth, found_i, old, proj_close = 0, nil, nil, nil
+  for i, line in ipairs(lines) do
+    local s = line:match('^%s*(.-)%s*$')
+    if s:sub(1, 1) == '<' then
+      depth = depth + 1
+    elseif s == '>' then
+      if depth == 1 then proj_close = i end
+      depth = depth - 1
+    elseif depth == 1 and not found_i then
+      local v = s:match('^' .. token .. '%s+(.*)$')
+      if v then found_i, old = i, v end
+    end
+  end
+  if not proj_close then return nil, 'нет закрывающего >' end
+  if found_i then
+    if value == nil then
+      table.remove(lines, found_i)
+    else
+      local indent = lines[found_i]:match('^(%s*)')
+      lines[found_i] = indent .. token .. ' ' .. value
+    end
+  elseif value ~= nil then
+    table.insert(lines, 2, '  ' .. token .. ' ' .. value)
+  end
+  local ok, err = write_lines(path, lines)
+  if not ok then return nil, err end
+  return old or false
+end
+
 -- Заменяет project notes (top-level <NOTES>) на text; создаёт блок при
 -- отсутствии.
 function M.set_project_notes(path, text)

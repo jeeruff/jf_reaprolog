@@ -104,6 +104,17 @@ do
   local txt = io.open(tmp, 'rb'):read('*a')
   local _, dup2 = txt:gsub('\n      STATUS ', '')
   eq(dup2, 1, 'STATUS not duplicated')
+  -- top-level токен: вставка (не было), замена, чтение старого, удаление
+  local old1 = core.set_project_token(tmp, 'RENDER_1X', '0')
+  eq(old1, false, 'RENDER_1X: не было — вставлен')
+  local old2 = core.set_project_token(tmp, 'RENDER_1X', '1')
+  eq(old2, '0', 'RENDER_1X: старое значение возвращено')
+  local ctok = core.parse_rpp(tmp)
+  eq(ctok.track_count, 4, 'проект парсится после токена')
+  core.set_project_token(tmp, 'RENDER_1X', nil)
+  local txt_tok = io.open(tmp, 'rb'):read('*a')
+  check(not txt_tok:find('RENDER_1X', 1, true), 'RENDER_1X удалён')
+
   -- notes: замена блока, чекбокс переключён
   assert(core.set_project_notes(tmp,
     'Ночная вещь, серия dungeon.\n- [x] дописать интро\n- [x] выбрать темп'))

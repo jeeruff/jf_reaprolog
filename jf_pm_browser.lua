@@ -59,6 +59,7 @@ local state = {
   thumb_style = tonumber(core.get_setting('thumb_style')) or 0, -- 0 калейдоскоп, 1 иероглиф
   card_size = tonumber(core.get_setting('card_size')) or 2,     -- 1 S / 2 M / 3 L
   peak_style = tonumber(core.get_setting('peak_style')) or 0,   -- 0 волна / 1 спектр
+  preview_vol = tonumber(core.get_setting('preview_vol')) or 1.0,
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
   filter_text = '',         -- fzf: имя, теги, треки
@@ -936,7 +937,7 @@ local function preview_toggle(audio)
   if not src then return end
   local cfp = reaper.CF_CreatePreview(src)
   reaper.PCM_Source_Destroy(src) -- CF_Preview держит свою копию
-  reaper.CF_Preview_SetValue(cfp, 'D_VOLUME', 1.0)
+  reaper.CF_Preview_SetValue(cfp, 'D_VOLUME', state.preview_vol)
   reaper.CF_Preview_Play(cfp)
   playing.audio, playing.cfp = audio, cfp
 end
@@ -991,13 +992,25 @@ local function draw_wave_strip(card, width, height)
       'пики не построились')
   end
   ImGui.InvisibleButton(ctx, '###wave' .. card.path, width, height)
+  -- клик — играть с места клика / сик; правый клик — стоп
   if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) then
-    preview_toggle(audio)
+    local mx = ImGui.GetMousePos(ctx)
+    local frac = math.min(math.max((mx - x0) / width, 0), 1)
+    if playing.audio ~= audio then preview_toggle(audio) end
+    if playing.cfp and w and w.len > 0 then
+      reaper.CF_Preview_SetValue(playing.cfp, 'D_POSITION', frac * w.len)
+    end
+    clicked = true
+  end
+  if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Right) then
+    preview_stop()
     clicked = true
   end
   if ImGui.IsItemHovered(ctx) then
-    ImGui.SetTooltip(ctx, playing.audio == audio and 'стоп' or
-      ('играть: ' .. (audio:match('([^/\\]+)$') or audio)))
+    ImGui.SetTooltip(ctx, playing.audio == audio
+      and 'клик — сик · пкм — стоп'
+      or ('играть: ' .. (audio:match('([^/\\]+)$') or audio)
+        .. '\nклик — с места клика · пкм — стоп'))
   end
   return clicked
 end
@@ -1011,6 +1024,11 @@ local function render_preview(card)
   end
   local dir = card.path:match('^(.*)[/\\]') or '.'
   os.remove(dir .. '/jf_preview.wav') -- иначе рендер спросит про перезапись
+
+  -- рендер на полной скорости: RENDER_1X 0 правится в тексте .rpp до
+  -- открытия (в API поля скорости нет), после закрытия возвращается
+  local old_1x = core.set_project_token(card.path, 'RENDER_1X', '0')
+
   reaper.Main_OnCommand(40859, 0)
   reaper.Main_openProject(card.path)
   local proj = reaper.EnumProjects(-1)
@@ -1023,25 +1041,63 @@ local function render_preview(card)
     fmt = gets('RENDER_FORMAT'),
     bounds = reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 0, false),
     settings = reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, false),
+    spos = reaper.GetSetProjectInfo(proj, 'RENDER_STARTPOS', 0, false),
+    epos = reaper.GetSetProjectInfo(proj, 'RENDER_ENDPOS', 0, false),
   }
+  local function restore_1x()
+    core.set_project_token(card.path, 'RENDER_1X',
+      old_1x ~= false and old_1x or nil)
+  end
+
+  -- границы: весь проект; если конца нет (нулевая длина) или проект
+  -- бесконечно длинный — первый регион
+  local plen = reaper.GetProjectLength(proj)
+  local bounds_note = ''
+  if plen <= 0.05 or plen > 3600 then
+    local rgn_start, rgn_end, rgn_name
+    local idx = 0
+    while true do
+      local rv, isrgn, pos, rgnend, name = reaper.EnumProjectMarkers2(proj, idx)
+      if rv == 0 then break end
+      if isrgn then rgn_start, rgn_end, rgn_name = pos, rgnend, name break end
+      idx = idx + 1
+    end
+    if not rgn_start then
+      reaper.Main_OnCommand(40860, 0) -- закрыть таб, рендерить нечего
+      restore_1x()
+      state.status_msg = 'Превью: у проекта нет ни конца, ни регионов'
+      return
+    end
+    reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 0, true) -- custom
+    reaper.GetSetProjectInfo(proj, 'RENDER_STARTPOS', rgn_start, true)
+    reaper.GetSetProjectInfo(proj, 'RENDER_ENDPOS', rgn_end, true)
+    bounds_note = ' (первый регион: ' ..
+      (rgn_name ~= '' and rgn_name or '?') .. ')'
+  else
+    reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 1, true) -- весь проект
+  end
+
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FILE', dir, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', 'jf_preview', true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', 'evaw', true)
-  reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', 1, true) -- весь проект
-  reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, true)   -- master mix
+  reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', 0, true) -- master mix
   reaper.Main_OnCommand(41824, 0) -- File: Render project, using the most recent render settings
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FILE', old.file, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_PATTERN', old.pat, true)
   reaper.GetSetProjectInfo_String(proj, 'RENDER_FORMAT', old.fmt, true)
   reaper.GetSetProjectInfo(proj, 'RENDER_BOUNDSFLAG', old.bounds, true)
   reaper.GetSetProjectInfo(proj, 'RENDER_SETTINGS', old.settings, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_STARTPOS', old.spos, true)
+  reaper.GetSetProjectInfo(proj, 'RENDER_ENDPOS', old.epos, true)
   reaper.Main_SaveProject(0, false)
   reaper.Main_OnCommand(40860, 0) -- Close current project tab
+  restore_1x()
   audio_cache[card.path] = nil
   for k in pairs(wave_cache) do
     if k:find(dir .. '/jf_preview.wav', 1, true) == 1 then wave_cache[k] = nil end
   end
-  state.status_msg = 'Превью отрендерено: ' .. dir .. '/jf_preview.wav'
+  state.status_msg = 'Превью отрендерено' .. bounds_note .. ': '
+    .. dir .. '/jf_preview.wav'
 end
 
 -- ---------------------------------------------------------------------------
@@ -2139,6 +2195,20 @@ local function draw_toolbar()
   end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, 'галерея') then export_gallery() end
+  -- громкость превью (слайдер — согласованное исключение, как выпадашка)
+  ImGui.SameLine(ctx)
+  ImGui.SetNextItemWidth(ctx, 90)
+  local vchg, nv = ImGui.SliderDouble(ctx, '###pvol', state.preview_vol,
+    0.0, 1.0, 'vol %.2f')
+  if vchg then
+    state.preview_vol = nv
+    if playing.cfp then
+      reaper.CF_Preview_SetValue(playing.cfp, 'D_VOLUME', nv)
+    end
+  end
+  if ImGui.IsItemDeactivatedAfterEdit(ctx) then
+    core.set_setting('preview_vol', string.format('%.3f', state.preview_vol))
+  end
 
   -- блок выборки: порядок номеров = порядок склейки; при нескольких
   -- выделенных — те же команды, что на карточке, но на всю выборку
