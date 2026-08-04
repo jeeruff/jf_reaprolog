@@ -240,6 +240,7 @@ function M.parse_rpp(path)
     render_file = '', render_pattern = '',
     duration = 0, ext = {}, items = {},
     notes = '', track_notes = {}, item_notes = {},
+    item_count = 0,
   }
   local MAX_ITEMS = 800      -- кап карты айтемов, чтобы индекс не разбухал
   local MAX_NOTE_ITEMS = 200 -- кап заметок айтемов
@@ -247,6 +248,9 @@ function M.parse_rpp(path)
   local stack = {}
   local region_open = {}   -- id -> запись региона, ждущая парной строки-конца
   local cur_item = nil
+  local tempo_pts = {}     -- bpm-точки TEMPOENVEX (span темпа)
+  local file_names = {}    -- basename'ы FILE-ссылок (детект тональностей)
+  local file_names_n = 0
 
   for line in f:lines() do
     local s = line:match('^%s*(.-)%s*$')
@@ -280,6 +284,7 @@ function M.parse_rpp(path)
         note_buf, note_parent = nil, nil
       end
       if top == 'ITEM' and cur_item then
+        card.item_count = card.item_count + 1
         local fin = cur_item.pos + cur_item.len
         if fin > card.duration then card.duration = fin end
         -- карта айтемов для тамбнейла-навигатора: {t трек, p позиция, l длина}
@@ -303,6 +308,16 @@ function M.parse_rpp(path)
     elseif first ~= '' then
       local depth = #stack
       local top = stack[depth]
+      if top == 'TEMPOENVEX' and s:sub(1, 3) == 'PT ' then
+        local bpm = tonumber(M.tokenize_rpp_line(s)[3])
+        if bpm and bpm > 0 then tempo_pts[#tempo_pts + 1] = bpm end
+      elseif s:sub(1, 5) == 'FILE ' and file_names_n < 400 then
+        local fn = M.tokenize_rpp_line(s)[2]
+        if fn and fn ~= '' then
+          file_names_n = file_names_n + 1
+          file_names[file_names_n] = fn:match('([^/\\]+)$') or fn
+        end
+      end
       if top == 'REAPER_PROJECT' then
         if s:sub(1, 6) == 'MARKER' then
           local t = M.tokenize_rpp_line(s)
@@ -356,7 +371,137 @@ function M.parse_rpp(path)
     if r.fin > card.duration then card.duration = r.fin end
   end
   card.track_count = #card.track_names
+
+  -- span темпа: базовый TEMPO + все точки огибающей
+  local mn, mx = card.tempo, card.tempo
+  for _, b in ipairs(tempo_pts) do
+    if not mn or b < mn then mn = b end
+    if not mx or b > mx then mx = b end
+  end
+  card.bpm_min, card.bpm_max = mn, mx
+
+  -- тональности: имя проекта/регионы/маркеры/треки (свободный матч),
+  -- имена FILE — только с явным min/maj (иначе питчи семплов дают мусор)
+  local keys, seen = {}, {}
+  local function add_keys(str, strict)
+    if not str or str == '' or #keys >= 4 then return end
+    for _, k in ipairs(M.find_keys_in(str, strict)) do
+      if not seen[k] and #keys < 4 then
+        seen[k] = true
+        keys[#keys + 1] = k
+      end
+    end
+  end
+  add_keys(path:match('([^/\\]+)%.[rR][pP][pP]$'), false)
+  for _, r in ipairs(card.regions) do add_keys(r.name, false) end
+  for _, mk in ipairs(card.markers) do add_keys(mk.name, false) end
+  for _, tn in ipairs(card.track_names) do add_keys(tn, false) end
+  for _, fn in ipairs(file_names) do add_keys(fn, true) end
+  card.keys = keys
+
   return card
+end
+
+-- ===========================================================================
+-- BPM из имени и тональности из строк
+-- ===========================================================================
+
+-- '[160]' или '160bpm' в имени проекта → число (40..300)
+function M.name_bpm(name)
+  if not name then return nil end
+  for num in name:gmatch('%[(%d+%.?%d*)%]') do
+    local b = tonumber(num)
+    if b and b >= 40 and b <= 300 then return b end
+  end
+  local b = tonumber(name:match('%f[%d](%d+%.?%d*)%s*[bB][pP][mM]'))
+  if b and b >= 40 and b <= 300 then return b end
+  return nil
+end
+
+-- эффективный bpm карточки: тег в имени приоритетнее TEMPO из .rpp
+function M.card_bpm(card)
+  return M.name_bpm(card.name) or card.tempo
+end
+
+-- Тональности в строке: 'Amin', 'F#m', 'Db maj', 'C#'…
+-- strict=true (имена файлов): нужен явный суффикс m/min/maj —
+-- голые 'C#4' это питчи семплов, не тональности.
+-- Нормализация: минор → 'Am', мажор → 'A'.
+function M.find_keys_in(str, strict)
+  local out = {}
+  if not str then return out end
+  local norm = str:gsub('[%-_%.]', ' ')
+  -- склейка 'A min'/'F# maj' в одно слово
+  norm = norm:gsub('([A-Ga-g][#b]?)%s+(m[ia][jn]o?r?)', '%1%2')
+  for w in norm:gmatch('%S+') do
+    local note, acc, suf = w:match('^([A-Ga-g])([#b]?)(%a*)$')
+    if note then
+      suf = suf:lower()
+      local minor = (suf == 'm' or suf == 'min' or suf == 'minor')
+      local major = (suf == 'maj' or suf == 'major')
+      local bare = (suf == '')
+      local upper = note:match('%u') ~= nil
+      local ok
+      if minor or major then
+        ok = true
+      elseif bare and acc ~= '' and upper and not strict then
+        ok = true -- 'F#' в имени проекта/региона — принимаем
+      end
+      if ok then
+        local k = note:upper() .. (acc == 'b' and 'b' or acc)
+        if minor then k = k .. 'm' end
+        out[#out + 1] = k
+      end
+    end
+  end
+  return out
+end
+
+-- ===========================================================================
+-- Аудиофайлы в папке проекта (детект пустых проектов)
+-- ===========================================================================
+
+M.AUDIO_EXT = {
+  wav = true, aif = true, aiff = true, flac = true, mp3 = true,
+  ogg = true, m4a = true, caf = true, wv = true, opus = true,
+}
+
+-- Рекурсивный счётчик аудиофайлов (ранний выход: больше 99 не считаем)
+function M.dir_audio_count(dir, depth)
+  depth = depth or 1
+  if depth > 6 then return 0 end
+  local count, subs = 0, {}
+  local i = 0
+  while true do
+    local fn = reaper.EnumerateFiles(dir, i)
+    if not fn then break end
+    local ext = fn:match('%.([%a%d]+)$')
+    if ext and M.AUDIO_EXT[ext:lower()] then
+      count = count + 1
+      if count > 99 then return count end
+    end
+    i = i + 1
+  end
+  i = 0
+  while true do
+    local sub = reaper.EnumerateSubdirectories(dir, i)
+    if not sub then break end
+    if sub:sub(1, 1) ~= '.' then subs[#subs + 1] = sub end
+    i = i + 1
+  end
+  for _, sub in ipairs(subs) do
+    count = count + M.dir_audio_count(dir .. '/' .. sub, depth + 1)
+    if count > 99 then return count end
+  end
+  return count
+end
+
+-- Пустой проект: нет ни одного айтема ИЛИ ни одного аудиофайла в папке.
+-- Поля могут отсутствовать в старом индексе — тогда не помечаем.
+function M.is_empty_project(card)
+  if card.item_count ~= nil and card.item_count == 0 then return true end
+  if card.audio_files ~= nil and card.audio_files == 0 then return true end
+  return false
 end
 
 -- ===========================================================================
@@ -558,7 +703,7 @@ end
 
 -- Полная карточка одного проекта (парсинг + fs). old_card — из прежнего
 -- индекса, оттуда переносятся index-only поля (needs_report).
-function M.build_card(path, old_card, dir_sizes)
+function M.build_card(path, old_card, dir_sizes, dir_audio)
   local card, err = M.parse_rpp(path)
   if not card then return nil, err end
   card.path = path
@@ -571,6 +716,12 @@ function M.build_card(path, old_card, dir_sizes)
   else
     card.dir_size = M.dir_size(dir)
     if dir_sizes then dir_sizes[dir] = card.dir_size end
+  end
+  if dir_audio and dir_audio[dir] then
+    card.audio_files = dir_audio[dir]
+  else
+    card.audio_files = M.dir_audio_count(dir)
+    if dir_audio then dir_audio[dir] = card.audio_files end
   end
   card.fs_tags = M.finder_tags(path)
   card.backups = M.find_backups(path)
@@ -594,8 +745,9 @@ function M.build_index(paths, old_index)
   local idx = { version = 1, updated = 0, projects = {} }
   local old = old_index and old_index.projects or {}
   local dir_sizes = {} -- кэш: несколько .rpp в одной папке — один обход
+  local dir_audio = {}
   for _, p in ipairs(M.scan_projects(paths)) do
-    local card = M.build_card(p, old[p], dir_sizes)
+    local card = M.build_card(p, old[p], dir_sizes, dir_audio)
     if card then idx.projects[p] = card end
   end
   return idx

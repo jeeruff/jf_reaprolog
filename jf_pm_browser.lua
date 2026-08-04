@@ -60,6 +60,10 @@ local EN = {
   ['канбан'] = 'kanban',
   ['сорт:'] = 'sort:', ['дата'] = 'date', ['статус'] = 'class',
   ['длительность'] = 'length', ['имя'] = 'name', ['размер'] = 'size',
+  ['нет айтемов'] = 'no items',
+  ['нет аудио в папке проекта'] = 'no audio in project folder',
+  ['аудиофайлов: '] = 'audio files: ',
+  ['пустые'] = 'empty',
   ['fzf: всё — имя, треки, регионы, отчёты… ( / )'] =
     'fzf: everything — name, tracks, regions, reports… ( / )',
   ['Пути'] = 'Paths', ['Проекты (через ;):'] = 'Projects (separated by ;):',
@@ -167,7 +171,7 @@ local state = {
   sel = {},                 -- упорядоченный список путей — порядок = порядок merge
   basket = {},              -- корзина регионов: {path, region} для сборки проекта
   kb_col = 0, kb_row = 0,   -- фокус в канбане
-  sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя, 5 размер
+  sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя, 5 размер, 6 bpm
   sort_rev = false,         -- клик по активному чипу переворачивает порядок
   expanded = nil,           -- path раскрытой карточки
   focus = 0,                -- индекс карточки в фокусе (vim), 0 = нет
@@ -179,14 +183,15 @@ local state = {
   tag_add_path = nil,       -- карточка с открытым полем нового тега
   tag_add_text = '',
   filter_tags = {},         -- активные теги-фильтры (AND)
+  filter_empty = false,     -- показывать только пустышки (∅)
 }
 
 local STATUS_ORDER = {}
 for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 
-local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'имя', 'размер' }
+local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'имя', 'размер', 'bpm' }
 -- естественное направление: true = по убыванию (новое/большое сверху)
-local SORT_DESC_NATURAL = { true, false, true, false, true }
+local SORT_DESC_NATURAL = { true, false, true, false, true, false }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
 -- лейблы выпадашки классов: «—» + core.STATUSES (исключение из правила
@@ -245,6 +250,26 @@ local function trunc(s, n)
     return s:sub(1, utf8.offset(s, n + 1) - 1) .. '…'
   end
   return s
+end
+
+-- '[160]' в имени → 160 BPM; огибающая темпа → span '90-160 BPM'
+local function fmt_bpm(card)
+  local function n(x) return math.floor(x + 0.5) end
+  local tag = core.name_bpm(card.name)
+  local lo, hi = card.bpm_min, card.bpm_max
+  if lo and hi and n(hi) - n(lo) >= 1 then
+    return n(lo) .. '-' .. n(hi) .. ' BPM'
+  end
+  local b = tag or card.tempo
+  if not b then return nil end
+  return n(b) .. ' BPM' .. (tag and card.tempo and n(tag) ~= n(card.tempo)
+    and (' (rpp ' .. n(card.tempo) .. ')') or '')
+end
+
+local function fmt_keys(card)
+  local k = card.keys
+  if not k or #k == 0 then return nil end
+  return table.concat(k, ' ', 1, math.min(#k, 3))
 end
 
 local function fnv1a(str)
@@ -387,6 +412,7 @@ local function collect_cards()
     elseif f >= 3 then
       ok = meta.status == core.STATUSES[f - 2]
     end
+    if ok and state.filter_empty then ok = core.is_empty_project(card) end
     -- фильтр по тегам-чипам: карточка должна иметь все активные (AND)
     if ok and next(state.filter_tags) then
       local have = {}
@@ -420,6 +446,9 @@ local function collect_cards()
       local sa = a.card.dir_size or a.card.size or 0
       local sb = b.card.dir_size or b.card.size or 0
       if sa ~= sb then return sa > sb end
+    elseif m == 6 then
+      local ba, bb = core.card_bpm(a.card), core.card_bpm(b.card)
+      if ba ~= bb and ba and bb then return ba < bb end
     end
     if (a.card.mtime or 0) ~= (b.card.mtime or 0) then
       return (a.card.mtime or 0) > (b.card.mtime or 0)
@@ -434,6 +463,12 @@ local function collect_cards()
     local na = a.card.needs_report and 1 or 0
     local nb = b.card.needs_report and 1 or 0
     if na ~= nb then return na > nb end
+    if m == 6 then
+      -- проекты без темпа — всегда в конец, реверс их не поднимает
+      local ha = core.card_bpm(a.card) and 1 or 0
+      local hb = core.card_bpm(b.card) and 1 or 0
+      if ha ~= hb then return ha > hb end
+    end
     if state.sort_rev then return less(b, a) end
     return less(a, b)
   end)
@@ -1508,9 +1543,21 @@ end
 
 local function draw_card_details(card, meta)
   ImGui.Separator(ctx)
-  ImGui.Text(ctx, string.format('%s BPM · %d/%d · %d трек(ов)',
-    card.tempo and tostring(card.tempo) or '—',
-    card.timesig_num or 4, card.timesig_den or 4, card.track_count or 0))
+  ImGui.Text(ctx, string.format('%s · %d/%d · %d трек(ов) · %d айтем(ов)',
+    fmt_bpm(card) or '— BPM',
+    card.timesig_num or 4, card.timesig_den or 4, card.track_count or 0,
+    card.item_count or 0))
+  local keys_str = fmt_keys(card)
+  if keys_str then
+    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, 0x7BD9D0FF, '· ' .. keys_str)
+  end
+  if core.is_empty_project(card) then
+    ImGui.TextColored(ctx, 0x8A8F93FF, '∅ ' ..
+      ((card.item_count == 0) and T('нет айтемов') or T('нет аудио в папке проекта')) ..
+      ((card.audio_files ~= nil)
+        and ('  ·  ' .. T('аудиофайлов: ') .. card.audio_files) or ''))
+  end
 
   if meta.desc ~= '' then
     ImGui.TextWrapped(ctx, meta.desc)
@@ -1901,6 +1948,15 @@ local function draw_card(entry, i, card_w)
     ImGui.SameLine(ctx)
     ImGui.BeginGroup(ctx)
     ImGui.Text(ctx, trunc(card.name, cs.name))
+    if core.is_empty_project(card) then
+      -- пустышка: ни одного айтема или ни одного аудиофайла в папке
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, 0x7A7A7AFF, '∅')
+      if ImGui.IsItemHovered(ctx) then
+        ImGui.SetTooltip(ctx, (card.item_count == 0 and T('нет айтемов') or
+          T('нет аудио в папке проекта')))
+      end
+    end
     if card.pinned then
       ImGui.SameLine(ctx)
       ImGui.TextColored(ctx, 0xD9B96CFF, '●') -- закреплён
@@ -1973,6 +2029,12 @@ local function draw_card(entry, i, card_w)
     ImGui.TextDisabled(ctx, fmt_duration(card.duration) .. '   ' ..
       (#card.regions) .. ' рег.' ..
       (card.dir_size and ('   ' .. fmt_size(card.dir_size)) or ''))
+    local bpm_str = fmt_bpm(card)
+    local keys_str = fmt_keys(card)
+    if bpm_str or keys_str then
+      ImGui.TextDisabled(ctx, (bpm_str or '') ..
+        (bpm_str and keys_str and '   ' or '') .. (keys_str or ''))
+    end
     ImGui.EndGroup(ctx)
 
     -- следующий шаг из последнего отчёта — открытая петля снаружи головы
@@ -2553,6 +2615,10 @@ local function draw_toolbar()
   if chip(T('все') .. '###fall', state.filter_status == 1) then state.filter_status = 1 end
   ImGui.SameLine(ctx)
   if chip(T('без отчёта') .. '###fnr', state.filter_status == 2) then state.filter_status = 2 end
+  ImGui.SameLine(ctx)
+  if chip('∅ ' .. T('пустые') .. '###fempty', state.filter_empty) then
+    state.filter_empty = not state.filter_empty
+  end
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
   for i, s in ipairs(core.STATUSES) do
