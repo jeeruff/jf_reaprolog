@@ -119,6 +119,9 @@ local EN = {
   ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
   ['Превью отрендерено'] = 'Preview rendered',
   ['Демо отрендерено'] = 'Demo rendered',
+  ['Подсказки кнопок:'] = 'Button tooltips:',
+  ['вкл'] = 'on', ['выкл'] = 'off',
+  ['отрендерить аудио-превью'] = 'render audio preview',
   ['отрендерить полное демо (весь проект)'] = 'render full demo (whole project)',
   ['Починить легаси-превью'] = 'Fix legacy previews',
   ['Легаси-превью: переименовано %d, общих на папку %d (батч дорендерит)'] =
@@ -169,6 +172,7 @@ local state = {
   thumb_style = tonumber(core.get_setting('thumb_style')) or 0, -- 0 калейдоскоп, 1 иероглиф
   card_size = tonumber(core.get_setting('card_size')) or 2,     -- 1 S / 2 M / 3 L
   peak_style = tonumber(core.get_setting('peak_style')) or 0,   -- 0 волна / 1 спектр
+  btn_tips = core.get_setting('btn_tips') ~= '0',               -- подсказки кнопок
   preview_vol = tonumber(core.get_setting('preview_vol')) or 1.0,
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
@@ -1568,29 +1572,32 @@ end
 -- Ряд команд карточки (всегда наверху). true — был клик по кнопке.
 local function draw_card_icons(card, meta, i)
   local hit = false
-  local function icon(label, tip, col)
+  -- только глиф; что делает кнопка — в тултипе (отключается в настройках)
+  local function icon(glyph, id, tip, col)
     if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
-    local clicked = ImGui.SmallButton(ctx, label .. '###ci' .. i)
+    local clicked = ImGui.SmallButton(ctx, glyph .. '###' .. id .. i)
     if col then ImGui.PopStyleColor(ctx) end
-    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, tip) end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, tip)
+    end
     if clicked then hit = true end
     return clicked
   end
-  if icon((card.pinned and '●' or '○') .. 'pin',
+  if icon(card.pinned and '●' or '○', 'pin',
       card.pinned and T('открепить') or T('закрепить'),
       card.pinned and 0xD9B96CFF or nil) then
     toggle_pin(card)
   end
   ImGui.SameLine(ctx)
-  if icon('▸prev', T('отрендерить аудио-превью (jf_preview.wav)')) then
+  if icon('▸', 'prev', T('отрендерить аудио-превью')) then
     render_audio(card, 'preview')
   end
   ImGui.SameLine(ctx)
-  if icon('▶demo', T('отрендерить полное демо (весь проект)')) then
+  if icon('▶', 'demo', T('отрендерить полное демо (весь проект)')) then
     render_audio(card, 'demo')
   end
   ImGui.SameLine(ctx)
-  if icon('Aa ren', T('переименовать проект…')) then
+  if icon('Aa', 'ren', T('переименовать проект…')) then
     if state.ren_path == card.path then
       state.ren_path = nil
     else
@@ -1599,7 +1606,7 @@ local function draw_card_icons(card, meta, i)
     end
   end
   ImGui.SameLine(ctx)
-  if icon('▦thumb', T('назначить картинку-превью…')) then
+  if icon('▦', 'thumb', T('назначить картинку-превью…')) then
     local rv, fn = reaper.GetUserFileNameForRead('', 'Картинка-превью проекта', '')
     if rv and fn and fn ~= '' then
       card.thumb_user = fn
@@ -1608,7 +1615,7 @@ local function draw_card_icons(card, meta, i)
     end
   end
   ImGui.SameLine(ctx)
-  if icon('×del', T('удалить в Корзину…')) then
+  if icon('×', 'del', T('удалить в Корзину…')) then
     delete_project(card)
   end
   -- инлайн-поле переименования — под рядом иконок
@@ -1962,7 +1969,9 @@ local function draw_card_details(card, meta)
     if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
     local clicked = ImGui.SmallButton(ctx, label)
     if col then ImGui.PopStyleColor(ctx) end
-    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, tip) end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, tip)
+    end
     return clicked
   end
   if icon('▲###fold', T('свернуть')) then state.expanded = nil end
@@ -2035,7 +2044,7 @@ local function draw_card(entry, i, card_w)
       inner_click = true
     end
     ImGui.PopStyleColor(ctx)
-    if ImGui.IsItemHovered(ctx) then
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
       ImGui.SetTooltip(ctx, T('обновить карточку'))
     end
     ImGui.SameLine(ctx, card_w - 30)
@@ -2548,6 +2557,18 @@ local function draw_settings()
     state.peak_style = 1
     core.set_setting('peak_style', '1')
   end
+  ImGui.Text(ctx, T('Подсказки кнопок:'))
+  ImGui.SameLine(ctx)
+  if chip(T('вкл') .. '###tip1', state.btn_tips) then
+    state.btn_tips = true
+    core.set_setting('btn_tips', '1')
+  end
+  ImGui.SameLine(ctx)
+  if chip(T('выкл') .. '###tip0', not state.btn_tips) then
+    state.btn_tips = false
+    core.set_setting('btn_tips', '0')
+  end
+
   ImGui.Text(ctx, T('Язык / Language:'))
   ImGui.SameLine(ctx)
   if chip('RU###lru', LANG == 'ru') then
