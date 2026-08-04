@@ -1294,7 +1294,16 @@ end
 local function batch_start()
   local queue = {}
   for path, card in pairs(state.index.projects) do
-    if not find_preview_audio(card) then queue[#queue + 1] = path end
+    local audio = find_preview_audio(card)
+    if not audio then
+      queue[#queue + 1] = path -- превью нет — рендерим
+    elseif audio:match('_preview%.wav$') or audio:match('jf_preview%.wav$') then
+      -- своё превью есть, но сплошная тишина — битый рендер, перерендерить
+      if core.wav_is_silent(audio) == true then
+        audio_cache[path] = nil
+        queue[#queue + 1] = path
+      end
+    end
   end
   table.sort(queue, function(a, b)
     return (state.index.projects[a].mtime or 0)

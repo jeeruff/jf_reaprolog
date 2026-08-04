@@ -782,6 +782,41 @@ function M.missing_media(path)
   return missing
 end
 
+-- true, если WAV — сплошная цифровая тишина (все сэмплы нулевые).
+-- Быстро для нормальных файлов: выход на первом ненулевом байте.
+function M.wav_is_silent(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil, 'cannot open' end
+  local head = f:read(12)
+  if not head or head:sub(1, 4) ~= 'RIFF' or head:sub(9, 12) ~= 'WAVE' then
+    f:close()
+    return nil, 'не WAV'
+  end
+  -- ищем data-чанк
+  local doff, dsize
+  while true do
+    local hdr = f:read(8)
+    if not hdr or #hdr < 8 then break end
+    local id = hdr:sub(1, 4)
+    local sz = string.unpack('<I4', hdr, 5)
+    if id == 'data' then
+      doff, dsize = f:seek(), sz
+      break
+    end
+    f:seek('cur', sz + (sz % 2))
+  end
+  if not doff then f:close() return nil, 'нет data' end
+  local left = dsize
+  while left > 0 do
+    local chunk = f:read(math.min(left, 1 << 20))
+    if not chunk then break end
+    if chunk:find('[^%z]') then f:close() return false end
+    left = left - #chunk
+  end
+  f:close()
+  return true
+end
+
 -- Обрезает цифровую тишину (нулевые сэмплы) в начале и хвосте WAV,
 -- оставляя max_lead_sec воздуха в начале и max_tail_sec в конце. Тишина
 -- рендера — точные нули при любом формате сэмплов (дизеринг в пустоту не

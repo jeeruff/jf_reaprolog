@@ -185,6 +185,25 @@ do
   local sz2 = io.open(wav2, 'rb'):seek('end')
   eq(sz2, 44 + math.floor(2.5 * srate) * balign, 'файл = 2.5 c аудио')
   os.remove(wav2)
+
+  -- wav_is_silent: сплошные нули → true, со звуком → false
+  local pcm3 = string.rep('\0', srate * balign)
+  local body3 = 'WAVE' .. 'fmt ' .. string.pack('<I4', #fmt) .. fmt
+    .. 'data' .. string.pack('<I4', #pcm3) .. pcm3
+  local wav3 = os.tmpname()
+  local wf3 = io.open(wav3, 'wb')
+  wf3:write('RIFF', string.pack('<I4', #body3), body3)
+  wf3:close()
+  eq(core.wav_is_silent(wav3), true, 'тишина распознана')
+  os.remove(wav3)
+  local wav4 = os.tmpname()
+  local body4 = 'WAVE' .. 'fmt ' .. string.pack('<I4', #fmt) .. fmt
+    .. 'data' .. string.pack('<I4', #sound) .. sound
+  local wf4 = io.open(wav4, 'wb')
+  wf4:write('RIFF', string.pack('<I4', #body4), body4)
+  wf4:close()
+  eq(core.wav_is_silent(wav4), false, 'звук распознан')
+  os.remove(wav4)
 end
 
 print('== rename_project ==')
