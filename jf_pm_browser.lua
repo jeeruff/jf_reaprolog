@@ -118,6 +118,11 @@ local EN = {
     'Preview: project has neither an end nor regions',
   ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
   ['Превью отрендерено'] = 'Preview rendered',
+  ['Демо отрендерено'] = 'Demo rendered',
+  ['отрендерить полное демо (весь проект)'] = 'render full demo (whole project)',
+  ['Починить легаси-превью'] = 'Fix legacy previews',
+  ['Легаси-превью: переименовано %d, общих на папку %d (батч дорендерит)'] =
+    'Legacy previews: %d renamed, %d shared per folder (batch will re-render)',
   ['на расслоение'] = 'to harvest',
   ['На расслоение: %d'] = 'To harvest: %d',
   ['Пропавшие файлы (%d):'] = 'Missing files (%d):',
@@ -211,9 +216,9 @@ end
 
 -- размеры карточек в сетке: ширина, высота, тамбнейл, макс. символов имени
 local CARD_SIZES = {
-  { label = 'S', w = 220, h = 130, thumb = 40, name = 15 },
-  { label = 'M', w = 300, h = 162, thumb = 64, name = 22 },
-  { label = 'L', w = 390, h = 200, thumb = 96, name = 30 },
+  { label = 'S', w = 230, h = 150, thumb = 40, name = 15 },
+  { label = 'M', w = 310, h = 178, thumb = 64, name = 22 },
+  { label = 'L', w = 400, h = 216, thumb = 96, name = 30 },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -1183,7 +1188,9 @@ end
 
 -- «Грамотный рендер»: открыть проект, отрендерить jf_preview.wav целиком,
 -- вернуть рендер-настройки на место, сохранить, закрыть таб.
-local function render_preview(card)
+-- kind: 'preview' (лимит 5 мин, суффикс _preview) | 'demo' (весь проект,
+-- суффикс _demo). Нормализация −18 LUFS и брикволл — в обоих случаях.
+local function render_audio(card, kind)
   if project_is_open(card.path) then
     warn_open(card, 'рендер превью')
     return
@@ -1202,7 +1209,8 @@ local function render_preview(card)
   end
   local dir = card.path:match('^(.*)[/\\]') or '.'
   -- превью зовётся по имени проекта: у двух .rpp в одной папке — свои файлы
-  local pv_name = card.name:gsub('%$', '') .. '_preview'
+  local pv_name = card.name:gsub('%$', '')
+    .. (kind == 'demo' and '_demo' or '_preview')
   local pv_path = dir .. '/' .. pv_name .. '.wav'
   os.remove(pv_path) -- иначе рендер спросит про перезапись
 
@@ -1244,7 +1252,8 @@ local function render_preview(card)
 
   -- границы: весь проект, но не длиннее лимита превью; если конца нет
   -- (нулевая длина) — первый регион (тоже с лимитом)
-  local PREVIEW_MAX = 300 -- лимит длины превью: 5 минут
+  -- демо рендерится целиком, превью — не длиннее 5 минут
+  local PREVIEW_MAX = kind == 'demo' and math.huge or 300
   local plen = reaper.GetProjectLength(proj)
   local bounds_note = ''
   if plen <= 0.05 then
@@ -1314,7 +1323,8 @@ local function render_preview(card)
   for k in pairs(wave_cache) do
     if k:find(pv_path, 1, true) == 1 then wave_cache[k] = nil end
   end
-  state.status_msg = T('Превью отрендерено') .. bounds_note .. ': ' .. pv_path
+  state.status_msg = (kind == 'demo' and T('Демо отрендерено')
+    or T('Превью отрендерено')) .. bounds_note .. ': ' .. pv_path
 end
 
 -- Батч «превью всем»: очередь путей, по одному проекту на кадр defer-цикла
@@ -1336,12 +1346,50 @@ local function batch_step()
       -- модальный диалог «файлы не найдены» повесил бы очередь
       bq.skipped = (bq.skipped or 0) + 1
     else
-      render_preview(card)
+      render_audio(card, 'preview')
       bq.done = bq.done + 1
     end
   end
   state.status_msg = string.format(T('Превью-батч: %d/%d'),
     bq.done + (bq.skipped or 0), bq.total)
+end
+
+-- Миграция: легаси jf_preview.wav → <имя>_preview.wav. В однопроектных
+-- папках переименовываем; в многопроектных общий файл принадлежал всем
+-- сразу — его нельзя присвоить одному проекту, поэтому только сообщаем.
+local function migrate_legacy_previews()
+  local by_dir = {}
+  for path, card in pairs(state.index.projects) do
+    local dir = path:match('^(.*)[/\\]') or '.'
+    local d = by_dir[dir]
+    if not d then d = {} by_dir[dir] = d end
+    d[#d + 1] = card
+  end
+  local moved, shared = 0, 0
+  for dir, cards in pairs(by_dir) do
+    local legacy = dir .. '/jf_preview.wav'
+    local f = io.open(legacy, 'rb')
+    if f then
+      f:close()
+      if #cards == 1 then
+        local target = dir .. '/' .. cards[1].name:gsub('%$', '') .. '_preview.wav'
+        local tf = io.open(target, 'rb')
+        if tf then
+          tf:close()
+          os.remove(legacy) -- именное превью уже есть, легаси лишний
+        elseif os.rename(legacy, target) then
+          moved = moved + 1
+        end
+        audio_cache[cards[1].path] = nil
+      else
+        shared = shared + 1 -- батч дорендерит именные каждому
+      end
+    end
+  end
+  wave_cache, dir_count_cache = {}, {}
+  state.status_msg = string.format(
+    T('Легаси-превью: переименовано %d, общих на папку %d (батч дорендерит)'),
+    moved, shared)
 end
 
 local function batch_start()
@@ -1516,6 +1564,71 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Сетка карточек
+
+-- Ряд команд карточки (всегда наверху). true — был клик по кнопке.
+local function draw_card_icons(card, meta, i)
+  local hit = false
+  local function icon(label, tip, col)
+    if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
+    local clicked = ImGui.SmallButton(ctx, label .. '###ci' .. i)
+    if col then ImGui.PopStyleColor(ctx) end
+    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, tip) end
+    if clicked then hit = true end
+    return clicked
+  end
+  if icon((card.pinned and '●' or '○') .. 'pin',
+      card.pinned and T('открепить') or T('закрепить'),
+      card.pinned and 0xD9B96CFF or nil) then
+    toggle_pin(card)
+  end
+  ImGui.SameLine(ctx)
+  if icon('▸prev', T('отрендерить аудио-превью (jf_preview.wav)')) then
+    render_audio(card, 'preview')
+  end
+  ImGui.SameLine(ctx)
+  if icon('▶demo', T('отрендерить полное демо (весь проект)')) then
+    render_audio(card, 'demo')
+  end
+  ImGui.SameLine(ctx)
+  if icon('Aa ren', T('переименовать проект…')) then
+    if state.ren_path == card.path then
+      state.ren_path = nil
+    else
+      state.ren_path, state.ren_text = card.path, card.name
+      state.ren_focus = true
+    end
+  end
+  ImGui.SameLine(ctx)
+  if icon('▦thumb', T('назначить картинку-превью…')) then
+    local rv, fn = reaper.GetUserFileNameForRead('', 'Картинка-превью проекта', '')
+    if rv and fn and fn ~= '' then
+      card.thumb_user = fn
+      img_cache[fn] = nil
+      core.save_index(state.index)
+    end
+  end
+  ImGui.SameLine(ctx)
+  if icon('×del', T('удалить в Корзину…')) then
+    delete_project(card)
+  end
+  -- инлайн-поле переименования — под рядом иконок
+  if state.ren_path == card.path then
+    ImGui.SetNextItemWidth(ctx, -1)
+    if state.ren_focus then
+      ImGui.SetKeyboardFocusHere(ctx)
+      state.ren_focus = false
+    end
+    local done, v = ImGui.InputTextWithHint(ctx, '###rename' .. i,
+      T('новое имя + Enter'), state.ren_text, ImGui.InputTextFlags_EnterReturnsTrue)
+    if v then state.ren_text = v end
+    if done then
+      rename_project(card, state.ren_text)
+      state.ren_path = nil
+    end
+    hit = true
+  end
+  return hit
+end
 
 -- md-lite: # заголовки, - буллеты; строки-чекбоксы пропускаются
 -- (они рисуются интерактивно в блоке TODO)
@@ -1844,7 +1957,7 @@ local function draw_card_details(card, meta)
   end
 
   ImGui.TextDisabled(ctx, card.path)
-  -- команды — маленькими иконками с тултипами
+  -- (иконки команд переехали наверх карточки — draw_card_icons)
   local function icon(label, tip, col)
     if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
     local clicked = ImGui.SmallButton(ctx, label)
@@ -1854,73 +1967,16 @@ local function draw_card_details(card, meta)
   end
   if icon('▲###fold', T('свернуть')) then state.expanded = nil end
   ImGui.SameLine(ctx)
-  if icon((card.pinned and '●' or '○') .. '###pin',
-      card.pinned and T('открепить') or T('закрепить'),
-      card.pinned and 0xD9B96CFF or nil) then
-    toggle_pin(card)
-  end
-  ImGui.SameLine(ctx)
   local si = sel_index(card.path)
   if icon((si and '■' or '□') .. '###sel',
       si and T('снять выбор') or T('выбрать'), si and 0xD9B96CFF or nil) then
     toggle_select(card.path)
-  end
-  ImGui.SameLine(ctx)
-  if icon('×###del', T('удалить в Корзину…')) then
-    delete_project(card)
-    return
-  end
-  ImGui.SameLine(ctx)
-  if icon('▦###thumb', T('назначить картинку-превью…')) then
-    -- нативный диалог, без зависимостей от js_ReaScriptAPI
-    local rv, fn = reaper.GetUserFileNameForRead('', 'Картинка-превью проекта', '')
-    if rv and fn and fn ~= '' then
-      card.thumb_user = fn
-      img_cache[fn] = nil -- если раньше не загрузилась — пробуем заново
-      core.save_index(state.index)
-    end
   end
   if card.thumb_user then
     ImGui.SameLine(ctx)
     if icon('▧###unthumb', T('сбросить превью')) then
       card.thumb_user = nil
       core.save_index(state.index)
-    end
-  end
-  ImGui.SameLine(ctx)
-  if icon('▸###rprev', T('отрендерить аудио-превью (jf_preview.wav)')) then
-    render_preview(card)
-    return
-  end
-  ImGui.SameLine(ctx)
-  if icon('↻###refr', T('обновить карточку (перечитать .rpp)')) then
-    refresh_card(card.path)
-    state.status_msg = T('Обновлено: ') .. card.name
-    return
-  end
-  ImGui.SameLine(ctx)
-  if icon('Aa###ren', T('переименовать проект…')) then
-    if state.ren_path == card.path then
-      state.ren_path = nil
-    else
-      state.ren_path, state.ren_text = card.path, card.name
-      state.ren_focus = true
-    end
-  end
-  if state.ren_path == card.path then
-    ImGui.SameLine(ctx)
-    ImGui.SetNextItemWidth(ctx, 200)
-    if state.ren_focus then
-      ImGui.SetKeyboardFocusHere(ctx)
-      state.ren_focus = false
-    end
-    local done, v = ImGui.InputTextWithHint(ctx, '###rename',
-      T('новое имя + Enter'), state.ren_text, ImGui.InputTextFlags_EnterReturnsTrue)
-    if v then state.ren_text = v end
-    if done then
-      rename_project(card, state.ren_text)
-      state.ren_path = nil
-      return
     end
   end
 end
@@ -1938,12 +1994,16 @@ local function draw_card(entry, i, card_w)
   if expanded then
     child_flags = child_flags | ImGui.ChildFlags_AutoResizeY
   end
+  -- без скроллбаров: в свёрнутом виде контент подгоняется под высоту,
+  -- в раскрытом карточка растёт сама (AutoResizeY)
+  local win_flags = ImGui.WindowFlags_NoScrollbar
+    | ImGui.WindowFlags_NoScrollWithMouse
   if focused then
     ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xE8E8E8FF)
   elseif si then
     ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
   end
-  if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags) then
+  if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags, win_flags) then
     draw_thumb(card, cs.thumb)
     ImGui.SameLine(ctx)
     ImGui.BeginGroup(ctx)
@@ -1986,6 +2046,9 @@ local function draw_card(entry, i, card_w)
     end
     ImGui.PopStyleColor(ctx)
 
+    -- ряд команд наверху карточки: всегда под рукой, не в глубине
+    if draw_card_icons(card, meta, i) then inner_click = true end
+
     local color = core.STATUS_COLORS[meta.status]
     local stage = core.PIPELINE[meta.status]
     if stage then
@@ -2026,37 +2089,47 @@ local function draw_card(entry, i, card_w)
       ImGui.TextColored(ctx, deadline_color(meta.deadline, os.time()),
         '→ ' .. os.date('%d.%m', meta.deadline))
     end
-    ImGui.TextDisabled(ctx, fmt_duration(card.duration) .. '   ' ..
-      (#card.regions) .. ' рег.' ..
-      (card.dir_size and ('   ' .. fmt_size(card.dir_size)) or ''))
     local bpm_str = fmt_bpm(card)
     local keys_str = fmt_keys(card)
-    if bpm_str or keys_str then
-      ImGui.TextDisabled(ctx, (bpm_str or '') ..
-        (bpm_str and keys_str and '   ' or '') .. (keys_str or ''))
-    end
+    -- компактная строка: длительность · bpm · тональности
+    ImGui.TextDisabled(ctx, fmt_duration(card.duration)
+      .. (bpm_str and ('   ' .. bpm_str) or '')
+      .. (keys_str and ('   ' .. keys_str) or ''))
     ImGui.EndGroup(ctx)
 
     -- следующий шаг из последнего отчёта — открытая петля снаружи головы
     local next_action = meta.report_todo:match('^[^\n]+')
     if next_action then
-      ImGui.TextColored(ctx, 0xD9B96CFF, '→ ' .. next_action)
+      ImGui.TextColored(ctx, 0xD9B96CFF,
+        trunc('→ ' .. next_action, cs.name + 8))
     end
 
-    -- теги цветными чипами с ручным переносом по ширине карточки
+    -- теги: в свёрнутом виде одной строкой (без переносов — иначе
+    -- карточка перерастает высоту и появляется скроллбар)
     local tags = all_tags(card, meta)
-    for ti, t in ipairs(tags) do
-      local label = '#' .. t
-      if ti > 1 then
-        ImGui.SameLine(ctx)
-        if ImGui.CalcTextSize(ctx, label) > ImGui.GetContentRegionAvail(ctx) then
-          ImGui.NewLine(ctx)
+    if #tags > 0 then
+      if expanded then
+        for ti, t in ipairs(tags) do
+          local label = '#' .. t
+          if ti > 1 then
+            ImGui.SameLine(ctx)
+            if ImGui.CalcTextSize(ctx, label) > ImGui.GetContentRegionAvail(ctx) then
+              ImGui.NewLine(ctx)
+            end
+          end
+          ImGui.TextColored(ctx, tag_color(t), label)
         end
+      else
+        ImGui.TextColored(ctx, tag_color(tags[1]),
+          trunc('#' .. table.concat(tags, ' #'), cs.name + 10))
       end
-      ImGui.TextColored(ctx, tag_color(t), label)
     end
 
-    -- микро-плеер: волна/спектр, клик — play/stop
+    -- превью всегда видно: полоска-плеер прижата к низу свёрнутой карточки
+    if not expanded then
+      local _, resty = ImGui.GetContentRegionAvail(ctx)
+      if resty and resty > 22 then ImGui.Dummy(ctx, 1, resty - 22) end
+    end
     if draw_wave_strip(card, ImGui.GetContentRegionAvail(ctx), 20) then
       inner_click = true
     end
@@ -2495,6 +2568,10 @@ local function draw_settings()
   else
     if ImGui.Button(ctx, T('Сделать превью всем проектам (у кого нет аудио)')) then
       batch_start()
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, T('Починить легаси-превью')) then
+      migrate_legacy_previews()
     end
     ImGui.SameLine(ctx)
     ImGui.TextDisabled(ctx, T('лимит 5 мин · рендер offline · можно остановить'))
