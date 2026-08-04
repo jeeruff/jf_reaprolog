@@ -326,6 +326,7 @@ end
 local search_cache = {}
 -- кэши превью/DAW-ссылок (объявлены здесь: их чистят rescan и refresh_card)
 local audio_cache, wave_cache, daw_cache = {}, {}, {}
+local dir_count_cache = {} -- dir -> число .rpp (для легаси-превью)
 local function search_text(card, meta)
   local s = search_cache[card.path]
   if not s then
@@ -450,6 +451,7 @@ local function rescan()
   state.index = core.build_index(paths, state.index)
   core.save_index(state.index)
   search_cache, audio_cache, wave_cache, daw_cache = {}, {}, {}, {}
+  dir_count_cache = {}
   local n = 0
   for _ in pairs(state.index.projects) do n = n + 1 end
   state.status_msg = string.format('Rescan: %d проектов за %.1f c', n,
@@ -840,6 +842,7 @@ local function refresh_card(path)
   if nc then state.index.projects[path] = nc end
   core.save_index(state.index)
   search_cache[path], audio_cache[path], daw_cache[path] = nil, nil, nil
+  dir_count_cache = {}
   return nc
 end
 
@@ -956,11 +959,23 @@ local function find_preview_audio(card)
   local hit = audio_cache[card.path]
   if hit ~= nil then return hit or nil end
   local dir = card.path:match('^(.*)[/\\]') or '.'
-  local cands = {
-    dir .. '/' .. card.name .. '_preview.wav',
-    dir .. '/jf_preview.wav', -- легаси-имя до перехода на имя проекта
-    card.path .. '-PROX.wav',
-  }
+  -- сколько проектов в папке: легаси jf_preview.wav общий на папку —
+  -- при нескольких .rpp он делил бы одно превью между проектами (баг
+  -- «басс1/басс2 играют одно и то же»), поэтому принимаем его только
+  -- для единственного проекта в папке
+  local nproj = dir_count_cache[dir]
+  if not nproj then
+    nproj = 0
+    for p in pairs(state.index.projects) do
+      if (p:match('^(.*)[/\\]') or '.') == dir then nproj = nproj + 1 end
+    end
+    dir_count_cache[dir] = nproj
+  end
+  local cands = { dir .. '/' .. card.name .. '_preview.wav' }
+  if nproj <= 1 then
+    cands[#cands + 1] = dir .. '/jf_preview.wav'
+  end
+  cands[#cands + 1] = card.path .. '-PROX.wav'
   local rf = card.render_file or ''
   if rf ~= '' then
     if not rf:match('^/') then rf = dir .. '/' .. rf end
