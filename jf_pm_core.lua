@@ -540,6 +540,45 @@ function M.dir_size(dir)
   return total
 end
 
+-- Время последнего открытия (atime): REAPER читает .rpp при открытии,
+-- поэтому atime = «когда последний раз открывал». macOS обновляет atime
+-- лениво, но для сортировки по дням этого достаточно.
+function M.file_atime(path)
+  if reaper.JS_File_Stat then
+    local retval, _, _, _, accessed = reaper.JS_File_Stat(path)
+    if retval == 0 and accessed then
+      local num = tonumber(accessed)
+      if num then return num end
+      local y, mo, d, h, mi, sec =
+        tostring(accessed):match('(%d+)%-(%d+)%-(%d+)[T ](%d+):(%d+):(%d+)')
+      if y then
+        return os.time{ year = y, month = mo, day = d, hour = h, min = mi, sec = sec }
+      end
+    end
+  end
+  local out = reaper.ExecProcess('/usr/bin/stat -f %a "' .. path .. '"', 5000)
+  if out then
+    local ts = out:match('^%d+\n(%d+)')
+    if ts then return tonumber(ts) end
+  end
+  return 0
+end
+
+-- Список недавних проектов REAPER (reaper.ini, recentNN=path) — порядок
+-- открытия для тех, кто в него попал. Возвращает {path_lower -> ранг}.
+function M.recent_projects()
+  local ini = reaper.GetResourcePath() .. '/reaper.ini'
+  local f = io.open(ini, 'rb')
+  if not f then return {} end
+  local out = {}
+  for line in f:lines() do
+    local n, p = line:match('^recent(%d+)=(.+)$')
+    if n and p and p ~= '' then out[p:lower()] = tonumber(n) end
+  end
+  f:close()
+  return out
+end
+
 function M.file_mtime(path)
   -- js_ReaScriptAPI установлен (см. handover); формат modifiedTime проверить
   -- на железе — подстраховано разбором и unix-ts, и ISO-строки.
@@ -709,6 +748,7 @@ function M.build_card(path, old_card, dir_sizes, dir_audio)
   card.path = path
   card.name = path:match('([^/\\]+)%.[rR][pP][pP]$') or path
   card.mtime = M.file_mtime(path)
+  card.atime = M.file_atime(path)
   card.size = M.file_size(path)
   local dir = path:match('^(.*)[/\\]') or '.'
   if dir_sizes and dir_sizes[dir] then

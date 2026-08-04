@@ -119,6 +119,8 @@ local EN = {
   ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
   ['Превью отрендерено'] = 'Preview rendered',
   ['Демо отрендерено'] = 'Demo rendered',
+  ['открыт'] = 'opened',
+  ['Открыт: '] = 'Opened: ',
   ['Подсказки кнопок:'] = 'Button tooltips:',
   ['вкл'] = 'on', ['выкл'] = 'off',
   ['отрендерить аудио-превью'] = 'render audio preview',
@@ -179,8 +181,10 @@ local state = {
   filter_text = '',         -- fzf: имя, теги, треки
   sel = {},                 -- упорядоченный список путей — порядок = порядок merge
   basket = {},              -- корзина регионов: {path, region} для сборки проекта
+  recent = core.recent_projects(), -- порядок открытия из reaper.ini
   kb_col = 0, kb_row = 0,   -- фокус в канбане
-  sort_mode = 1,            -- 1 дата, 2 статус, 3 длительность, 4 имя, 5 размер, 6 bpm
+  sort_mode = 1,            -- 1 дата, 2 открыт, 3 статус, 4 длительность,
+                            -- 5 имя, 6 размер, 7 bpm
   sort_rev = false,         -- клик по активному чипу переворачивает порядок
   expanded = nil,           -- path раскрытой карточки
   focus = 0,                -- индекс карточки в фокусе (vim), 0 = нет
@@ -198,9 +202,10 @@ local state = {
 local STATUS_ORDER = {}
 for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 
-local SORT_CHIPS = { 'дата', 'статус', 'длительность', 'имя', 'размер', 'bpm' }
+local SORT_CHIPS = { 'дата', 'открыт', 'статус', 'длительность', 'имя',
+                     'размер', 'bpm' }
 -- естественное направление: true = по убыванию (новое/большое сверху)
-local SORT_DESC_NATURAL = { true, false, true, false, true, false }
+local SORT_DESC_NATURAL = { true, true, false, true, false, true, false }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
 -- лейблы выпадашки классов: «—» + core.STATUSES (исключение из правила
@@ -440,22 +445,35 @@ local function collect_cards()
   local m = state.sort_mode
   local function less(a, b)
     if m == 2 then
+      -- дата открытия: recent-список REAPER точнее (ранг 1 — последний
+      -- открытый), для остальных — atime файла
+      local ra = state.recent[a.card.path:lower()]
+      local rb = state.recent[b.card.path:lower()]
+      if ra and rb then
+        if ra ~= rb then return ra < rb end
+      elseif ra or rb then
+        return ra ~= nil -- бывшие в recent новее любого atime
+      else
+        local aa, ab = a.card.atime or 0, b.card.atime or 0
+        if aa ~= ab then return aa > ab end
+      end
+    elseif m == 3 then
       local oa = STATUS_ORDER[a.meta.status] or 99
       local ob = STATUS_ORDER[b.meta.status] or 99
       if oa ~= ob then return oa < ob end
-    elseif m == 3 then
+    elseif m == 4 then
       if (a.card.duration or 0) ~= (b.card.duration or 0) then
         return (a.card.duration or 0) > (b.card.duration or 0)
       end
-    elseif m == 4 then
+    elseif m == 5 then
       if a.card.name:lower() ~= b.card.name:lower() then
         return a.card.name:lower() < b.card.name:lower()
       end
-    elseif m == 5 then
+    elseif m == 6 then
       local sa = a.card.dir_size or a.card.size or 0
       local sb = b.card.dir_size or b.card.size or 0
       if sa ~= sb then return sa > sb end
-    elseif m == 6 then
+    elseif m == 7 then
       local ba, bb = core.card_bpm(a.card), core.card_bpm(b.card)
       if ba ~= bb and ba and bb then return ba < bb end
     end
@@ -472,7 +490,7 @@ local function collect_cards()
     local na = a.card.needs_report and 1 or 0
     local nb = b.card.needs_report and 1 or 0
     if na ~= nb then return na > nb end
-    if m == 6 then
+    if m == 7 then
       -- проекты без темпа — всегда в конец, реверс их не поднимает
       local ha = core.card_bpm(a.card) and 1 or 0
       local hb = core.card_bpm(b.card) and 1 or 0
@@ -496,6 +514,7 @@ local function rescan()
   core.save_index(state.index)
   search_cache, audio_cache, wave_cache, daw_cache = {}, {}, {}, {}
   dir_count_cache = {}
+  state.recent = core.recent_projects()
   local n = 0
   for _ in pairs(state.index.projects) do n = n + 1 end
   state.status_msg = string.format('Rescan: %d проектов за %.1f c', n,
@@ -1949,6 +1968,10 @@ local function draw_card_details(card, meta)
       end
       state.tag_add_path = nil
     end
+  end
+
+  if (card.atime or 0) > 0 then
+    ImGui.TextDisabled(ctx, T('Открыт: ') .. fmt_date(card.atime))
   end
 
   -- dawsync: связанные проекты других DAW из заметок/регионов
