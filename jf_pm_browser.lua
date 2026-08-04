@@ -114,6 +114,8 @@ local EN = {
     'Preview: project has neither an end nor regions',
   ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
   ['Превью отрендерено'] = 'Preview rendered',
+  ['на расслоение'] = 'to harvest',
+  ['На расслоение: %d'] = 'To harvest: %d',
   ['Пропавшие файлы (%d):'] = 'Missing files (%d):',
   ['Рендерить всё равно? (REAPER спросит про поиск файлов)'] =
     'Render anyway? (REAPER will ask to search for files)',
@@ -195,6 +197,7 @@ local function class_labels()
   if not l then
     local names = {}
     for i, s in ipairs(core.STATUSES) do names[i] = status_label(s) end
+    names[#names + 1] = T('удалить…') -- действие, не класс
     l = '—\0' .. table.concat(names, '\0') .. '\0'
     CLASS_LABELS_CACHE[LANG] = l
   end
@@ -1934,7 +1937,11 @@ local function draw_card(entry, i, card_w)
       inner_click = true
     end
     if chg then
-      set_status(card, ni == 0 and '' or core.STATUSES[ni])
+      if ni == #core.STATUSES + 1 then
+        delete_project(card) -- последний пункт выпадашки — удаление
+      else
+        set_status(card, ni == 0 and '' or core.STATUSES[ni])
+      end
       inner_click = true
     end
     if card.needs_report then
@@ -2455,6 +2462,14 @@ local function draw_toolbar()
   if #state.sel > 0 then
     ImGui.SameLine(ctx)
     ImGui.TextColored(ctx, 0xD9B96CFF, string.format(T('выбрано: %d'), #state.sel))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('на расслоение') .. '###selharv') then
+      for _, p in ipairs(state.sel) do
+        local card = state.index.projects[p]
+        if card then set_status(card, 'на расслоение') end
+      end
+      state.status_msg = string.format(T('На расслоение: %d'), #state.sel)
+    end
     if #state.sel >= 2 then
       ImGui.SameLine(ctx)
       if ImGui.Button(ctx, 'merge') then merge_selected() end
