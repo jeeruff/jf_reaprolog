@@ -750,6 +750,38 @@ function M.set_project_notes(path, text)
   return write_lines(path, out)
 end
 
+-- Пропавшие медиафайлы проекта: FILE-ссылки из текста .rpp, которых нет на
+-- диске (проверка до открытия — чтобы батч не спотыкался о модальный диалог
+-- REAPER «файлы не найдены»). Относительные пути — от папки проекта; как и
+-- REAPER, дополнительно ищем по имени в корне папки проекта.
+-- Возвращает список имён (уникальные, максимум 20).
+function M.missing_media(path)
+  local lines = read_lines(path)
+  if not lines then return {} end
+  local dir = path:match('^(.*)[/\\]') or '.'
+  local seen, missing = {}, {}
+  local function exists(p)
+    local f = io.open(p, 'rb')
+    if f then f:close() return true end
+    return false
+  end
+  for _, line in ipairs(lines) do
+    local fn = line:match("^%s*FILE%s+[\"'`](.-)[\"'`]")
+    if fn and fn ~= '' and not seen[fn] then
+      seen[fn] = true
+      local full = fn:match('^/') and fn or (dir .. '/' .. fn)
+      if not exists(full) then
+        local base = fn:match('([^/\\]+)$') or fn
+        if not exists(dir .. '/' .. base) then
+          missing[#missing + 1] = base
+          if #missing >= 20 then break end
+        end
+      end
+    end
+  end
+  return missing
+end
+
 -- Обрезает цифровую тишину (нулевые сэмплы) в начале и хвосте WAV,
 -- оставляя max_lead_sec воздуха в начале и max_tail_sec в конце. Тишина
 -- рендера — точные нули при любом формате сэмплов (дизеринг в пустоту не

@@ -114,6 +114,10 @@ local EN = {
     'Preview: project has neither an end nor regions',
   ['Превью-батч: %d/%d'] = 'Preview batch: %d/%d',
   ['Превью отрендерено'] = 'Preview rendered',
+  ['Пропавшие файлы (%d):'] = 'Missing files (%d):',
+  ['Рендерить всё равно? (REAPER спросит про поиск файлов)'] =
+    'Render anyway? (REAPER will ask to search for files)',
+  [' · пропущено (нет файлов): %d'] = ' · skipped (missing media): %d',
   [' · тишина −%d c'] = ' · silence −%d s',
   ['Превью-батч: готово %d'] = 'Preview batch: %d done',
   ['Превью-батч: у всех уже есть аудио'] =
@@ -1131,6 +1135,18 @@ local function render_preview(card)
     warn_open(card, 'рендер превью')
     return
   end
+  -- пропавшие медиа: открытие покажет модальный диалог REAPER — спросим
+  if not state.batch then
+    local missing = core.missing_media(card.path)
+    if #missing > 0 then
+      local r = reaper.MB(string.format(
+        T('Пропавшие файлы (%d):') .. '\n%s\n\n' ..
+        T('Рендерить всё равно? (REAPER спросит про поиск файлов)'),
+        #missing, table.concat(missing, '\n', 1, math.min(#missing, 8))),
+        'JF PM', 4)
+      if r ~= 6 then return end
+    end
+  end
   local dir = card.path:match('^(.*)[/\\]') or '.'
   -- превью зовётся по имени проекта: у двух .rpp в одной папке — свои файлы
   local pv_name = card.name:gsub('%$', '') .. '_preview'
@@ -1256,16 +1272,23 @@ local function batch_step()
   local path = table.remove(bq.queue, 1)
   if not path then
     state.status_msg = string.format(T('Превью-батч: готово %d'), bq.done)
+      .. ((bq.skipped or 0) > 0
+        and string.format(T(' · пропущено (нет файлов): %d'), bq.skipped) or '')
     state.batch = nil
     return
   end
   local card = state.index.projects[path]
   if card and not project_is_open(path) then
-    render_preview(card)
-    bq.done = bq.done + 1
+    if #core.missing_media(path) > 0 then
+      -- модальный диалог «файлы не найдены» повесил бы очередь
+      bq.skipped = (bq.skipped or 0) + 1
+    else
+      render_preview(card)
+      bq.done = bq.done + 1
+    end
   end
   state.status_msg = string.format(T('Превью-батч: %d/%d'),
-    bq.done, bq.total)
+    bq.done + (bq.skipped or 0), bq.total)
 end
 
 local function batch_start()

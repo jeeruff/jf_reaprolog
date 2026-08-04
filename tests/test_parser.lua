@@ -128,6 +128,18 @@ do
   os.remove(tmp)
 end
 
+print('== missing_media ==')
+do
+  -- аудио из фикстуры не существует на диске — всё в списке пропавших
+  local miss = core.missing_media('tests/fixtures/test_project.rpp')
+  check(#miss >= 2, 'пропавшие найдены: ' .. #miss)
+  local has_flute = false
+  for _, m in ipairs(miss) do
+    if m == 'flute_main_take3.wav' then has_flute = true end
+  end
+  check(has_flute, 'имя файла в списке')
+end
+
 print('== trim_wav_tail ==')
 do
   -- синтетический WAV: 16-бит моно 8кГц, 1 c звука + 3 c нулевого хвоста
