@@ -120,6 +120,17 @@ local EN = {
   ['Превью отрендерено'] = 'Preview rendered',
   ['Демо отрендерено'] = 'Demo rendered',
   ['открыт'] = 'opened',
+  ['сохранён'] = 'saved',
+  ['открыть бэкап в новой вкладке'] = 'open backup in a new tab',
+  ['восстановить проект из этого бэкапа…'] = 'restore project from this backup…',
+  ['Открыт бэкап: '] = 'Backup opened: ',
+  ['Бэкап не найден: '] = 'Backup not found: ',
+  ['Восстановить проект из бэкапа?'] = 'Restore project from backup?',
+  ['Текущий .rpp сохранится рядом как _before-restore.rpp'] =
+    'The current .rpp will be kept as _before-restore.rpp',
+  ['Восстановлено из: '] = 'Restored from: ',
+  ['Восстановление: не могу записать .rpp'] = 'Restore: cannot write .rpp',
+  ['восстановление бэкапа'] = 'backup restore',
   ['Открыт: '] = 'Opened: ',
   ['Подсказки кнопок:'] = 'Button tooltips:',
   ['вкл'] = 'on', ['выкл'] = 'off',
@@ -183,8 +194,8 @@ local state = {
   basket = {},              -- корзина регионов: {path, region} для сборки проекта
   recent = core.recent_projects(), -- порядок открытия из reaper.ini
   kb_col = 0, kb_row = 0,   -- фокус в канбане
-  sort_mode = 1,            -- 1 дата, 2 открыт, 3 статус, 4 длительность,
-                            -- 5 имя, 6 размер, 7 bpm
+  sort_mode = 1,            -- 1 дата, 2 открыт, 3 сохранён (с бэкапами),
+                            -- 4 статус, 5 длительность, 6 имя, 7 размер, 8 bpm
   sort_rev = false,         -- клик по активному чипу переворачивает порядок
   expanded = nil,           -- path раскрытой карточки
   focus = 0,                -- индекс карточки в фокусе (vim), 0 = нет
@@ -202,10 +213,10 @@ local state = {
 local STATUS_ORDER = {}
 for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 
-local SORT_CHIPS = { 'дата', 'открыт', 'статус', 'длительность', 'имя',
-                     'размер', 'bpm' }
+local SORT_CHIPS = { 'дата', 'открыт', 'сохранён', 'статус', 'длительность',
+                     'имя', 'размер', 'bpm' }
 -- естественное направление: true = по убыванию (новое/большое сверху)
-local SORT_DESC_NATURAL = { true, true, false, true, false, true, false }
+local SORT_DESC_NATURAL = { true, true, true, false, true, false, true, false }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
 -- лейблы выпадашки классов: «—» + core.STATUSES (исключение из правила
@@ -404,6 +415,15 @@ end
 
 -- ---------------------------------------------------------------------------
 
+-- последнее сохранение: сам .rpp либо свежайший бэкап
+local function last_save(card)
+  local t = card.mtime or 0
+  for _, bk in ipairs(card.backups or {}) do
+    if (bk.mtime or 0) > t then t = bk.mtime end
+  end
+  return t
+end
+
 local function collect_cards()
   local cards = {}
   local needle_tokens
@@ -458,22 +478,28 @@ local function collect_cards()
         if aa ~= ab then return aa > ab end
       end
     elseif m == 3 then
+      -- последнее сохранение с учётом бэкапов: свежий .rpp-bak значит,
+      -- что проект трогали, даже если сам .rpp старше
+      local sa = last_save(a.card)
+      local sb = last_save(b.card)
+      if sa ~= sb then return sa > sb end
+    elseif m == 4 then
       local oa = STATUS_ORDER[a.meta.status] or 99
       local ob = STATUS_ORDER[b.meta.status] or 99
       if oa ~= ob then return oa < ob end
-    elseif m == 4 then
+    elseif m == 5 then
       if (a.card.duration or 0) ~= (b.card.duration or 0) then
         return (a.card.duration or 0) > (b.card.duration or 0)
       end
-    elseif m == 5 then
+    elseif m == 6 then
       if a.card.name:lower() ~= b.card.name:lower() then
         return a.card.name:lower() < b.card.name:lower()
       end
-    elseif m == 6 then
+    elseif m == 7 then
       local sa = a.card.dir_size or a.card.size or 0
       local sb = b.card.dir_size or b.card.size or 0
       if sa ~= sb then return sa > sb end
-    elseif m == 7 then
+    elseif m == 8 then
       local ba, bb = core.card_bpm(a.card), core.card_bpm(b.card)
       if ba ~= bb and ba and bb then return ba < bb end
     end
@@ -490,7 +516,7 @@ local function collect_cards()
     local na = a.card.needs_report and 1 or 0
     local nb = b.card.needs_report and 1 or 0
     if na ~= nb then return na > nb end
-    if m == 7 then
+    if m == 8 then
       -- проекты без темпа — всегда в конец, реверс их не поднимает
       local ha = core.card_bpm(a.card) and 1 or 0
       local hb = core.card_bpm(b.card) and 1 or 0
@@ -907,6 +933,70 @@ local function refresh_card(path)
   search_cache[path], audio_cache[path], daw_cache[path] = nil, nil, nil
   dir_count_cache = {}
   return nc
+end
+
+-- Открыть бэкап: .rpp-bak REAPER открывает как обычный проект.
+local function open_backup(card, bk)
+  local dir = card.path:match('^(.*)[/\\]') or '.'
+  local full = bk.dir and (bk.dir .. '/' .. bk.file) or (dir .. '/' .. bk.file)
+  local f = io.open(full, 'rb')
+  if not f then
+    -- бэкап мог лежать в Backups/ — пробуем там
+    full = dir .. '/Backups/' .. bk.file
+    f = io.open(full, 'rb')
+    if not f then
+      state.status_msg = T('Бэкап не найден: ') .. bk.file
+      return
+    end
+  end
+  f:close()
+  open_project(full)
+  state.status_msg = T('Открыт бэкап: ') .. bk.file
+end
+
+-- Восстановить бэкап: текущий .rpp отходит в <имя>_before-restore.rpp,
+-- бэкап копируется на его место. Проект не должен быть открыт.
+local function restore_backup(card, bk)
+  if project_is_open(card.path) then
+    warn_open(card, T('восстановление бэкапа'))
+    return
+  end
+  local dir = card.path:match('^(.*)[/\\]') or '.'
+  local src = bk.dir and (bk.dir .. '/' .. bk.file) or (dir .. '/' .. bk.file)
+  local sf = io.open(src, 'rb')
+  if not sf then
+    src = dir .. '/Backups/' .. bk.file
+    sf = io.open(src, 'rb')
+    if not sf then
+      state.status_msg = T('Бэкап не найден: ') .. bk.file
+      return
+    end
+  end
+  local r = reaper.MB(
+    T('Восстановить проект из бэкапа?') .. '\n\n' .. bk.file ..
+    '\n\n' .. T('Текущий .rpp сохранится рядом как _before-restore.rpp'),
+    'JF PM', 1)
+  if r ~= 1 then sf:close() return end
+  local data = sf:read('*a')
+  sf:close()
+  local keep = dir .. '/' .. card.name .. '_before-restore.rpp'
+  os.remove(keep)
+  local cf = io.open(card.path, 'rb')
+  if cf then
+    local cur = cf:read('*a')
+    cf:close()
+    local kf = io.open(keep, 'wb')
+    if kf then kf:write(cur) kf:close() end
+  end
+  local out = io.open(card.path, 'wb')
+  if not out then
+    state.status_msg = T('Восстановление: не могу записать .rpp')
+    return
+  end
+  out:write(data)
+  out:close()
+  refresh_card(card.path)
+  state.status_msg = T('Восстановлено из: ') .. bk.file
 end
 
 -- Переименование: всё с префиксом имени + папка проекта (см. core).
@@ -1894,9 +1984,24 @@ local function draw_card_details(card, meta)
   local backups = card.backups or {}
   if #backups > 0 then
     if ImGui.TreeNode(ctx, string.format('%s (%d)###bak', T('Бэкапы'), #backups)) then
-      for _, b in ipairs(backups) do
-        ImGui.BulletText(ctx, string.format('%s — %s, %s',
-          b.file, fmt_date(b.mtime), fmt_size(b.size)))
+      for bi, bk in ipairs(backups) do
+        -- клик — открыть бэкап в новой вкладке, «↩» — восстановить
+        if ImGui.SmallButton(ctx, string.format('%s — %s, %s###bko%d',
+            bk.file, fmt_date(bk.mtime), fmt_size(bk.size), bi)) then
+          open_backup(card, bk)
+        end
+        if state.btn_tips and ImGui.IsItemHovered(ctx) then
+          ImGui.SetTooltip(ctx, T('открыть бэкап в новой вкладке'))
+        end
+        ImGui.SameLine(ctx)
+        if ImGui.SmallButton(ctx, '↩###bkr' .. bi) then
+          restore_backup(card, bk)
+          ImGui.TreePop(ctx)
+          return
+        end
+        if state.btn_tips and ImGui.IsItemHovered(ctx) then
+          ImGui.SetTooltip(ctx, T('восстановить проект из этого бэкапа…'))
+        end
       end
       ImGui.TreePop(ctx)
     end

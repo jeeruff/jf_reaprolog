@@ -707,7 +707,8 @@ function M.find_backups(path)
            or fn:match('%d%d%d%d%-%d%d%-%d%d') then
           local full = d .. '/' .. fn
           out[#out + 1] = {
-            file = fn, mtime = M.file_mtime(full), size = M.file_size(full),
+            file = fn, dir = d, -- d: папка проекта или Backups/
+            mtime = M.file_mtime(full), size = M.file_size(full),
           }
         end
       end
