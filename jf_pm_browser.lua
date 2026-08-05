@@ -10,6 +10,8 @@
 -- Shift+D — удалить в Корзину, m — merge выборки, / — в поле fzf,
 -- g/G — в начало/конец, Esc — свернуть → сброс выборки → фокус → закрыть окно.
 -- Канбан: Shift+H/L — перенести карточку в соседний статус, drag&drop мышью.
+-- Cmd/Ctrl+Z — отменить последнее обратимое действие (класс, теги, закреп);
+-- журнал действий — консоль в правом верхнем углу.
 
 local VERSION = '0.3'
 
@@ -121,6 +123,14 @@ local EN = {
   ['Демо отрендерено'] = 'Demo rendered',
   ['открыт'] = 'opened',
   ['сохранён'] = 'saved',
+  ['журнал'] = 'log', ['отменить'] = 'undo',
+  ['Отменять нечего'] = 'Nothing to undo', ['Отменено: '] = 'Undone: ',
+  ['класс «%s» → %s'] = 'class "%s" → %s',
+  ['закреп «%s»'] = 'pin "%s"',
+  ['закреплён «%s»'] = 'pinned "%s"', ['откреплён «%s»'] = 'unpinned "%s"',
+  ['тег #%s на «%s»'] = 'tag #%s on "%s"',
+  ['в Корзину: '] = 'to Trash: ',
+  ['вернуть можно из Корзины Finder'] = 'restore from Finder Trash',
   ['открыть бэкап в новой вкладке'] = 'open backup in a new tab',
   ['восстановить проект из этого бэкапа…'] = 'restore project from this backup…',
   ['Открыт бэкап: '] = 'Backup opened: ',
@@ -193,6 +203,8 @@ local state = {
   sel = {},                 -- упорядоченный список путей — порядок = порядок merge
   basket = {},              -- корзина регионов: {path, region} для сборки проекта
   recent = core.recent_projects(), -- порядок открытия из reaper.ini
+  log = {},                 -- консоль: последние действия (новые сверху)
+  undo = {},                -- стек отмены: {label, fn}
   kb_col = 0, kb_row = 0,   -- фокус в канбане
   sort_mode = 1,            -- 1 дата, 2 открыт, 3 сохранён (с бэкапами),
                             -- 4 статус, 5 длительность, 6 имя, 7 размер, 8 bpm
@@ -568,9 +580,41 @@ local function open_project(path)
   reaper.Main_openProject(path)
 end
 
+-- ---------------------------------------------------------------------------
+-- Консоль действий и отмена. В журнал (5 строк справа сверху) пишется всё
+-- заметное; в undo-стек — только обратимое (класс, теги, закреп, дедлайн).
+-- Удаление в Корзину отменяется через Finder («Put Back» руками) — в undo
+-- не кладём, но в консоли отмечаем.
+
+local LOG_MAX = 40
+local function logf(kind, fmt, ...)
+  local msg = select('#', ...) > 0 and string.format(fmt, ...) or fmt
+  table.insert(state.log, 1, { kind = kind, msg = msg, t = os.time() })
+  while #state.log > LOG_MAX do state.log[#state.log] = nil end
+  state.status_msg = msg
+end
+
+local UNDO_MAX = 30
+local function push_undo(label, fn)
+  table.insert(state.undo, 1, { label = label, fn = fn })
+  while #state.undo > UNDO_MAX do state.undo[#state.undo] = nil end
+end
+
+local function do_undo()
+  local u = table.remove(state.undo, 1)
+  if not u then
+    logf('warn', T('Отменять нечего'))
+    return
+  end
+  u.fn()
+  logf('undo', T('Отменено: ') .. u.label)
+end
+
 -- Статус из канбана: живёт в индексе, пока проект не открыт и отчёт
 -- не перезаписал STATUS в .rpp (см. build_card).
-local function set_status(card, status)
+local function set_status(card, status, silent)
+  local prev = card.status_over
+  local prev_base = card.status_over_base
   if status == '' then
     card.status_over, card.status_over_base = nil, nil
   else
@@ -579,11 +623,28 @@ local function set_status(card, status)
   end
   search_cache[card.path] = nil -- статус входит в поисковую строку
   core.save_index(state.index)
+  if not silent then
+    push_undo(string.format(T('класс «%s» → %s'), card.name,
+      status ~= '' and status or '—'), function()
+      card.status_over, card.status_over_base = prev, prev_base
+      search_cache[card.path] = nil
+      core.save_index(state.index)
+    end)
+    logf('act', string.format(T('класс «%s» → %s'), card.name,
+      status ~= '' and status or '—'))
+  end
 end
 
 local function toggle_pin(card)
+  local prev = card.pinned
   card.pinned = not card.pinned or nil
   core.save_index(state.index)
+  push_undo(string.format(T('закреп «%s»'), card.name), function()
+    card.pinned = prev
+    core.save_index(state.index)
+  end)
+  logf('act', string.format(card.pinned and T('закреплён «%s»')
+    or T('откреплён «%s»'), card.name))
 end
 
 -- В Корзину (с возможностью «вернуть обратно»): Finder на macOS, gio на Linux
@@ -643,7 +704,8 @@ local function delete_project(card)
   drop_from_index(card.path, target == dir and dir or nil)
   state.focus = 0
   core.save_index(state.index)
-  state.status_msg = 'В Корзине: ' .. target
+  logf('del', T('в Корзину: ') .. target ..
+    ' — ' .. T('вернуть можно из Корзины Finder'))
 end
 
 -- Массовое удаление выделенных: один вопрос на всех
@@ -2034,9 +2096,17 @@ local function draw_card_details(card, meta)
       else
         state.status_msg = T('Тег из .rpp/Finder — снимай в проекте')
       end
+      local prev_extra = {}
+      for _, x in ipairs(card.tags_extra or {}) do prev_extra[#prev_extra + 1] = x end
       card.tags_extra = #extra > 0 and extra or nil
       search_cache[card.path] = nil
       core.save_index(state.index)
+      push_undo(string.format(T('тег #%s на «%s»'), t, card.name), function()
+        card.tags_extra = #prev_extra > 0 and prev_extra or nil
+        search_cache[card.path] = nil
+        core.save_index(state.index)
+      end)
+      logf('act', string.format(T('тег #%s на «%s»'), t, card.name))
     end
     ImGui.PopStyleColor(ctx)
   end
@@ -2609,11 +2679,32 @@ end
 -- ---------------------------------------------------------------------------
 -- Тулбар и настройки: всё чипами, без выпадашек
 
-local function chip(label, active)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Button, active and 0x3D3D3DFF or 0x1E1E1EFF)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Text, active and 0xFFFFFFFF or 0x9A9A9AFF)
+local function chip(label, active, col)
+  -- col — акцент активного чипа (цветовое кодирование групп)
+  local on = col or 0x3D3D3DFF
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, active and on or 0x1E1E1EFF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,
+    active and on or 0x2E2E2EFF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text,
+    active and (col and 0x111213FF or 0xFFFFFFFF) or 0x9A9A9AFF)
   local clicked = ImGui.SmallButton(ctx, label)
-  ImGui.PopStyleColor(ctx, 2)
+  ImGui.PopStyleColor(ctx, 3)
+  return clicked
+end
+
+-- Вкладка вида: крупная кнопка со скруглением сверху, активная — цветная
+local VIEW_COLORS = { 0x7BB8D9FF, 0xD9B96CFF, 0x7FD98AFF, 0xC98AD9FF }
+local function view_tab(label, active, col)
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 12, 6)
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 6)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, active and col or 0x232425FF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,
+    active and col or 0x323334FF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, col)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, active and 0x111213FF or 0xB5B8BAFF)
+  local clicked = ImGui.Button(ctx, label)
+  ImGui.PopStyleColor(ctx, 4)
+  ImGui.PopStyleVar(ctx, 2)
   return clicked
 end
 
@@ -2737,7 +2828,40 @@ local function draw_settings()
   ImGui.Separator(ctx)
 end
 
+-- Консоль действий: 5 строк в правом верхнем углу + кнопка отмены
+local LOG_COLORS = {
+  act = 0xB5B8BAFF, undo = 0x7BB8D9FF, del = 0xE06060FF,
+  warn = 0xD9B96CFF, ok = 0x7FD98AFF,
+}
+local function draw_console()
+  local w = 330
+  local x = ImGui.GetWindowWidth(ctx) - w - 16
+  if x < 380 then return end -- окно узкое — консоль не рисуем
+  local y0 = ImGui.GetCursorPosY(ctx)
+  ImGui.SetCursorPos(ctx, x, y0)
+  if ImGui.BeginChild(ctx, '##console', w, 84, ImGui.ChildFlags_Border,
+      ImGui.WindowFlags_NoScrollbar | ImGui.WindowFlags_NoScrollWithMouse) then
+    if #state.undo > 0 then
+      if chip(T('отменить') .. ' (' .. #state.undo .. ')###undo', true,
+          0x7BB8D9FF) then
+        do_undo()
+      end
+      ImGui.SameLine(ctx)
+    end
+    ImGui.TextDisabled(ctx, T('журнал'))
+    for i = 1, 4 do
+      local e = state.log[i]
+      if not e then break end
+      ImGui.TextColored(ctx, LOG_COLORS[e.kind] or 0x9A9A9AFF,
+        os.date('%H:%M', e.t) .. '  ' .. trunc(e.msg, 40))
+    end
+    ImGui.EndChild(ctx)
+  end
+  ImGui.SetCursorPosY(ctx, y0)
+end
+
 local function draw_toolbar()
+  draw_console()
   if ImGui.Button(ctx, 'Rescan') then rescan() end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, T('настройки')) then
@@ -2771,7 +2895,7 @@ local function draw_toolbar()
         local card = state.index.projects[p]
         if card then set_status(card, 'на расслоение') end
       end
-      state.status_msg = string.format(T('На расслоение: %d'), #state.sel)
+      logf('act', string.format(T('На расслоение: %d'), #state.sel))
     end
     if #state.sel >= 2 then
       ImGui.SameLine(ctx)
@@ -2812,7 +2936,8 @@ local function draw_toolbar()
   ImGui.TextDisabled(ctx, '|')
   for i, label in ipairs(VIEW_CHIPS) do
     ImGui.SameLine(ctx)
-    if chip(T(label) .. '###view' .. i, state.view == i - 1) then
+    if view_tab(T(label) .. '###view' .. i, state.view == i - 1,
+        VIEW_COLORS[i] or 0x7BB8D9FF) then
       state.view = i - 1
       state.focus = 0
       state.cal_scroll_end = 2
@@ -2849,7 +2974,8 @@ local function draw_toolbar()
   ImGui.TextDisabled(ctx, '|')
   for i, s in ipairs(core.STATUSES) do
     ImGui.SameLine(ctx)
-    if chip(status_label(s) .. '###fst' .. i, state.filter_status == i + 2) then
+    if chip(status_label(s) .. '###fst' .. i, state.filter_status == i + 2,
+        core.STATUS_COLORS[s]) then
       state.filter_status = i + 2
     end
   end
@@ -2865,7 +2991,7 @@ local function draw_toolbar()
       label = T(s) .. (desc and ' ↓' or ' ↑')
     end
     -- повторный клик по активному чипу — переворот порядка
-    if chip(label .. '###sort' .. i, active) then
+    if chip(label .. '###sort' .. i, active, 0xD9B96CFF) then
       if active then
         state.sort_rev = not state.sort_rev
       else
@@ -2879,7 +3005,7 @@ local function draw_toolbar()
   ImGui.TextDisabled(ctx, '|')
   for i, cs in ipairs(CARD_SIZES) do
     ImGui.SameLine(ctx)
-    if chip(cs.label .. '###csize' .. i, state.card_size == i) then
+    if chip(cs.label .. '###csize' .. i, state.card_size == i, 0x7BB8D9FF) then
       state.card_size = i
       core.set_setting('card_size', tostring(i))
     end
@@ -3020,6 +3146,12 @@ local function handle_keys(cards, cols)
   end
   if ImGui.IsKeyPressed(ctx, ImGui.Key_M) and #state.sel >= 2 then
     merge_selected()
+  end
+  -- Cmd/Ctrl+Z — отмена последнего обратимого действия
+  local mods = ImGui.GetKeyMods(ctx)
+  if (mods & ImGui.Mod_Super ~= 0 or mods & ImGui.Mod_Ctrl ~= 0)
+     and ImGui.IsKeyPressed(ctx, ImGui.Key_Z) then
+    do_undo()
   end
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Slash) then
     state.focus_tag_input = true
