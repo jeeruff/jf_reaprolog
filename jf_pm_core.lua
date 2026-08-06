@@ -41,6 +41,21 @@ M.STATUS_EN = {
   ['издано'] = 'out', ['на расслоение'] = 'to harvest',
   ['семплпак'] = 'samplepack', ['покой'] = 'rest',
 }
+-- Чужие DAW: расширение → тип. Список из jf_dawsync.lua пользователя.
+-- is_dir: проект — пакет-папка (Logic), внутрь при скане не заходим.
+M.DAW_TYPES = {
+  als       = { daw = 'ableton',  label = 'Ab', color = 0xB8D97BFF },
+  flp       = { daw = 'flstudio', label = 'FL', color = 0xD9A87BFF },
+  xrns      = { daw = 'renoise',  label = 'Rn', color = 0x7BD9D0FF },
+  ptx       = { daw = 'protools', label = 'PT', color = 0x9A7BD9FF },
+  ptf       = { daw = 'protools', label = 'PT', color = 0x9A7BD9FF },
+  logicx    = { daw = 'logic',    label = 'Lg', color = 0x7FD98AFF, is_dir = true },
+  bwproject = { daw = 'bitwig',   label = 'Bw', color = 0xD98A8AFF },
+  npr       = { daw = 'nuendo',   label = 'Nu', color = 0x8AA0D9FF },
+  pd        = { daw = 'puredata', label = 'Pd', color = 0xE8E8E8FF },
+  maxpat    = { daw = 'max',      label = 'Mx', color = 0x8A8F93FF },
+}
+
 -- легаси-статусы из старых .rpp → новые классы (нормализуются в card_meta).
 -- Файлы не переписываются: миграция ленивая, на чтении.
 M.STATUS_ALIASES = {
@@ -510,6 +525,7 @@ end
 -- Пустой проект: нет ни одного айтема ИЛИ ни одного аудиофайла в папке.
 -- Поля могут отсутствовать в старом индексе — тогда не помечаем.
 function M.is_empty_project(card)
+  if card.daw then return false end -- чужая DAW: содержимое не парсим
   if card.item_count ~= nil and card.item_count == 0 then return true end
   if card.audio_files ~= nil and card.audio_files == 0 then return true end
   return false
@@ -640,7 +656,7 @@ end
 -- ===========================================================================
 
 function M.scan_projects(paths)
-  local found = {}
+  local found, foreign = {}, {}
   local function scandir(dir, depth)
     if depth > 6 then return end
     local i = 0
@@ -650,6 +666,11 @@ function M.scan_projects(paths)
       local lower = fn:lower()
       if lower:match('%.rpp$') and not lower:find('autosave', 1, true) then
         found[#found + 1] = dir .. '/' .. fn
+      else
+        local e = lower:match('%.([%w]+)$')
+        if e and M.DAW_TYPES[e] and not M.DAW_TYPES[e].is_dir then
+          foreign[#foreign + 1] = { path = dir .. '/' .. fn, ext = e }
+        end
       end
       i = i + 1
     end
@@ -657,7 +678,12 @@ function M.scan_projects(paths)
     while true do
       local sub = reaper.EnumerateSubdirectories(dir, j)
       if not sub then break end
-      if sub:sub(1, 1) ~= '.' and sub ~= 'Backups' then
+      local se = sub:lower():match('%.([%w]+)$')
+      if se and M.DAW_TYPES[se] and M.DAW_TYPES[se].is_dir then
+        -- пакет-папка (Logic .logicx) — сам проект, внутрь не идём
+        foreign[#foreign + 1] = { path = dir .. '/' .. sub, ext = se }
+      elseif sub:sub(1, 1) ~= '.' and sub ~= 'Backups' and sub ~= 'Backup' then
+        -- Backup — автосейвы Ableton, иначе десятки дублей .als
         scandir(dir .. '/' .. sub, depth + 1)
       end
       j = j + 1
@@ -667,7 +693,7 @@ function M.scan_projects(paths)
     p = p:gsub('/+$', '')
     if p ~= '' then scandir(p, 1) end
   end
-  return found
+  return found, foreign
 end
 
 function M.script_dir()
@@ -734,9 +760,10 @@ end
 
 -- Своя картинка-тамбнейл в папке проекта: <имя проекта>.png/jpg приоритетнее
 -- общего jf_thumb.png (несколько .rpp в папке — у каждого своё превью).
-function M.find_thumb(path)
+function M.find_thumb(path, base_override)
   local dir = path:match('^(.*)[/\\]') or '.'
-  local base = (path:match('([^/\\]+)%.[rR][pP][pP]$') or ''):lower()
+  local base = (base_override
+    or path:match('([^/\\]+)%.[rR][pP][pP]$') or ''):lower()
   local generic
   local i = 0
   while true do
@@ -793,14 +820,57 @@ function M.build_card(path, old_card, dir_sizes, dir_audio)
   return card
 end
 
+-- Карточка проекта чужой DAW: без парсинга содержимого — метаданные файла,
+-- теги Finder, превью-картинка/аудио по имени, bpm/тональности из имени.
+-- Index-only поля (класс, закреп, теги, превью) работают как у REAPER-карт.
+function M.build_foreign_card(path, ext, old_card, dir_sizes)
+  local t = M.DAW_TYPES[ext] or {}
+  local name = path:match('([^/\\]+)%.' .. ext .. '$')
+    or path:match('([^/\\]+)$')
+  local card = {
+    path = path, daw = t.daw or ext, daw_ext = ext, name = name,
+    tempo = nil, timesig_num = 4, timesig_den = 4,
+    track_names = {}, regions = {}, markers = {}, items = {},
+    notes = '', track_notes = {}, item_notes = {}, backups = {},
+    render_file = '', render_pattern = '', duration = 0, ext = {},
+  }
+  card.mtime = M.file_mtime(path)
+  card.atime = M.file_atime(path)
+  card.size = M.file_size(path)
+  local dir = path:match('^(.*)[/\\]') or '.'
+  if dir_sizes and dir_sizes[dir] then
+    card.dir_size = dir_sizes[dir]
+  else
+    card.dir_size = M.dir_size(dir)
+    if dir_sizes then dir_sizes[dir] = card.dir_size end
+  end
+  card.fs_tags = M.finder_tags(path)
+  card.thumb_file = M.find_thumb(path, name)
+  card.keys = M.find_keys_in(name, false)
+  card.needs_report = false
+  if old_card then
+    card.pinned = old_card.pinned
+    card.tags_extra = old_card.tags_extra
+    card.thumb_user = old_card.thumb_user
+    card.status_over = old_card.status_over
+    card.status_over_base = old_card.status_over_base
+  end
+  return card
+end
+
 function M.build_index(paths, old_index)
   local idx = { version = 1, updated = 0, projects = {} }
   local old = old_index and old_index.projects or {}
   local dir_sizes = {} -- кэш: несколько .rpp в одной папке — один обход
   local dir_audio = {}
-  for _, p in ipairs(M.scan_projects(paths)) do
+  local rpp, foreign = M.scan_projects(paths)
+  for _, p in ipairs(rpp) do
     local card = M.build_card(p, old[p], dir_sizes, dir_audio)
     if card then idx.projects[p] = card end
+  end
+  for _, f in ipairs(foreign) do
+    local card = M.build_foreign_card(f.path, f.ext, old[f.path], dir_sizes)
+    if card then idx.projects[f.path] = card end
   end
   return idx
 end

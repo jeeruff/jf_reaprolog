@@ -206,6 +206,65 @@ do
   os.remove(wav4)
 end
 
+print('== foreign DAW scan / card ==')
+do
+  local function list(dir, want_dirs)
+    local out = {}
+    local p = io.popen("ls -A '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
+    if p then
+      for name in p:lines() do
+        local pd = io.popen("test -d '" .. (dir .. '/' .. name):gsub("'", "'\\''")
+          .. "' && echo d")
+        local isdir = pd:read('*l') == 'd'
+        pd:close()
+        if isdir == want_dirs then out[#out + 1] = name end
+      end
+      p:close()
+    end
+    return out
+  end
+  _G.reaper = {
+    EnumerateFiles = function(d, i) return list(d, false)[i + 1] end,
+    EnumerateSubdirectories = function(d, i) return list(d, true)[i + 1] end,
+    GetOS = function() return 'macOS-arm64' end,
+    ExecProcess = function(cmd, _)
+      local p = io.popen(cmd .. ' 2>/dev/null')
+      if not p then return nil end
+      local out = p:read('*a') or ''
+      p:close()
+      return '0\n' .. out
+    end,
+  }
+  local root = os.tmpname()
+  os.remove(root)
+  os.execute("mkdir -p '" .. root .. "/Backup' '" .. root .. "/Jam.logicx'")
+  local function touch(p) io.open(p, 'wb'):close() end
+  touch(root .. '/song[128].als')
+  touch(root .. '/beat.flp')
+  touch(root .. '/Backup/song.als')     -- автосейв Ableton — пропустить
+  touch(root .. '/song[128].png')       -- обложка по имени
+  touch(root .. '/real.rpp')
+
+  local rpp, foreign = core.scan_projects({ root })
+  eq(#rpp, 1, 'rpp найден')
+  eq(#foreign, 3, 'чужие: als + flp + logicx (Backup пропущен)')
+  local exts = {}
+  for _, f in ipairs(foreign) do exts[f.ext] = f.path end
+  check(exts.als and exts.als:find('song%[128%]'), 'als найден')
+  check(exts.flp ~= nil, 'flp найден')
+  check(exts.logicx and exts.logicx:find('Jam%.logicx$'), 'logicx как пакет-папка')
+
+  local fc = core.build_foreign_card(exts.als, 'als', nil, {})
+  eq(fc.daw, 'ableton', 'daw тип')
+  eq(fc.name, 'song[128]', 'имя без расширения')
+  eq(core.card_bpm(fc), 128, 'bpm из имени [128]')
+  check(fc.thumb_file and fc.thumb_file:find('%.png$'), 'обложка по имени')
+  eq(core.is_empty_project(fc), false, 'чужой проект не «пустышка»')
+
+  os.execute("rm -rf '" .. root .. "'")
+  _G.reaper = nil
+end
+
 print('== rename_project ==')
 do
   -- стаб reaper.* поверх ls (как в рескан-харнессе)

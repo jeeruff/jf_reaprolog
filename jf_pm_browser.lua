@@ -123,6 +123,14 @@ local EN = {
   ['Демо отрендерено'] = 'Demo rendered',
   ['открыт'] = 'opened',
   ['сохранён'] = 'saved',
+  ['только для REAPER-проектов'] = 'REAPER projects only',
+  ['двойной клик — открыть в этой программе'] =
+    'double click — open in its app',
+  ['открыть в '] = 'open in ',
+  ['рендер'] = 'render', ['дедлайн'] = 'deadline',
+  ['переименование'] = 'rename',
+  ['merge: в выборке проект другой DAW — убери его'] =
+    'merge: selection contains a foreign DAW project — remove it',
   ['открыть проект'] = 'open project',
   ['журнал'] = 'log', ['отменить'] = 'undo',
   ['Отменять нечего'] = 'Nothing to undo', ['Отменено: '] = 'Undone: ',
@@ -200,6 +208,7 @@ local state = {
   preview_vol = tonumber(core.get_setting('preview_vol')) or 1.0,
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
+  filter_daw = nil,         -- nil все | 'reaper' | 'ableton' | …
   filter_text = '',         -- fzf: имя, теги, треки
   sel = {},                 -- упорядоченный список путей — порядок = порядок merge
   basket = {},              -- корзина регионов: {path, region} для сборки проекта
@@ -400,6 +409,7 @@ local function search_text(card, meta)
       table.concat(all_tags(card, meta), ' '),
       table.concat(card.track_names or {}, ' '),
       table.concat(regions, ' '),
+      card.daw or 'reaper',
       meta.status or '',
       meta.track_id or '',
       meta.samples or '',
@@ -460,6 +470,9 @@ local function collect_cards()
       ok = meta.status == core.STATUSES[f - 2]
     end
     if ok and state.filter_empty then ok = core.is_empty_project(card) end
+    if ok and state.filter_daw then
+      ok = (card.daw or 'reaper') == state.filter_daw
+    end
     -- фильтр по тегам-чипам: карточка должна иметь все активные (AND)
     if ok and next(state.filter_tags) then
       local have = {}
@@ -577,6 +590,15 @@ local function export_gallery()
 end
 
 local function open_project(path)
+  if not path:lower():match('%.rpp$') then
+    -- проект чужой DAW: открыть приложением по расширению (как jf_dawsync)
+    if reaper.CF_ShellExecute then
+      reaper.CF_ShellExecute(path)
+    else
+      reaper.ExecProcess('/usr/bin/open "' .. path .. '"', -1)
+    end
+    return
+  end
   reaper.Main_OnCommand(40859, 0) -- New project tab
   reaper.Main_openProject(path)
 end
@@ -625,10 +647,12 @@ local function set_status(card, status, silent)
   search_cache[card.path] = nil -- статус входит в поисковую строку
   core.save_index(state.index)
   if not silent then
+    local path = card.path
     push_undo(string.format(T('класс «%s» → %s'), card.name,
       status ~= '' and status or '—'), function()
-      card.status_over, card.status_over_base = prev, prev_base
-      search_cache[card.path] = nil
+      local c = state.index.projects[path] or card
+      c.status_over, c.status_over_base = prev, prev_base
+      search_cache[path] = nil
       core.save_index(state.index)
     end)
     logf('act', string.format(T('класс «%s» → %s'), card.name,
@@ -640,8 +664,10 @@ local function toggle_pin(card)
   local prev = card.pinned
   card.pinned = not card.pinned or nil
   core.save_index(state.index)
+  local path = card.path
   push_undo(string.format(T('закреп «%s»'), card.name), function()
-    card.pinned = prev
+    local c = state.index.projects[path] or card
+    c.pinned = prev
     core.save_index(state.index)
   end)
   logf('act', string.format(card.pinned and T('закреплён «%s»')
@@ -758,6 +784,13 @@ end
 
 -- Merge: выделенные соединяются последовательно в порядке выделения.
 local function merge_selected()
+  for _, p in ipairs(state.sel) do
+    local cc = state.index.projects[p]
+    if cc and cc.daw then
+      logf('warn', T('merge: в выборке проект другой DAW — убери его'))
+      return
+    end
+  end
   if #state.sel < 2 then return end
   local dir = state.sel[1]:match('^(.*)[/\\]')
   local out = dir .. '/merge_' .. os.date('%y%m%d_%H%M') .. '.rpp'
@@ -887,6 +920,13 @@ end
 
 -- a) target_path = nil: новый таб; b) target_path: вставка в конец проекта
 local function merge_as_subprojects(target_path)
+  for _, p in ipairs(state.sel) do
+    local cc = state.index.projects[p]
+    if cc and cc.daw then
+      logf('warn', T('merge: в выборке проект другой DAW — убери его'))
+      return
+    end
+  end
   if #state.sel < 2 then return end
   local paths = {}
   for i, p in ipairs(state.sel) do paths[i] = p end
@@ -966,6 +1006,15 @@ local function parse_region_name(name)
   end)
   title = title:gsub('%s+', ' '):match('^%s*(.-)%s*$')
   return { title = title, tags = tags, rating = rating }
+end
+
+-- Операции, знающие формат .rpp, для чужих DAW недоступны
+local function reaper_only(card, what)
+  if card.daw then
+    logf('warn', (what or '') .. ': ' .. T('только для REAPER-проектов'))
+    return true
+  end
+  return false
 end
 
 -- Правки закрытых .rpp (rename, дедлайн, чекбоксы) требуют, чтобы проект
@@ -1064,6 +1113,7 @@ end
 
 -- Переименование: всё с префиксом имени + папка проекта (см. core).
 local function rename_project(card, new_name)
+  if reaper_only(card, T('переименование')) then return end
   new_name = new_name:match('^%s*(.-)%s*$')
   if new_name == '' or new_name == card.name then return end
   if project_is_open(card.path) then
@@ -1097,6 +1147,7 @@ end
 -- Переключить чекбокс todo: правка источника (REPORT_TODO либо project
 -- notes) в тексте .rpp, затем перечитать карточку.
 local function toggle_todo(card, meta, todo)
+  if reaper_only(card, 'todo') then return end
   if project_is_open(card.path) then
     warn_open(card, 'правка todo')
     return
@@ -1137,6 +1188,7 @@ end
 
 -- Дедлайн с карточки: пишется в extstate закрытого .rpp
 local function set_deadline(card, text)
+  if reaper_only(card, T('дедлайн')) then return end
   text = text:match('^%s*(.-)%s*$')
   if project_is_open(card.path) then
     warn_open(card, 'дедлайн')
@@ -1168,7 +1220,7 @@ end
 -- Источник звука: jf_preview.wav → прокси саба → RENDER_FILE проекта.
 
 local AUDIO_EXT = { wav = true, aiff = true, aif = true, flac = true,
-                    mp3 = true, ogg = true }
+                    mp3 = true, ogg = true, m4a = true }
 
 -- audio_cache: card.path -> путь к аудио | false (объявлен выше)
 local function find_preview_audio(card)
@@ -1188,6 +1240,12 @@ local function find_preview_audio(card)
     dir_count_cache[dir] = nproj
   end
   local cands = { dir .. '/' .. card.name .. '_preview.wav' }
+  if card.daw then
+    -- чужая DAW: экспорт обычно лежит рядом с проектом под тем же именем
+    for _, e in ipairs({ 'wav', 'mp3', 'aiff', 'aif', 'flac', 'm4a', 'ogg' }) do
+      cands[#cands + 1] = dir .. '/' .. card.name .. '.' .. e
+    end
+  end
   if nproj <= 1 then
     cands[#cands + 1] = dir .. '/jf_preview.wav'
   end
@@ -1367,6 +1425,7 @@ end
 -- kind: 'preview' (лимит 5 мин, суффикс _preview) | 'demo' (весь проект,
 -- суффикс _demo). Нормализация −18 LUFS и брикволл — в обоих случаях.
 local function render_audio(card, kind)
+  if reaper_only(card, T('рендер')) then return end
   if project_is_open(card.path) then
     warn_open(card, 'рендер превью')
     return
@@ -1744,6 +1803,7 @@ end
 -- Ряд команд карточки (всегда наверху). true — был клик по кнопке.
 local function draw_card_icons(card, meta, i)
   local hit = false
+  local foreign = card.daw ~= nil
   -- только глиф; что делает кнопка — в тултипе (отключается в настройках)
   local function icon(glyph, id, tip, col)
     if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
@@ -1760,16 +1820,25 @@ local function draw_card_icons(card, meta, i)
       card.pinned and 0xD9B96CFF or nil) then
     toggle_pin(card)
   end
-  ImGui.SameLine(ctx)
-  if icon('▸', 'prev', T('отрендерить аудио-превью')) then
-    render_audio(card, 'preview')
+  if not foreign then
+    ImGui.SameLine(ctx)
+    if icon('▸', 'prev', T('отрендерить аудио-превью')) then
+      render_audio(card, 'preview')
+    end
+    ImGui.SameLine(ctx)
+    if icon('▶', 'demo', T('отрендерить полное демо (весь проект)')) then
+      render_audio(card, 'demo')
+    end
+  else
+    ImGui.SameLine(ctx)
+    local dt = core.DAW_TYPES[card.daw_ext] or {}
+    if icon('▸', 'dopen', T('открыть в ') .. (dt.daw or 'DAW'),
+        dt.color) then
+      open_project(card.path)
+    end
   end
   ImGui.SameLine(ctx)
-  if icon('▶', 'demo', T('отрендерить полное демо (весь проект)')) then
-    render_audio(card, 'demo')
-  end
-  ImGui.SameLine(ctx)
-  if icon('Aa', 'ren', T('переименовать проект…')) then
+  if not foreign and icon('Aa', 'ren', T('переименовать проект…')) then
     if state.ren_path == card.path then
       state.ren_path = nil
     else
@@ -2102,9 +2171,11 @@ local function draw_card_details(card, meta)
       card.tags_extra = #extra > 0 and extra or nil
       search_cache[card.path] = nil
       core.save_index(state.index)
+      local upath = card.path
       push_undo(string.format(T('тег #%s на «%s»'), t, card.name), function()
-        card.tags_extra = #prev_extra > 0 and prev_extra or nil
-        search_cache[card.path] = nil
+        local c = state.index.projects[upath] or card
+        c.tags_extra = #prev_extra > 0 and prev_extra or nil
+        search_cache[upath] = nil
         core.save_index(state.index)
       end)
       logf('act', string.format(T('тег #%s на «%s»'), t, card.name))
@@ -2216,6 +2287,16 @@ local function draw_card(entry, i, card_w)
     ImGui.SameLine(ctx)
     ImGui.BeginGroup(ctx)
     ImGui.Text(ctx, trunc(card.name, cs.name))
+    if card.daw then
+      -- цветной бейдж DAW: видно, чей проект, не вглядываясь
+      local dt = core.DAW_TYPES[card.daw_ext] or {}
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, dt.color or 0x9A9A9AFF, '[' .. (dt.label or '?') .. ']')
+      if state.btn_tips and ImGui.IsItemHovered(ctx) then
+        ImGui.SetTooltip(ctx, (dt.daw or '') .. ' · ' ..
+          T('двойной клик — открыть в этой программе'))
+      end
+    end
     if core.is_empty_project(card) then
       -- пустышка: ни одного айтема или ни одного аудиофайла в папке
       ImGui.SameLine(ctx)
@@ -2979,6 +3060,28 @@ local function draw_toolbar()
   ImGui.SameLine(ctx)
   if chip('∅ ' .. T('пустые') .. '###fempty', state.filter_empty) then
     state.filter_empty = not state.filter_empty
+  end
+  -- чипы DAW: появляются, когда в индексе есть чужие проекты
+  local daws = {}
+  for _, card in pairs(state.index.projects) do
+    if card.daw and not daws[card.daw] then
+      daws[card.daw] = core.DAW_TYPES[card.daw_ext] or {}
+    end
+  end
+  if next(daws) then
+    ImGui.SameLine(ctx)
+    ImGui.TextDisabled(ctx, '|')
+    ImGui.SameLine(ctx)
+    if chip('Rp###fdaw_rp', state.filter_daw == 'reaper', 0x7BB8D9FF) then
+      state.filter_daw = state.filter_daw ~= 'reaper' and 'reaper' or nil
+    end
+    for daw, dt in pairs(daws) do
+      ImGui.SameLine(ctx)
+      if chip((dt.label or daw) .. '###fdaw_' .. daw,
+          state.filter_daw == daw, dt.color) then
+        state.filter_daw = state.filter_daw ~= daw and daw or nil
+      end
+    end
   end
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
