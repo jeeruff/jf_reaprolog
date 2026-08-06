@@ -301,7 +301,7 @@ eq(card.ext.SOMEKEY, nil, 'foreign namespace ignored')
 
 print('== card_meta ==')
 local meta = core.card_meta(card)
-eq(meta.status, 'доделать', 'meta status (легаси «в работе» → класс)')
+eq(meta.status, 'аранжировка', 'meta status (легаси «в работе» → класс)')
 eq(meta.tags[3], 'EP-кандидат', 'meta tags split')
 eq(meta.report_todo, 'свести брейк\nдобавить machinedrum', 'meta todo decoded \\n')
 eq(meta.report_ts, 1722340000, 'meta report_ts')

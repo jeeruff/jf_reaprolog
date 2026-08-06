@@ -123,6 +123,7 @@ local EN = {
   ['Демо отрендерено'] = 'Demo rendered',
   ['открыт'] = 'opened',
   ['сохранён'] = 'saved',
+  ['открыть проект'] = 'open project',
   ['журнал'] = 'log', ['отменить'] = 'undo',
   ['Отменять нечего'] = 'Nothing to undo', ['Отменено: '] = 'Undone: ',
   ['класс «%s» → %s'] = 'class "%s" → %s',
@@ -452,7 +453,7 @@ local function collect_cards()
     local ok = true
     local f = state.filter_status
     if f == 0 then
-      ok = meta.status ~= 'архив'
+      ok = meta.status ~= 'покой'
     elseif f == 2 then
       ok = card.needs_report or meta.report_ts == 0
     elseif f >= 3 then
@@ -2629,6 +2630,15 @@ local function draw_kanban(cards)
             ImGui.SameLine(ctx)
             ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
           end
+          ImGui.SameLine(ctx)
+          ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x7BB8D9FF)
+          if ImGui.SmallButton(ctx, '▸###kbopen' .. ci .. '_' .. ei) then
+            open_project(card.path)
+          end
+          ImGui.PopStyleColor(ctx)
+          if state.btn_tips and ImGui.IsItemHovered(ctx) then
+            ImGui.SetTooltip(ctx, T('открыть проект'))
+          end
           ImGui.TextDisabled(ctx, fmt_date(card.mtime))
           local na = e.meta.report_todo:match('^[^\n]+')
           if na then
@@ -2949,7 +2959,7 @@ local function draw_toolbar()
   for _, card in pairs(state.index.projects) do
     local s = (card.ext or {}).STATUS or ''
     s = core.STATUS_ALIASES[s] or s
-    if s == 'доделать' or s == 'отмиксить' or s == 'мастеринг' then wip = wip + 1 end
+    if s == 'аранжировка' or s == 'микс' or s == 'мастер' then wip = wip + 1 end
     if card.needs_report then no_report = no_report + 1 end
   end
   ImGui.SameLine(ctx)

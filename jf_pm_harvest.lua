@@ -88,7 +88,7 @@ local function harvest_regions()
 end
 
 local function set_archive()
-  reaper.SetProjExtState(proj, core.NAMESPACE, 'STATUS', 'архив')
+  reaper.SetProjExtState(proj, core.NAMESPACE, 'STATUS', 'покой')
   reaper.Main_SaveProject(proj, false)
   local idx = core.load_index()
   local card = core.build_card(proj_fn, idx.projects[proj_fn])
@@ -130,7 +130,7 @@ local function loop()
     ImGui.Separator(ctx)
     local rv
     rv, st.archive_after = ImGui.Checkbox(ctx,
-      'после расслоения поставить статус «архив»', st.archive_after)
+      'после расслоения поставить класс «покой»', st.archive_after)
 
     if st.msg ~= '' then
       ImGui.TextColored(ctx, 0x7FD98AFF, st.msg)
