@@ -13,7 +13,7 @@
 -- Cmd/Ctrl+Z — отменить последнее обратимое действие (класс, теги, закреп);
 -- журнал действий — консоль в правом верхнем углу.
 
-local VERSION = '0.3'
+local VERSION = '0.9'
 
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
@@ -123,6 +123,29 @@ local EN = {
   ['Демо отрендерено'] = 'Demo rendered',
   ['открыт'] = 'opened',
   ['сохранён'] = 'saved',
+  ['консоль'] = 'console',
+  ['Rescan остановлен'] = 'Rescan stopped',
+  ['Rescan: %d путей, фоном'] = 'Rescan: %d paths, in background',
+  ['Rescan: %d проектов за %.1f c'] = 'Rescan: %d projects in %.1f s',
+  ['команда… help — список, && — цепочка'] =
+    'command… help — list, && — chain',
+  ['превью %d/%d'] = 'preview %d/%d',
+  ['всего: %d'] = 'total: %d', ['совпадений: %d'] = 'matches: %d',
+  ['фильтр: «%s», карточек: %d'] = 'filter: "%s", cards: %d',
+  ['карточек: %d, выбрано: %d'] = 'cards: %d, selected: %d',
+  ['выборка очищена'] = 'selection cleared',
+  ['в выборке: %d'] = 'selected: %d',
+  ['фильтры и выборка сброшены'] = 'filters and selection cleared',
+  ['не найдено'] = 'not found', ['открываю: '] = 'opening: ',
+  ['выборка пуста (sel <pat>)'] = 'selection is empty (sel <pat>)',
+  ['нет класса: '] = 'no such class: ',
+  ['класс «%s»: %d проектов'] = 'class "%s": %d projects',
+  ['тег: '] = 'tag: ', ['тег снят: '] = 'tag removed: ',
+  ['нечего рендерить'] = 'nothing to render',
+  ['превью-батч: %d'] = 'preview batch: %d',
+  ['фильтр DAW: %s, карточек: %d'] = 'DAW filter: %s, cards: %d',
+  ['все'] = 'all', ['сортировка: '] = 'sort: ',
+  ['нет команды: '] = 'no such command: ',
   ['только для REAPER-проектов'] = 'REAPER projects only',
   ['двойной клик — открыть в этой программе'] =
     'double click — open in its app',
@@ -214,6 +237,9 @@ local state = {
   basket = {},              -- корзина регионов: {path, region} для сборки проекта
   recent = core.recent_projects(), -- порядок открытия из reaper.ini
   log = {},                 -- консоль: последние действия (новые сверху)
+  con_text = '',            -- ввод консоли
+  con_hist = {},            -- история команд
+  con_focus = false,
   undo = {},                -- стек отмены: {label, fn}
   kb_col = 0, kb_row = 0,   -- фокус в канбане
   sort_mode = 1,            -- 1 дата, 2 открыт, 3 сохранён (с бэкапами),
@@ -554,7 +580,46 @@ local function collect_cards()
   return cards
 end
 
+-- ---------------------------------------------------------------------------
+-- Консоль действий и отмена. В журнал (5 строк справа сверху) пишется всё
+-- заметное; в undo-стек — только обратимое (класс, теги, закреп, дедлайн).
+-- Удаление в Корзину отменяется через Finder («Put Back» руками) — в undo
+-- не кладём, но в консоли отмечаем.
+
+local LOG_MAX = 200
+local function logf(kind, fmt, ...)
+  local msg = select('#', ...) > 0 and string.format(fmt, ...) or fmt
+  table.insert(state.log, 1, { kind = kind, msg = msg, t = os.time() })
+  while #state.log > LOG_MAX do state.log[#state.log] = nil end
+  state.log_scroll = true
+  state.status_msg = msg
+end
+
+local UNDO_MAX = 30
+local function push_undo(label, fn)
+  table.insert(state.undo, 1, { label = label, fn = fn })
+  while #state.undo > UNDO_MAX do state.undo[#state.undo] = nil end
+end
+
+local function do_undo()
+  local u = table.remove(state.undo, 1)
+  if not u then
+    logf('warn', T('Отменять нечего'))
+    return
+  end
+  u.fn()
+  logf('undo', T('Отменено: ') .. u.label)
+end
+
+-- Rescan — фоновый: скан дерева быстрый (нативные Enumerate), а карточки
+-- строятся порциями по ~30 мс на кадр defer-цикла. UI живёт на старом
+-- индексе, пока новый собирается; в конце — атомарная подмена.
 local function rescan()
+  if state.rescan then
+    state.rescan = nil
+    logf('warn', T('Rescan остановлен'))
+    return
+  end
   local paths = core.get_scan_paths()
   if #paths == 0 then
     state.status_msg = 'Укажи директории проектов (кнопка «настройки»)'
@@ -562,15 +627,46 @@ local function rescan()
     return
   end
   local t0 = reaper.time_precise()
-  state.index = core.build_index(paths, state.index)
-  core.save_index(state.index)
-  search_cache, audio_cache, wave_cache, daw_cache = {}, {}, {}, {}
-  dir_count_cache = {}
-  state.recent = core.recent_projects()
-  local n = 0
-  for _ in pairs(state.index.projects) do n = n + 1 end
-  state.status_msg = string.format('Rescan: %d проектов за %.1f c', n,
-    reaper.time_precise() - t0)
+  local rpp, foreign = core.scan_projects(paths)
+  local queue = {}
+  for _, p in ipairs(rpp) do queue[#queue + 1] = { path = p } end
+  for _, f in ipairs(foreign) do
+    queue[#queue + 1] = { path = f.path, ext = f.ext }
+  end
+  state.rescan = {
+    queue = queue, i = 0, total = #queue, t0 = t0,
+    idx = { version = 1, updated = 0, projects = {} },
+    dir_sizes = {}, dir_audio = {},
+  }
+  logf('act', string.format(T('Rescan: %d путей, фоном'), #queue))
+end
+
+local function rescan_step()
+  local rs = state.rescan
+  if not rs then return end
+  local frame_end = reaper.time_precise() + 0.03
+  local old = state.index.projects
+  while rs.i < rs.total and reaper.time_precise() < frame_end do
+    rs.i = rs.i + 1
+    local it = rs.queue[rs.i]
+    local card
+    if it.ext then
+      card = core.build_foreign_card(it.path, it.ext, old[it.path], rs.dir_sizes)
+    else
+      card = core.build_card(it.path, old[it.path], rs.dir_sizes, rs.dir_audio)
+    end
+    if card then rs.idx.projects[it.path] = card end
+  end
+  if rs.i >= rs.total then
+    state.index = rs.idx
+    core.save_index(state.index)
+    search_cache, audio_cache, wave_cache, daw_cache = {}, {}, {}, {}
+    dir_count_cache = {}
+    state.recent = core.recent_projects()
+    logf('ok', string.format(T('Rescan: %d проектов за %.1f c'), rs.total,
+      reaper.time_precise() - rs.t0))
+    state.rescan = nil
+  end
 end
 
 -- Экспорт текущего вида (фильтры и сортировка учтены) в автономный HTML
@@ -601,36 +697,6 @@ local function open_project(path)
   end
   reaper.Main_OnCommand(40859, 0) -- New project tab
   reaper.Main_openProject(path)
-end
-
--- ---------------------------------------------------------------------------
--- Консоль действий и отмена. В журнал (5 строк справа сверху) пишется всё
--- заметное; в undo-стек — только обратимое (класс, теги, закреп, дедлайн).
--- Удаление в Корзину отменяется через Finder («Put Back» руками) — в undo
--- не кладём, но в консоли отмечаем.
-
-local LOG_MAX = 40
-local function logf(kind, fmt, ...)
-  local msg = select('#', ...) > 0 and string.format(fmt, ...) or fmt
-  table.insert(state.log, 1, { kind = kind, msg = msg, t = os.time() })
-  while #state.log > LOG_MAX do state.log[#state.log] = nil end
-  state.status_msg = msg
-end
-
-local UNDO_MAX = 30
-local function push_undo(label, fn)
-  table.insert(state.undo, 1, { label = label, fn = fn })
-  while #state.undo > UNDO_MAX do state.undo[#state.undo] = nil end
-end
-
-local function do_undo()
-  local u = table.remove(state.undo, 1)
-  if not u then
-    logf('warn', T('Отменять нечего'))
-    return
-  end
-  u.fn()
-  logf('undo', T('Отменено: ') .. u.label)
 end
 
 -- Статус из канбана: живёт в индексе, пока проект не открыт и отчёт
@@ -2919,41 +2985,17 @@ local function draw_settings()
   ImGui.Separator(ctx)
 end
 
--- Консоль действий: 5 строк в правом верхнем углу + кнопка отмены
 local LOG_COLORS = {
   act = 0xB5B8BAFF, undo = 0x7BB8D9FF, del = 0xE06060FF,
-  warn = 0xD9B96CFF, ok = 0x7FD98AFF,
+  warn = 0xD9B96CFF, ok = 0x7FD98AFF, cmd = 0x7BD9D0FF, ['in'] = 0xD9B96CFF,
 }
-local function draw_console()
-  local w = 330
-  local x = ImGui.GetWindowWidth(ctx) - w - 16
-  if x < 380 then return end -- окно узкое — консоль не рисуем
-  local y0 = ImGui.GetCursorPosY(ctx)
-  ImGui.SetCursorPos(ctx, x, y0)
-  if ImGui.BeginChild(ctx, '##console', w, 84, ImGui.ChildFlags_Border,
-      ImGui.WindowFlags_NoScrollbar | ImGui.WindowFlags_NoScrollWithMouse) then
-    if #state.undo > 0 then
-      if chip(T('отменить') .. ' (' .. #state.undo .. ')###undo', true,
-          0x7BB8D9FF) then
-        do_undo()
-      end
-      ImGui.SameLine(ctx)
-    end
-    ImGui.TextDisabled(ctx, T('журнал'))
-    for i = 1, 4 do
-      local e = state.log[i]
-      if not e then break end
-      ImGui.TextColored(ctx, LOG_COLORS[e.kind] or 0x9A9A9AFF,
-        os.date('%H:%M', e.t) .. '  ' .. trunc(e.msg, 40))
-    end
-    ImGui.EndChild(ctx)
-  end
-  ImGui.SetCursorPosY(ctx, y0)
-end
 
 local function draw_toolbar()
-  draw_console()
-  if ImGui.Button(ctx, 'Rescan') then rescan() end
+  if ImGui.Button(ctx, state.rescan
+      and string.format('Rescan %d/%d ■', state.rescan.i, state.rescan.total)
+      or 'Rescan') then
+    rescan()
+  end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, T('настройки')) then
     state.show_settings = not state.show_settings
@@ -3288,6 +3330,271 @@ end
 
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Консоль: мини-bash над каталогом. Команды сцепляются через &&.
+-- Работают над выборкой (sel) либо над отфильтрованными карточками.
+
+local function con_out(fmt, ...)
+  logf('cmd', fmt, ...)
+end
+
+local function con_match(pat, plain)
+  -- карточки под фильтрами, отсортированные как на экране
+  local cards = collect_cards()
+  local out = {}
+  for _, e in ipairs(cards) do
+    local hay = search_text(e.card, e.meta)
+    local ok
+    if plain then
+      ok = hay:find(ulower(pat), 1, true)
+    else
+      local okp, res = pcall(string.find, hay, ulower(pat))
+      ok = okp and res
+    end
+    if ok then out[#out + 1] = e end
+  end
+  return out
+end
+
+local function con_selected_cards()
+  local out = {}
+  for _, p in ipairs(state.sel) do
+    local c = state.index.projects[p]
+    if c then out[#out + 1] = c end
+  end
+  return out
+end
+
+local CMDS
+CMDS = {
+  help = function()
+    con_out('ls [n] · grep <pat> · fzf <text> · sel <pat>|clear · count')
+    con_out('open <pat> · class <класс|-> · tag <имя|-имя> · dl <дд.мм|->')
+    con_out('pin · unpin · render · demo · daw <ab|fl|rp|…> · sort <режим>')
+    con_out('rescan · undo · всё сцепляется через &&')
+  end,
+  ls = function(args)
+    local n = tonumber(args) or 10
+    local cards = collect_cards()
+    for i = 1, math.min(n, #cards) do
+      local e = cards[i]
+      con_out('%2d %s  [%s]%s', i, e.card.name,
+        e.meta.status ~= '' and e.meta.status or '—',
+        core.card_bpm(e.card) and ('  ' .. core.card_bpm(e.card) .. 'bpm') or '')
+    end
+    con_out(T('всего: %d'), #cards)
+  end,
+  grep = function(args)
+    if args == '' then con_out('grep <lua-pattern>') return end
+    local hits = con_match(args, false)
+    for i = 1, math.min(8, #hits) do con_out('  ' .. hits[i].card.name) end
+    con_out(T('совпадений: %d'), #hits)
+  end,
+  fzf = function(args)
+    state.filter_text = args
+    con_out(T('фильтр: «%s», карточек: %d'), args, #collect_cards())
+  end,
+  count = function()
+    con_out(T('карточек: %d, выбрано: %d'), #collect_cards(), #state.sel)
+  end,
+  sel = function(args)
+    if args == 'clear' or args == '' then
+      state.sel = {}
+      con_out(T('выборка очищена'))
+      return
+    end
+    local hits = con_match(args, false)
+    for _, e in ipairs(hits) do
+      if not sel_index(e.card.path) then
+        state.sel[#state.sel + 1] = e.card.path
+      end
+    end
+    con_out(T('в выборке: %d'), #state.sel)
+  end,
+  clear = function()
+    state.sel, state.filter_text, state.filter_daw = {}, '', nil
+    state.filter_status, state.filter_empty = 0, false
+    con_out(T('фильтры и выборка сброшены'))
+  end,
+  open = function(args)
+    local hits = con_match(args, false)
+    if #hits == 0 then con_out(T('не найдено')) return end
+    open_project(hits[1].card.path)
+    con_out(T('открываю: ') .. hits[1].card.name)
+  end,
+  class = function(args)
+    if #state.sel == 0 then con_out(T('выборка пуста (sel <pat>)')) return end
+    local cls = args == '-' and '' or args
+    if cls ~= '' then
+      local valid = false
+      for _, s in ipairs(core.STATUSES) do if s == cls then valid = true end end
+      if not valid then
+        con_out(T('нет класса: ') .. cls .. ' (' ..
+          table.concat(core.STATUSES, ' ') .. ')')
+        return
+      end
+    end
+    for _, c in ipairs(con_selected_cards()) do set_status(c, cls, true) end
+    con_out(T('класс «%s»: %d проектов'), cls ~= '' and cls or '—', #state.sel)
+  end,
+  tag = function(args)
+    if #state.sel == 0 then con_out(T('выборка пуста (sel <pat>)')) return end
+    if args == '' then con_out('tag <имя> | tag -имя') return end
+    local remove = args:sub(1, 1) == '-'
+    local t = remove and args:sub(2) or args
+    for _, c in ipairs(con_selected_cards()) do
+      local extra = c.tags_extra or {}
+      local found
+      for j, x in ipairs(extra) do if x == t then found = j end end
+      if remove and found then table.remove(extra, found) end
+      if not remove and not found then extra[#extra + 1] = t end
+      c.tags_extra = #extra > 0 and extra or nil
+      search_cache[c.path] = nil
+    end
+    core.save_index(state.index)
+    con_out((remove and T('тег снят: ') or T('тег: ')) .. t)
+  end,
+  dl = function(args)
+    if #state.sel == 0 then con_out(T('выборка пуста (sel <pat>)')) return end
+    for _, c in ipairs(con_selected_cards()) do
+      set_deadline(c, args == '-' and '' or args)
+    end
+  end,
+  pin = function()
+    for _, c in ipairs(con_selected_cards()) do
+      if not c.pinned then toggle_pin(c) end
+    end
+  end,
+  unpin = function()
+    for _, c in ipairs(con_selected_cards()) do
+      if c.pinned then toggle_pin(c) end
+    end
+  end,
+  render = function()
+    if #state.sel == 0 then con_out(T('выборка пуста (sel <pat>)')) return end
+    local queue = {}
+    for _, p in ipairs(state.sel) do
+      local c = state.index.projects[p]
+      if c and not c.daw then queue[#queue + 1] = p end
+    end
+    if #queue == 0 then con_out(T('нечего рендерить')) return end
+    state.batch = { queue = queue, done = 0, total = #queue }
+    con_out(T('превью-батч: %d'), #queue)
+  end,
+  demo = function()
+    for _, c in ipairs(con_selected_cards()) do render_audio(c, 'demo') end
+  end,
+  daw = function(args)
+    local map = { rp = 'reaper', ab = 'ableton', fl = 'flstudio',
+      rn = 'renoise', pt = 'protools', lg = 'logic' }
+    state.filter_daw = map[args] or (args ~= '' and args or nil)
+    con_out(T('фильтр DAW: %s, карточек: %d'),
+      state.filter_daw or T('все'), #collect_cards())
+  end,
+  sort = function(args)
+    for i, s in ipairs(SORT_CHIPS) do
+      if s == args or (LANG == 'en' and T(s) == args) then
+        state.sort_mode = i
+        con_out(T('сортировка: ') .. s)
+        return
+      end
+    end
+    con_out('sort: ' .. table.concat(SORT_CHIPS, ' '))
+  end,
+  rescan = function() rescan() end,
+  undo = function() do_undo() end,
+}
+
+local function run_console(line)
+  line = line:match('^%s*(.-)%s*$')
+  if line == '' then return end
+  logf('in', '> ' .. line)
+  table.insert(state.con_hist, 1, line)
+  if #state.con_hist > 50 then state.con_hist[#state.con_hist] = nil end
+  for cmd in (line .. ' && '):gmatch('(.-)%s*&&%s*') do
+    if cmd ~= '' then
+      local name, args = cmd:match('^(%S+)%s*(.*)$')
+      local fn = CMDS[name]
+      if not fn then
+        con_out(T('нет команды: ') .. tostring(name) .. ' (help)')
+        return
+      end
+      local ok, err = pcall(fn, args or '')
+      if not ok then
+        con_out('err: ' .. tostring(err))
+        return
+      end
+    end
+  end
+end
+
+-- Нижняя консоль: лог (новые снизу), прогрессы процессов, строка ввода
+local CONSOLE_H = 158
+local function draw_console_bottom()
+  if not ImGui.BeginChild(ctx, '##consoleb', 0, CONSOLE_H,
+      ImGui.ChildFlags_Border) then
+    return
+  end
+  ImGui.TextDisabled(ctx, T('консоль'))
+  if #state.undo > 0 then
+    ImGui.SameLine(ctx)
+    if chip(T('отменить') .. ' (' .. #state.undo .. ')###undo', true,
+        0x7BB8D9FF) then
+      do_undo()
+    end
+  end
+  -- процессы с прогресс-барами
+  if state.rescan then
+    ImGui.SameLine(ctx)
+    ImGui.ProgressBar(ctx, state.rescan.i / math.max(state.rescan.total, 1),
+      170, 0, string.format('rescan %d/%d', state.rescan.i, state.rescan.total))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '■###rsstop') then state.rescan = nil end
+  end
+  if state.batch then
+    ImGui.SameLine(ctx)
+    local d = state.batch.done + (state.batch.skipped or 0)
+    ImGui.ProgressBar(ctx, d / math.max(state.batch.total, 1), 170, 0,
+      string.format(T('превью %d/%d'), d, state.batch.total))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '■###bstop') then state.batch = nil end
+  end
+  if playing.audio then
+    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, 0xD9B96CFF,
+      '♪ ' .. (playing.audio:match('([^/\\]+)$') or ''))
+  end
+
+  local input_h = ImGui.GetFrameHeightWithSpacing(ctx)
+  if ImGui.BeginChild(ctx, '##clog', 0, -input_h) then
+    for i = math.min(#state.log, LOG_MAX), 1, -1 do
+      local e = state.log[i]
+      ImGui.TextColored(ctx, LOG_COLORS[e.kind] or 0x9A9A9AFF,
+        os.date('%H:%M:%S', e.t) .. '  ' .. e.msg)
+    end
+    if state.log_scroll then
+      ImGui.SetScrollHereY(ctx, 1.0)
+      state.log_scroll = false
+    end
+    ImGui.EndChild(ctx)
+  end
+  ImGui.SetNextItemWidth(ctx, -1)
+  if state.con_focus then
+    ImGui.SetKeyboardFocusHere(ctx)
+    state.con_focus = false
+  end
+  local done, v = ImGui.InputTextWithHint(ctx, '###conin',
+    T('команда… help — список, && — цепочка'), state.con_text,
+    ImGui.InputTextFlags_EnterReturnsTrue)
+  if v then state.con_text = v end
+  if done then
+    run_console(state.con_text)
+    state.con_text = ''
+    state.con_focus = true
+  end
+  ImGui.EndChild(ctx)
+end
+
 local function loop()
   ImGui.PushFont(ctx, font)
   ImGui.SetNextWindowSize(ctx, 980, 660, ImGui.Cond_FirstUseEver)
@@ -3299,8 +3606,9 @@ local function loop()
 
     local cards = collect_cards()
     local cols = 1
-    -- контент в своём child: тулбар не скроллится, внизу место под статусбар
+    -- контент в своём child: тулбар не скроллится, внизу консоль и статусбар
     local footer_h = ImGui.GetTextLineHeightWithSpacing(ctx) + 8
+      + CONSOLE_H + 6
     local wflags = (state.view == 2 or state.view == 3)
       and ImGui.WindowFlags_HorizontalScrollbar or ImGui.WindowFlags_None
     if ImGui.BeginChild(ctx, '##content', 0, -footer_h,
@@ -3316,8 +3624,11 @@ local function loop()
       end
       handle_keys(cards, cols)
       ImGui.EndChild(ctx)
-      batch_step() -- очередь «превью всем»: один проект за кадр
+      batch_step()  -- очередь «превью всем»: один проект за кадр
+      rescan_step() -- фоновый рескан: порция карточек за кадр
     end
+
+    draw_console_bottom()
 
     -- статусбар: слева сообщение или сводка, справа версия
     ImGui.Separator(ctx)
