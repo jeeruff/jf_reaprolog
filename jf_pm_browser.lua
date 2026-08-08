@@ -124,6 +124,8 @@ local EN = {
   ['открыт'] = 'opened',
   ['сохранён'] = 'saved',
   ['консоль'] = 'console',
+  ['развернуть'] = 'expand',
+  ['нет превью'] = 'no preview',
   ['Rescan остановлен'] = 'Rescan stopped',
   ['Rescan: %d путей, фоном'] = 'Rescan: %d paths, in background',
   ['Rescan: %d проектов за %.1f c'] = 'Rescan: %d projects in %.1f s',
@@ -225,7 +227,7 @@ local state = {
   stems_path = core.get_setting('stems_path'),
   regions_path = core.get_setting('regions_path'),
   thumb_style = tonumber(core.get_setting('thumb_style')) or 0, -- 0 калейдоскоп, 1 иероглиф
-  card_size = tonumber(core.get_setting('card_size')) or 2,     -- 1 S / 2 M / 3 L
+  card_size = 1,            -- единый размер карточки
   peak_style = tonumber(core.get_setting('peak_style')) or 0,   -- 0 волна / 1 спектр
   btn_tips = core.get_setting('btn_tips') ~= '0',               -- подсказки кнопок
   preview_vol = tonumber(core.get_setting('preview_vol')) or 1.0,
@@ -283,10 +285,9 @@ local function class_labels()
 end
 
 -- размеры карточек в сетке: ширина, высота, тамбнейл, макс. символов имени
+-- один размер карточки: шире, всё влезает, ряд кнопок внизу
 local CARD_SIZES = {
-  { label = 'S', w = 230, h = 150, thumb = 40, name = 15 },
-  { label = 'M', w = 310, h = 178, thumb = 64, name = 22 },
-  { label = 'L', w = 400, h = 216, thumb = 96, name = 30 },
+  { label = 'M', w = 360, h = 190, thumb = 64, name = 20 },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -1435,7 +1436,7 @@ local function draw_wave_strip(card, width, height)
   local clicked = false
   if not audio then
     ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
-      T('нет аудио · ▸ в карточке отрендерит превью'))
+      T('нет превью'))
     ImGui.Dummy(ctx, width, height)
     return false
   end
@@ -1892,27 +1893,50 @@ end
 -- Сетка карточек
 
 -- Ряд команд карточки (всегда наверху). true — был клик по кнопке.
-local function draw_card_icons(card, meta, i)
+-- Нижний ряд команд карточки: прозрачные значки без фона.
+-- Порядок: свернуть/развернуть и выбрать — первыми слева, деструктив — справа.
+local function draw_card_icons(card, meta, i, expanded)
   local hit = false
   local foreign = card.daw ~= nil
-  -- только глиф; что делает кнопка — в тултипе (отключается в настройках)
   local function icon(glyph, id, tip, col)
-    if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
+    ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x00000000)
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, 0xFFFFFF22)
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, 0xFFFFFF3A)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, col or 0x8A8F93FF)
     local clicked = ImGui.SmallButton(ctx, glyph .. '###' .. id .. i)
-    if col then ImGui.PopStyleColor(ctx) end
+    ImGui.PopStyleColor(ctx, 4)
     if state.btn_tips and ImGui.IsItemHovered(ctx) then
       ImGui.SetTooltip(ctx, tip)
     end
     if clicked then hit = true end
     return clicked
   end
+
+  if icon(expanded and '▴' or '▾', 'fold',
+      expanded and T('свернуть') or T('развернуть')) then
+    state.expanded = expanded and nil or card.path
+    state.focus = i
+  end
+  ImGui.SameLine(ctx)
+  local si = sel_index(card.path)
+  if icon(si and '■' or '□', 'sel',
+      si and T('снять выбор') or T('выбрать'),
+      si and 0xD9B96CFF or nil) then
+    toggle_select(card.path)
+  end
+  ImGui.SameLine(ctx)
   if icon(card.pinned and '●' or '○', 'pin',
       card.pinned and T('открепить') or T('закрепить'),
       card.pinned and 0xD9B96CFF or nil) then
     toggle_pin(card)
   end
-  if not foreign then
-    ImGui.SameLine(ctx)
+  ImGui.SameLine(ctx)
+  if foreign then
+    local dt = core.DAW_TYPES[card.daw_ext] or {}
+    if icon('▸', 'dopen', T('открыть в ') .. (dt.daw or 'DAW'), dt.color) then
+      open_project(card.path)
+    end
+  else
     if icon('▸', 'prev', T('отрендерить аудио-превью')) then
       render_audio(card, 'preview')
     end
@@ -1920,21 +1944,14 @@ local function draw_card_icons(card, meta, i)
     if icon('▶', 'demo', T('отрендерить полное демо (весь проект)')) then
       render_audio(card, 'demo')
     end
-  else
     ImGui.SameLine(ctx)
-    local dt = core.DAW_TYPES[card.daw_ext] or {}
-    if icon('▸', 'dopen', T('открыть в ') .. (dt.daw or 'DAW'),
-        dt.color) then
-      open_project(card.path)
-    end
-  end
-  ImGui.SameLine(ctx)
-  if not foreign and icon('Aa', 'ren', T('переименовать проект…')) then
-    if state.ren_path == card.path then
-      state.ren_path = nil
-    else
-      state.ren_path, state.ren_text = card.path, card.name
-      state.ren_focus = true
+    if icon('Aa', 'ren', T('переименовать проект…')) then
+      if state.ren_path == card.path then
+        state.ren_path = nil
+      else
+        state.ren_path, state.ren_text = card.path, card.name
+        state.ren_focus = true
+      end
     end
   end
   ImGui.SameLine(ctx)
@@ -1946,11 +1963,24 @@ local function draw_card_icons(card, meta, i)
       core.save_index(state.index)
     end
   end
+  if card.thumb_user then
+    ImGui.SameLine(ctx)
+    if icon('▧', 'unthumb', T('сбросить превью')) then
+      card.thumb_user = nil
+      core.save_index(state.index)
+    end
+  end
   ImGui.SameLine(ctx)
-  if icon('×', 'del', T('удалить в Корзину…')) then
+  if icon('↻', 'refr', T('обновить карточку (перечитать .rpp)')) then
+    refresh_card(card.path)
+    state.status_msg = T('Обновлено: ') .. card.name
+  end
+  ImGui.SameLine(ctx)
+  if icon('×', 'del', T('удалить в Корзину…'), 0xB06060FF) then
     delete_project(card)
   end
-  -- инлайн-поле переименования — под рядом иконок
+
+  -- инлайн-поле переименования — под рядом
   if state.ren_path == card.path then
     ImGui.SetNextItemWidth(ctx, -1)
     if state.ren_focus then
@@ -2325,30 +2355,6 @@ local function draw_card_details(card, meta)
   end
 
   ImGui.TextDisabled(ctx, card.path)
-  -- (иконки команд переехали наверх карточки — draw_card_icons)
-  local function icon(label, tip, col)
-    if col then ImGui.PushStyleColor(ctx, ImGui.Col_Text, col) end
-    local clicked = ImGui.SmallButton(ctx, label)
-    if col then ImGui.PopStyleColor(ctx) end
-    if state.btn_tips and ImGui.IsItemHovered(ctx) then
-      ImGui.SetTooltip(ctx, tip)
-    end
-    return clicked
-  end
-  if icon('▲###fold', T('свернуть')) then state.expanded = nil end
-  ImGui.SameLine(ctx)
-  local si = sel_index(card.path)
-  if icon((si and '■' or '□') .. '###sel',
-      si and T('снять выбор') or T('выбрать'), si and 0xD9B96CFF or nil) then
-    toggle_select(card.path)
-  end
-  if card.thumb_user then
-    ImGui.SameLine(ctx)
-    if icon('▧###unthumb', T('сбросить превью')) then
-      card.thumb_user = nil
-      core.save_index(state.index)
-    end
-  end
 end
 
 local function draw_card(entry, i, card_w)
@@ -2390,6 +2396,13 @@ local function draw_card(entry, i, card_w)
     else
       ImGui.Text(ctx, trunc(card.name, cs.name))
     end
+    -- дата и bpm — справа от имени, той же строкой
+    local right = os.date('%d.%m.%y', card.mtime or 0)
+    local bpm_str = fmt_bpm(card)
+    if bpm_str then right = right .. ' · ' .. bpm_str end
+    ImGui.SameLine(ctx,
+      card_w - ImGui.CalcTextSize(ctx, right) - 12)
+    ImGui.TextDisabled(ctx, right)
     if core.is_empty_project(card) then
       -- пустышка: ни одного айтема или ни одного аудиофайла в папке
       ImGui.SameLine(ctx)
@@ -2408,29 +2421,6 @@ local function draw_card(entry, i, card_w)
       -- номер в выборке = позиция в merge
       ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
     end
-    -- обновить одну карточку (перечитать .rpp) и ячейка выделения — в углу
-    ImGui.SameLine(ctx, card_w - 56)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x6A6A6AFF)
-    if ImGui.SmallButton(ctx, '↻###refr1') then
-      refresh_card(card.path)
-      state.status_msg = T('Обновлено: ') .. card.name
-      inner_click = true
-    end
-    ImGui.PopStyleColor(ctx)
-    if state.btn_tips and ImGui.IsItemHovered(ctx) then
-      ImGui.SetTooltip(ctx, T('обновить карточку'))
-    end
-    ImGui.SameLine(ctx, card_w - 30)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, si and 0xD9B96CFF or 0x6A6A6AFF)
-    if ImGui.SmallButton(ctx, (si and '■' or '□') .. '###selbox') then
-      toggle_select(card.path)
-      inner_click = true
-    end
-    ImGui.PopStyleColor(ctx)
-
-    -- ряд команд наверху карточки: всегда под рукой, не в глубине
-    if draw_card_icons(card, meta, i) then inner_click = true end
-
     local color = core.STATUS_COLORS[meta.status]
     local stage = core.PIPELINE[meta.status]
     if stage then
@@ -2460,22 +2450,20 @@ local function draw_card(entry, i, card_w)
       end
       inner_click = true
     end
-    if card.needs_report then
-      ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0xE06060FF, T('· без отчёта'))
-    end
-
-    ImGui.TextDisabled(ctx, fmt_date(card.mtime))
     if (meta.deadline or 0) > 0 then
       ImGui.SameLine(ctx)
       ImGui.TextColored(ctx, deadline_color(meta.deadline, os.time()),
         '→ ' .. os.date('%d.%m', meta.deadline))
     end
-    local bpm_str = fmt_bpm(card)
+    if card.needs_report then
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, 0xE06060FF, T('· без отчёта'))
+    end
+
     local keys_str = fmt_keys(card)
-    -- компактная строка: длительность · bpm · тональности
+    -- компактная строка: длительность · размер · тональности
     ImGui.TextDisabled(ctx, fmt_duration(card.duration)
-      .. (bpm_str and ('   ' .. bpm_str) or '')
+      .. (card.dir_size and ('   ' .. fmt_size(card.dir_size)) or '')
       .. (keys_str and ('   ' .. keys_str) or ''))
     ImGui.EndGroup(ctx)
 
@@ -2507,16 +2495,17 @@ local function draw_card(entry, i, card_w)
       end
     end
 
-    -- превью всегда видно: полоска-плеер прижата к низу свёрнутой карточки
+    -- превью всегда видно: волна прижата к низу, под ней ряд кнопок
     if not expanded then
       local _, resty = ImGui.GetContentRegionAvail(ctx)
-      if resty and resty > 22 then ImGui.Dummy(ctx, 1, resty - 22) end
+      if resty and resty > 46 then ImGui.Dummy(ctx, 1, resty - 46) end
     end
     if draw_wave_strip(card, ImGui.GetContentRegionAvail(ctx), 20) then
       inner_click = true
     end
 
     if expanded then draw_card_details(card, meta) end
+    if draw_card_icons(card, meta, i, expanded) then inner_click = true end
     ImGui.EndChild(ctx)
   end
   if focused or si then
@@ -3182,16 +3171,7 @@ local function draw_toolbar()
       end
     end
   end
-  -- размер карточек в сетке
-  ImGui.SameLine(ctx)
-  ImGui.TextDisabled(ctx, '|')
-  for i, cs in ipairs(CARD_SIZES) do
-    ImGui.SameLine(ctx)
-    if chip(cs.label .. '###csize' .. i, state.card_size == i, 0x7BB8D9FF) then
-      state.card_size = i
-      core.set_setting('card_size', tostring(i))
-    end
-  end
+
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
   ImGui.SameLine(ctx)
