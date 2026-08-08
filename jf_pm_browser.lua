@@ -124,6 +124,8 @@ local EN = {
   ['открыт'] = 'opened',
   ['сохранён'] = 'saved',
   ['консоль'] = 'console',
+  ['цепочка'] = 'chain',
+  ['играть выбранные по очереди'] = 'play selected in sequence',
   ['развернуть'] = 'expand',
   ['нет превью'] = 'no preview',
   ['Rescan остановлен'] = 'Rescan stopped',
@@ -227,7 +229,7 @@ local state = {
   stems_path = core.get_setting('stems_path'),
   regions_path = core.get_setting('regions_path'),
   thumb_style = tonumber(core.get_setting('thumb_style')) or 0, -- 0 калейдоскоп, 1 иероглиф
-  card_size = 1,            -- единый размер карточки
+  card_size = tonumber(core.get_setting('card_size')) or 2, -- 1 S / 2 M / 3 L
   peak_style = tonumber(core.get_setting('peak_style')) or 0,   -- 0 волна / 1 спектр
   btn_tips = core.get_setting('btn_tips') ~= '0',               -- подсказки кнопок
   preview_vol = tonumber(core.get_setting('preview_vol')) or 1.0,
@@ -285,9 +287,11 @@ local function class_labels()
 end
 
 -- размеры карточек в сетке: ширина, высота, тамбнейл, макс. символов имени
--- один размер карточки: шире, всё влезает, ряд кнопок внизу
+-- размеры: S — иконка+имя+волна, M — обычная, L — всё развёрнуто сразу
 local CARD_SIZES = {
+  { label = 'S', w = 150, h = 168, thumb = 100, name = 16, mini = true },
   { label = 'M', w = 360, h = 190, thumb = 64, name = 20 },
+  { label = 'L', w = 400, h = 0, thumb = 64, name = 24, full = true },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -631,6 +635,11 @@ local function rescan()
     state.status_msg = 'Укажи директории проектов (кнопка «настройки»)'
     state.show_settings = true
     return
+  end
+  for _, p in ipairs(paths) do
+    local ok = reaper.EnumerateFiles(p, 0) ~= nil
+      or reaper.EnumerateSubdirectories(p, 0) ~= nil
+    logf(ok and 'act' or 'warn', (ok and '✓ ' or '✗ ') .. p)
   end
   local t0 = reaper.time_precise()
   local rpp, foreign = core.scan_projects(paths)
@@ -1336,6 +1345,38 @@ local function find_preview_audio(card)
       return p
     end
   end
+  -- точных нет — фаззи: лучший аудиофайл папки, похожий на имя проекта
+  -- («трек v3.wav» для «трек.rpp»); нормализуем до букв/цифр
+  local function norm(s)
+    return (s:lower():gsub('[%s%p_]+', ''))
+  end
+  local want = norm(card.name)
+  if #want >= 3 then
+    local best, best_score
+    local i = 0
+    while true do
+      local fn = reaper.EnumerateFiles(dir, i)
+      if not fn then break end
+      local ext = fn:lower():match('%.([%w]+)$')
+      if ext and AUDIO_EXT[ext] then
+        local base = norm(fn:gsub('%.[%w]+$', ''))
+        local score
+        if base == want then score = 100
+        elseif base:find(want, 1, true) then score = 80 - (#base - #want)
+        elseif want:find(base, 1, true) and #base >= 4 then
+          score = 60 - (#want - #base)
+        end
+        if score and (not best_score or score > best_score) then
+          best, best_score = dir .. '/' .. fn, score
+        end
+      end
+      i = i + 1
+    end
+    if best then
+      audio_cache[card.path] = best
+      return best
+    end
+  end
   audio_cache[card.path] = false
   return nil
 end
@@ -1391,32 +1432,79 @@ local function get_wave(audio)
   return w2
 end
 
--- плейбек через SWS CF_Preview; одновременно играет один
-local playing = { audio = nil, cfp = nil }
-local function preview_stop()
-  if playing.cfp then
-    reaper.CF_Preview_Stop(playing.cfp)
-    playing.audio, playing.cfp = nil, nil
+-- Плейбек через SWS CF_Preview. Несколько превью могут играть
+-- одновременно (мини-плейлист выбранных — как сешн-грид Ableton);
+-- playlist — последовательный режим: следующий стартует, когда кончился
+-- текущий.
+local players = {}   -- audio -> cfp
+local playlist = nil -- { queue = {audio…}, i, started }
+
+local function is_playing(audio)
+  return players[audio] ~= nil
+end
+
+local function preview_stop(audio)
+  if audio then
+    local c = players[audio]
+    if c then
+      reaper.CF_Preview_Stop(c)
+      players[audio] = nil
+    end
+  else
+    for _, c in pairs(players) do reaper.CF_Preview_Stop(c) end
+    players = {}
+    playlist = nil
   end
 end
 
-local function preview_toggle(audio)
+local function preview_play(audio, keep_others)
   if not reaper.CF_CreatePreview then
     state.status_msg = 'Плеер: нужен SWS (CF_Preview)'
     return
   end
-  if playing.audio == audio then
-    preview_stop()
-    return
+  if not keep_others then
+    for _, c in pairs(players) do reaper.CF_Preview_Stop(c) end
+    players = {}
   end
-  preview_stop()
   local src = reaper.PCM_Source_CreateFromFile(audio)
   if not src then return end
   local cfp = reaper.CF_CreatePreview(src)
   reaper.PCM_Source_Destroy(src) -- CF_Preview держит свою копию
   reaper.CF_Preview_SetValue(cfp, 'D_VOLUME', state.preview_vol)
   reaper.CF_Preview_Play(cfp)
-  playing.audio, playing.cfp = audio, cfp
+  players[audio] = cfp
+end
+
+local function preview_toggle(audio, keep_others)
+  if is_playing(audio) then
+    preview_stop(audio)
+  else
+    preview_play(audio, keep_others)
+  end
+end
+
+-- каждый кадр: убрать доигравшие, продвинуть плейлист
+local function players_step()
+  for a, c in pairs(players) do
+    local ok, st = reaper.CF_Preview_GetValue(c, 'B_PLAY')
+    if ok and st == 0 then players[a] = nil end
+  end
+  if playlist then
+    local cur = playlist.queue[playlist.i]
+    if not cur then
+      playlist = nil
+    elseif not players[cur] then
+      if not playlist.started then
+        playlist.started = true
+        preview_play(cur, false)
+      elseif playlist.i < #playlist.queue then
+        playlist.i = playlist.i + 1
+        preview_play(playlist.queue[playlist.i], false)
+      else
+        playlist = nil
+      end
+    end
+  end
 end
 
 -- цвет спектрального пика: частота (нижние 15 бит) → hue от красного к синему
@@ -1427,7 +1515,7 @@ local function spec_color(spec)
 end
 
 -- полоска-плеер: клик — play/stop; вернуть true, если клик был по полоске
-local function draw_wave_strip(card, width, height)
+local function draw_wave_strip(card, width, height, multi)
   local audio = find_preview_audio(card)
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
@@ -1444,25 +1532,22 @@ local function draw_wave_strip(card, width, height)
   if w then
     local mid = y0 + height / 2
     local step = width / w.n
-    local is_playing = playing.audio == audio
+    local now_playing = is_playing(audio)
     for i = 1, w.n do
       local x = x0 + (i - 1) * step
       local col = w.spec and spec_color(w.spec[i])
-        or (is_playing and 0xD9B96CFF or 0x8A8F93FF)
+        or (now_playing and 0xD9B96CFF or 0x8A8F93FF)
       local hi = math.min(math.max(w.max[i], 0), 1) * (height / 2 - 1)
       local lo = math.min(math.max(-w.min[i], 0), 1) * (height / 2 - 1)
       ImGui.DrawList_AddRectFilled(dl, x, mid - hi, x + math.max(step - 1, 1),
         mid + lo + 1, col)
     end
-    if is_playing and playing.cfp then
-      local ok, pos = reaper.CF_Preview_GetValue(playing.cfp, 'D_POSITION')
+    if now_playing then
+      local ok, pos = reaper.CF_Preview_GetValue(players[audio], 'D_POSITION')
       if ok and w.len > 0 then
         local px = x0 + math.min(pos / w.len, 1) * width
         ImGui.DrawList_AddLine(dl, px, y0, px, y0 + height, 0xFFFFFFDD, 1)
       end
-      -- дошёл до конца — сброс
-      local ok2, st2 = reaper.CF_Preview_GetValue(playing.cfp, 'B_PLAY')
-      if ok2 and st2 == 0 then preview_stop() end
     end
   else
     ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
@@ -1473,9 +1558,9 @@ local function draw_wave_strip(card, width, height)
   if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) then
     local mx = ImGui.GetMousePos(ctx)
     local frac = math.min(math.max((mx - x0) / width, 0), 1)
-    if playing.audio ~= audio then preview_toggle(audio) end
-    if playing.cfp and w and w.len > 0 then
-      reaper.CF_Preview_SetValue(playing.cfp, 'D_POSITION', frac * w.len)
+    if not is_playing(audio) then preview_play(audio, multi) end
+    if players[audio] and w and w.len > 0 then
+      reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', frac * w.len)
     end
     clicked = true
   end
@@ -1484,7 +1569,7 @@ local function draw_wave_strip(card, width, height)
     clicked = true
   end
   if ImGui.IsItemHovered(ctx) then
-    ImGui.SetTooltip(ctx, playing.audio == audio
+    ImGui.SetTooltip(ctx, is_playing(audio)
       and T('клик — сик · пкм — стоп')
       or (T('играть: ') .. (audio:match('([^/\\]+)$') or audio)
         .. '\n' .. T('клик — с места клика · пкм — стоп')))
@@ -2359,11 +2444,12 @@ end
 
 local function draw_card(entry, i, card_w)
   local card, meta = entry.card, entry.meta
-  local expanded = state.expanded == card.path
+  local cs = CARD_SIZES[state.card_size]
+  -- L: вся информация каждой карточки развёрнута сразу
+  local expanded = cs.full or state.expanded == card.path
   local focused = state.focus == i
   local si = sel_index(card.path)
-  local inner_click = false  -- клик по виджету внутри — не раскрывать карточку
-  local cs = CARD_SIZES[state.card_size]
+  local inner_click = false  -- клик по виджету внутри — не менять фокус
   local h = expanded and 0 or cs.h  -- 0 = авто-высота по контенту
 
   local child_flags = ImGui.ChildFlags_Border
@@ -2374,12 +2460,30 @@ local function draw_card(entry, i, card_w)
   -- в раскрытом карточка растёт сама (AutoResizeY)
   local win_flags = ImGui.WindowFlags_NoScrollbar
     | ImGui.WindowFlags_NoScrollWithMouse
-  if focused then
-    ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xE8E8E8FF)
-  elseif si then
-    ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
+  local hilite = focused or si
+  if hilite then
+    -- жирная рамка выделения/фокуса
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_ChildBorderSize, 2.5)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Border,
+      focused and 0xE8E8E8FF or 0xD9B96CFF)
   end
   if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags, win_flags) then
+    if cs.mini then
+      -- S: только иконка — тамбнейл, имя, волна, две кнопки
+      draw_thumb(card, cs.thumb)
+      if card.daw then
+        local dt = core.DAW_TYPES[card.daw_ext] or {}
+        ImGui.TextColored(ctx, dt.color or 0x9A9A9AFF, '[' .. (dt.label or '?') .. ']')
+        ImGui.SameLine(ctx)
+      end
+      ImGui.Text(ctx, trunc(card.name, cs.name))
+      if draw_wave_strip(card, ImGui.GetContentRegionAvail(ctx), 16) then
+        inner_click = true
+      end
+      if draw_card_icons(card, meta, i, false) then inner_click = true end
+      ImGui.EndChild(ctx)
+      goto card_done
+    end
     draw_thumb(card, cs.thumb)
     ImGui.SameLine(ctx)
     ImGui.BeginGroup(ctx)
@@ -2508,8 +2612,10 @@ local function draw_card(entry, i, card_w)
     if draw_card_icons(card, meta, i, expanded) then inner_click = true end
     ImGui.EndChild(ctx)
   end
-  if focused or si then
+  ::card_done::
+  if hilite then
     ImGui.PopStyleColor(ctx)
+    ImGui.PopStyleVar(ctx)
   end
   if focused and state.scroll_to_focus then
     ImGui.SetScrollHereY(ctx, 0.5)
@@ -2524,11 +2630,9 @@ local function draw_card(entry, i, card_w)
     elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) and not inner_click then
       if select_click then
         toggle_select(card.path) -- cmd/ctrl+клик: в выборку для merge
-        state.focus = i
-      elseif not expanded then
-        state.expanded = card.path
-        state.focus = i
       end
+      -- обычный клик — только фокус; раскрытие — стрелкой ▾ или Enter
+      state.focus = i
     end
   end
 end
@@ -2900,6 +3004,16 @@ local function draw_settings()
   ImGui.SetNextItemWidth(ctx, -86)
   changed, val = ImGui.InputText(ctx, '##paths', state.scan_paths)
   if changed then state.scan_paths = val end
+  -- как скрипт разбирает строку: каждая папка отдельно, с проверкой
+  for p in state.scan_paths:gmatch('[^;]+') do
+    p = p:match('^%s*(.-)%s*$')
+    if p ~= '' then
+      local ok = reaper.EnumerateFiles(p, 0) ~= nil
+        or reaper.EnumerateSubdirectories(p, 0) ~= nil
+      ImGui.TextColored(ctx, ok and 0x7FD98AFF or 0xE06060FF,
+        (ok and '✓ ' or '✗ ') .. p)
+    end
+  end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, '+ Finder##scan') then
     local dir = pick_folder('Папка с проектами', state.scan_paths:match('([^;]+)'))
@@ -3025,72 +3139,12 @@ local function draw_toolbar()
     0.0, 1.0, 'vol %.2f')
   if vchg then
     state.preview_vol = nv
-    if playing.cfp then
-      reaper.CF_Preview_SetValue(playing.cfp, 'D_VOLUME', nv)
+    for _, c in pairs(players) do
+      reaper.CF_Preview_SetValue(c, 'D_VOLUME', nv)
     end
   end
   if ImGui.IsItemDeactivatedAfterEdit(ctx) then
     core.set_setting('preview_vol', string.format('%.3f', state.preview_vol))
-  end
-
-  -- блок выборки: порядок номеров = порядок склейки; при нескольких
-  -- выделенных — те же команды, что на карточке, но на всю выборку
-  if #state.sel > 0 then
-    ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xD9B96CFF, string.format(T('выбрано: %d'), #state.sel))
-    ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, T('на расслоение') .. '###selharv') then
-      for _, p in ipairs(state.sel) do
-        local card = state.index.projects[p]
-        if card then set_status(card, 'на расслоение') end
-      end
-      logf('act', string.format(T('На расслоение: %d'), #state.sel))
-    end
-    if #state.sel >= 2 then
-      ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'merge') then merge_selected() end
-      ImGui.SameLine(ctx)
-      -- сабпроектами: исходники не трогаются, звук — прокси
-      if ImGui.Button(ctx, 'merge as subs') then merge_as_subprojects(nil) end
-      ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, T('subs → проект…')) then
-        local rv, fn = reaper.GetUserFileNameForRead('', 'Целевой проект', 'rpp')
-        if rv and fn and fn ~= '' then merge_as_subprojects(fn) end
-      end
-      ImGui.SameLine(ctx)
-      if ImGui.SmallButton(ctx, T('открыть') .. '###selopen') then
-        for _, p in ipairs(state.sel) do open_project(p) end
-      end
-      ImGui.SameLine(ctx)
-      if ImGui.SmallButton(ctx, T('закрепить') .. '###selpin') then pin_selected() end
-      ImGui.SameLine(ctx)
-      if ImGui.SmallButton(ctx, T('удалить…') .. '###seldel') then delete_selected() end
-    end
-    ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, T('сброс') .. '###selclr') then state.sel = {} end
-  end
-
-  -- корзина регионов (cmd+клик по региону в карточке)
-  if #state.basket > 0 then
-    ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xD9B96CFF,
-      string.format(T('регионов: %d'), #state.basket))
-    ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, T('собрать проект') .. '###bskgo') then basket_build() end
-    ImGui.SameLine(ctx)
-    if ImGui.SmallButton(ctx, T('сброс') .. '###bsk') then state.basket = {} end
-  end
-
-  ImGui.SameLine(ctx)
-  ImGui.TextDisabled(ctx, '|')
-  for i, label in ipairs(VIEW_CHIPS) do
-    ImGui.SameLine(ctx)
-    if view_tab(T(label) .. '###view' .. i, state.view == i - 1,
-        VIEW_COLORS[i] or 0x7BB8D9FF) then
-      state.view = i - 1
-      state.focus = 0
-      state.cal_scroll_end = 2
-    end
   end
 
   -- WIP-счётчик: >3 в активной работе — многовато, внимание расползается
@@ -3172,6 +3226,18 @@ local function draw_toolbar()
     end
   end
 
+  -- размер карточек: S иконки · M обычные · L всё развёрнуто
+  ImGui.SameLine(ctx)
+  ImGui.TextDisabled(ctx, '|')
+  for ci2, cs2 in ipairs(CARD_SIZES) do
+    ImGui.SameLine(ctx)
+    if chip(cs2.label .. '###csize' .. ci2, state.card_size == ci2,
+        0x7BB8D9FF) then
+      state.card_size = ci2
+      core.set_setting('card_size', tostring(ci2))
+    end
+  end
+
   ImGui.SameLine(ctx)
   ImGui.TextDisabled(ctx, '|')
   ImGui.SameLine(ctx)
@@ -3183,6 +3249,124 @@ local function draw_toolbar()
   local changed, val = ImGui.InputTextWithHint(ctx, '##tag',
     T('fzf: всё — имя, треки, регионы, отчёты… ( / )'), state.filter_text)
   if changed then state.filter_text = val end
+
+  -- блок выборки: порядок номеров = порядок склейки; при нескольких
+  -- выделенных — те же команды, что на карточке, но на всю выборку
+  if #state.sel > 0 then
+    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, 0xD9B96CFF, string.format(T('выбрано: %d'), #state.sel))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('на расслоение') .. '###selharv') then
+      for _, p in ipairs(state.sel) do
+        local card = state.index.projects[p]
+        if card then set_status(card, 'на расслоение') end
+      end
+      logf('act', string.format(T('На расслоение: %d'), #state.sel))
+    end
+    if #state.sel >= 2 then
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'merge') then merge_selected() end
+      ImGui.SameLine(ctx)
+      -- сабпроектами: исходники не трогаются, звук — прокси
+      if ImGui.Button(ctx, 'merge as subs') then merge_as_subprojects(nil) end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, T('subs → проект…')) then
+        local rv, fn = reaper.GetUserFileNameForRead('', 'Целевой проект', 'rpp')
+        if rv and fn and fn ~= '' then merge_as_subprojects(fn) end
+      end
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, T('открыть') .. '###selopen') then
+        for _, p in ipairs(state.sel) do open_project(p) end
+      end
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, T('закрепить') .. '###selpin') then pin_selected() end
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, T('удалить…') .. '###seldel') then delete_selected() end
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('сброс') .. '###selclr') then state.sel = {} end
+  end
+
+  -- корзина регионов (cmd+клик по региону в карточке)
+  if #state.basket > 0 then
+    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, 0xD9B96CFF,
+      string.format(T('регионов: %d'), #state.basket))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('собрать проект') .. '###bskgo') then basket_build() end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('сброс') .. '###bsk') then state.basket = {} end
+  end
+
+  ImGui.SameLine(ctx)
+  ImGui.TextDisabled(ctx, '|')
+  for i, label in ipairs(VIEW_CHIPS) do
+    ImGui.SameLine(ctx)
+    if view_tab(T(label) .. '###view' .. i, state.view == i - 1,
+        VIEW_COLORS[i] or 0x7BB8D9FF) then
+      state.view = i - 1
+      state.focus = 0
+      state.cal_scroll_end = 2
+    end
+  end
+
+  -- мини-плейлист выбранных: сешн-грид, как клипы в Ableton.
+  -- Клик по ячейке — играть параллельно; ▶▶ — цепочкой; ■ — стоп.
+  if #state.sel > 0 then
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '▶ ' .. T('все') .. '###playall') then
+      for _, p in ipairs(state.sel) do
+        local c = state.index.projects[p]
+        local a = c and find_preview_audio(c)
+        if a then preview_play(a, true) end
+      end
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '▶▶###playseq') then
+      local q = {}
+      for _, p in ipairs(state.sel) do
+        local c = state.index.projects[p]
+        local a = c and find_preview_audio(c)
+        if a then q[#q + 1] = a end
+      end
+      if #q > 0 then
+        preview_stop()
+        playlist = { queue = q, i = 1, started = false }
+      end
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, T('играть выбранные по очереди'))
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '■###selstop') then preview_stop() end
+
+    local cell_w, per_row = 150, math.max(1,
+      math.floor(ImGui.GetWindowWidth(ctx) / 158))
+    for si2, p in ipairs(state.sel) do
+      local c = state.index.projects[p]
+      if c then
+        if (si2 - 1) % per_row ~= 0 then ImGui.SameLine(ctx) end
+        local a = find_preview_audio(c)
+        local lit = a and is_playing(a)
+        if lit then
+          ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
+        end
+        if ImGui.BeginChild(ctx, '##pl' .. p, cell_w, 44,
+            ImGui.ChildFlags_Border,
+            ImGui.WindowFlags_NoScrollbar | ImGui.WindowFlags_NoScrollWithMouse) then
+          ImGui.Text(ctx, trunc(c.name, 14))
+          if a then
+            draw_wave_strip(c, ImGui.GetContentRegionAvail(ctx), 14, true)
+          else
+            ImGui.TextDisabled(ctx, T('нет превью'))
+          end
+          ImGui.EndChild(ctx)
+        end
+        if lit then ImGui.PopStyleColor(ctx) end
+      end
+    end
+  end
+
 
   -- все теги (из списка + встретившиеся в проектах) чипами справа от поиска:
   -- клик — фильтр (AND по нескольким), повторный клик — снять
@@ -3566,10 +3750,15 @@ local function draw_console_bottom()
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, '■###bstop') then state.batch = nil end
   end
-  if playing.audio then
+  local nplay = 0
+  for _ in pairs(players) do nplay = nplay + 1 end
+  if nplay > 0 then
     ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xD9B96CFF,
-      '♪ ' .. (playing.audio:match('([^/\\]+)$') or ''))
+    ImGui.TextColored(ctx, 0xD9B96CFF, '♪ ' .. nplay ..
+      (playlist and (' · ' .. T('цепочка') .. ' ' .. playlist.i .. '/'
+        .. #playlist.queue) or ''))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '■###pstopall') then preview_stop() end
   end
 
   local input_h = ImGui.GetFrameHeightWithSpacing(ctx)
@@ -3631,8 +3820,9 @@ local function loop()
       end
       handle_keys(cards, cols)
       ImGui.EndChild(ctx)
-      batch_step()  -- очередь «превью всем»: один проект за кадр
-      rescan_step() -- фоновый рескан: порция карточек за кадр
+      batch_step()   -- очередь «превью всем»: один проект за кадр
+      rescan_step()  -- фоновый рескан: порция карточек за кадр
+      players_step() -- очистка доигравших превью + шаг плейлиста
     end
 
     draw_console_bottom()

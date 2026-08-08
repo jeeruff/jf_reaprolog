@@ -1360,11 +1360,47 @@ end
 -- Настройки (глобальный extstate, переживает рестарт Reaper)
 -- ===========================================================================
 
+-- Настройки живут в ДВУХ местах: extstate (как раньше) и JSON-файл рядом
+-- со скриптом. Файл пишется немедленно и приоритетен при чтении: extstate
+-- сбрасывается в reaper.ini только при выходе REAPER, и крэш/вторая копия
+-- скрипта теряли пути. Файл эту потерю исключает.
+M.SETTINGS_FILENAME = 'jf_pm_settings.json'
+
+local settings_cache
+local function settings_path()
+  return M.script_dir() .. '/' .. M.SETTINGS_FILENAME
+end
+
+local function load_settings_file()
+  if settings_cache then return settings_cache end
+  local f = io.open(settings_path(), 'rb')
+  if f then
+    local data = M.json_decode(f:read('*a'))
+    f:close()
+    settings_cache = type(data) == 'table' and data or {}
+  else
+    settings_cache = {}
+  end
+  return settings_cache
+end
+
+local function save_settings_file()
+  local f = io.open(settings_path(), 'wb')
+  if not f then return end
+  f:write(M.json_encode(settings_cache or {}))
+  f:close()
+end
+
 function M.get_setting(key)
+  local s = load_settings_file()
+  if s[key] ~= nil then return s[key] end
   return reaper.GetExtState(M.EXT_SECTION, key)
 end
 
 function M.set_setting(key, val)
+  local s = load_settings_file()
+  s[key] = val
+  save_settings_file()
   reaper.SetExtState(M.EXT_SECTION, key, val, true)
 end
 
