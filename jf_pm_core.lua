@@ -808,9 +808,10 @@ function M.build_card(path, old_card, dir_sizes, dir_audio)
   card.thumb_user = old_card and old_card.thumb_user or nil
   card.needs_report = old_card and old_card.needs_report or false
   if old_card then
-    -- index-only поля: закреп, теги из браузера, статус из канбана
+    -- index-only поля: закреп, теги из браузера, статус из канбана, лупы
     card.pinned = old_card.pinned
     card.tags_extra = old_card.tags_extra
+    card.loops = old_card.loops
     if old_card.status_over
        and (old_card.status_over_base or '') == (card.ext.STATUS or '') then
       card.status_over = old_card.status_over
@@ -854,6 +855,7 @@ function M.build_foreign_card(path, ext, old_card, dir_sizes)
     card.thumb_user = old_card.thumb_user
     card.status_over = old_card.status_over
     card.status_over_base = old_card.status_over_base
+    card.loops = old_card.loops
   end
   return card
 end
