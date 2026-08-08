@@ -262,9 +262,9 @@ local STATUS_ORDER = {}
 for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 
 local SORT_CHIPS = { 'дата', 'открыт', 'сохранён', 'статус', 'длительность',
-                     'имя', 'размер', 'bpm' }
+                     'имя', 'размер', 'bpm', 'daw' }
 -- естественное направление: true = по убыванию (новое/большое сверху)
-local SORT_DESC_NATURAL = { true, true, true, false, true, false, true, false }
+local SORT_DESC_NATURAL = { true, true, true, false, true, false, true, false, false }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
 -- лейблы выпадашки классов: «—» + core.STATUSES (исключение из правила
@@ -554,6 +554,11 @@ local function collect_cards()
     elseif m == 8 then
       local ba, bb = core.card_bpm(a.card), core.card_bpm(b.card)
       if ba ~= bb and ba and bb then return ba < bb end
+    elseif m == 9 then
+      -- по DAW: REAPER первым (пустой ключ), дальше алфавит; внутри — дата
+      local da = a.card.daw or ''
+      local db = b.card.daw or ''
+      if da ~= db then return da < db end
     end
     if (a.card.mtime or 0) ~= (b.card.mtime or 0) then
       return (a.card.mtime or 0) > (b.card.mtime or 0)
@@ -1798,12 +1803,31 @@ local function get_image(path)
   return img or nil
 end
 
+-- Плашка DAW поверх тамбнейла: цветной прямоугольник с меткой программы
+local function draw_daw_overlay(card, x0, y0, size)
+  if not card.daw then return end
+  local dt = core.DAW_TYPES[card.daw_ext] or {}
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local label = dt.label or '?'
+  local pad = 3
+  local tw = ImGui.CalcTextSize(ctx, label)
+  local bx0, by1 = x0 + 2, y0 + size - 2
+  local by0 = by1 - ImGui.GetTextLineHeight(ctx) - pad
+  ImGui.DrawList_AddRectFilled(dl, bx0, by0, bx0 + tw + pad * 2, by1,
+    dt.color or 0x8A8F93FF, 3)
+  ImGui.DrawList_AddText(dl, bx0 + pad, by0 + pad / 2, 0x111213FF, label)
+  ImGui.DrawList_AddRect(dl, x0, y0, x0 + size, y0 + size,
+    dt.color or 0x8A8F93FF, 4, 0, 1.5)
+end
+
 local function draw_thumb(card, size)
   -- превью: назначенное вручную → <имя проекта>.png / jf_thumb.png в папке
   local img = card.thumb_user and get_image(card.thumb_user) or nil
   if not img and card.thumb_file then img = get_image(card.thumb_file) end
   if img then
+    local ix, iy = ImGui.GetCursorScreenPos(ctx)
     ImGui.Image(ctx, img, size, size)
+    draw_daw_overlay(card, ix, iy, size)
     return
   end
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
@@ -1860,6 +1884,7 @@ local function draw_thumb(card, size)
       end
     end
   end
+  draw_daw_overlay(card, x0, y0, size)
   ImGui.Dummy(ctx, size, size)
 end
 
@@ -2352,16 +2377,18 @@ local function draw_card(entry, i, card_w)
     draw_thumb(card, cs.thumb)
     ImGui.SameLine(ctx)
     ImGui.BeginGroup(ctx)
-    ImGui.Text(ctx, trunc(card.name, cs.name))
     if card.daw then
-      -- цветной бейдж DAW: видно, чей проект, не вглядываясь
+      -- цветной бейдж DAW перед именем: после длинного имени он бы уехал
       local dt = core.DAW_TYPES[card.daw_ext] or {}
-      ImGui.SameLine(ctx)
       ImGui.TextColored(ctx, dt.color or 0x9A9A9AFF, '[' .. (dt.label or '?') .. ']')
       if state.btn_tips and ImGui.IsItemHovered(ctx) then
         ImGui.SetTooltip(ctx, (dt.daw or '') .. ' · ' ..
           T('двойной клик — открыть в этой программе'))
       end
+      ImGui.SameLine(ctx)
+      ImGui.Text(ctx, trunc(card.name, cs.name - 4))
+    else
+      ImGui.Text(ctx, trunc(card.name, cs.name))
     end
     if core.is_empty_project(card) then
       -- пустышка: ни одного айтема или ни одного аудиофайла в папке
