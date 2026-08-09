@@ -10,8 +10,9 @@
 -- Shift+D — удалить в Корзину, m — merge выборки, / — в поле fzf,
 -- g/G — в начало/конец, Esc — свернуть → сброс выборки → фокус → закрыть окно.
 -- Канбан: Shift+H/L — перенести карточку в соседний статус, drag&drop мышью.
--- Cmd/Ctrl+Z — отменить последнее обратимое действие (класс, теги, закреп);
--- журнал действий — консоль в правом верхнем углу.
+-- Cmd/Ctrl+Z — отмена; f — vim-хинты (буквы — фокус, Shift+метка — выделить
+-- и остаться, Esc — выход); Ctrl/Cmd+1..5 — лупы активного превью.
+-- Консоль — внизу окна: журнал, прогрессы, мини-bash команды.
 
 local VERSION = '1.0'
 
@@ -126,6 +127,7 @@ local EN = {
   ['консоль'] = 'console',
   ['цепочка'] = 'chain',
   ['найти превью'] = 'find previews',
+  ['нет такого лупа'] = 'no such loop', ['лупов: %d'] = 'loops: %d',
   ['обновить превью выделенных; нет файла — Spotlight по всему диску'] =
     'refresh previews of selected; if missing — Spotlight search disk-wide',
   ['Поиск превью: найдено %d из %d'] = 'Preview search: found %d of %d',
@@ -2679,6 +2681,16 @@ local function draw_card(entry, i, card_w)
       focused and 0xE8E8E8FF or 0xD9B96CFF)
   end
   if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags, win_flags) then
+    -- vim-хинт (режим f): жёлтая плашка с буквами в углу
+    if state.hints and state.hints.labels[i] then
+      local hx, hy = ImGui.GetCursorScreenPos(ctx)
+      local hdl = ImGui.GetWindowDrawList(ctx)
+      local lbl = state.hints.labels[i]
+      local tw = ImGui.CalcTextSize(ctx, lbl)
+      ImGui.DrawList_AddRectFilled(hdl, hx - 4, hy - 4,
+        hx + tw + 6, hy + 15, 0xE8D44DFF, 3)
+      ImGui.DrawList_AddText(hdl, hx + 1, hy - 3, 0x111213FF, lbl)
+    end
     if cs.mini then
       -- S: клип — тамбнейл слева, имя и волна справа, кнопки снизу
       draw_thumb(card, cs.thumb)
@@ -2869,6 +2881,7 @@ local function draw_grid(cards)
   -- Раскрытая карточка или режим L ломают равновысотность — тогда
   -- честный полный проход (редкий случай).
   if state.expanded or cs.full then
+    state.vis_first, state.vis_last = 1, #cards
     for i, entry in ipairs(cards) do
       if (i - 1) % cols ~= 0 then ImGui.SameLine(ctx) end
       draw_card(entry, i, card_w)
@@ -2894,6 +2907,8 @@ local function draw_grid(cards)
   local first_row = math.max(0, math.floor(scroll / row_h) - 1)
   local last_row = math.min(total_rows - 1,
     math.ceil((scroll + vis_h) / row_h) + 1)
+  state.vis_first = first_row * cols + 1
+  state.vis_last = math.min(#cards, (last_row + 1) * cols)
 
   if first_row > 0 then
     ImGui.Dummy(ctx, 1, first_row * row_h - spacing_y)
@@ -3703,8 +3718,14 @@ local function draw_toolbar()
       ImGui.SameLine(ctx)
       if ImGui.Button(ctx, 'merge') then merge_selected() end
       ImGui.SameLine(ctx)
-      -- сабпроектами: исходники не трогаются, звук — прокси
-      if ImGui.Button(ctx, 'merge as subs') then merge_as_subprojects(nil) end
+      -- сабпроектами: исходники не трогаются — ГЛАВНАЯ функция, ярче
+      ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0xD9B96CFF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, 0xE8CD8AFF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, 0xC9A95CFF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x111213FF)
+      local msub = ImGui.Button(ctx, '⧉ merge as subs')
+      ImGui.PopStyleColor(ctx, 4)
+      if msub then merge_as_subprojects(nil) end
       ImGui.SameLine(ctx)
       if ImGui.Button(ctx, T('subs → проект…')) then
         local rv, fn = reaper.GetUserFileNameForRead('', 'Целевой проект', 'rpp')
@@ -3848,11 +3869,80 @@ end
 -- ---------------------------------------------------------------------------
 -- Vim-навигация
 
+-- Хинты (как Surfingkeys): f — метки на видимых карточках; буквы — прыжок
+-- фокуса; Shift+метка — выделить и остаться в режиме (карточка попадает
+-- в стек плееров), Esc — выход.
+local HINT_KEYS = 'asdfghjkl'
+local function hints_start(cards)
+  local first = state.vis_first or 1
+  local last = math.min(state.vis_last or #cards, #cards)
+  local n = last - first + 1
+  if n <= 0 then return end
+  local labels = {}
+  local K = #HINT_KEYS
+  for idx = 0, n - 1 do
+    local i = first + idx
+    if n <= K then
+      labels[i] = HINT_KEYS:sub(idx + 1, idx + 1)
+    else
+      local a = math.floor(idx / K) + 1
+      local b2 = (idx % K) + 1
+      labels[i] = HINT_KEYS:sub(a, a) .. HINT_KEYS:sub(b2, b2)
+    end
+  end
+  state.hints = { labels = labels, buf = '' }
+end
+
+local function hints_input(cards)
+  local h = state.hints
+  if not h then return false end
+  if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
+    state.hints = nil
+    return true
+  end
+  local shift = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
+  for k = 1, #HINT_KEYS do
+    local ch = HINT_KEYS:sub(k, k)
+    -- Key_A..Key_Z в ImGui идут подряд
+    local keycode = ImGui.Key_A + (ch:byte() - string.byte('a'))
+    if ImGui.IsKeyPressed(ctx, keycode) then
+      h.buf = h.buf .. ch
+      -- полное совпадение?
+      local hit
+      for i, lbl in pairs(h.labels) do
+        if lbl == h.buf then hit = i break end
+      end
+      if hit then
+        if shift then
+          -- выделить и остаться: собираем несколько в стек плееров
+          toggle_select(cards[hit].card.path)
+          state.focus = hit
+          h.buf = ''
+        else
+          state.focus = hit
+          state.scroll_to_focus = true
+          state.hints = nil
+        end
+        return true
+      end
+      -- нет метки с таким префиксом — сброс набора
+      local prefix = false
+      for _, lbl in pairs(h.labels) do
+        if lbl:sub(1, #h.buf) == h.buf then prefix = true break end
+      end
+      if not prefix then h.buf = '' end
+      return true
+    end
+  end
+  return true -- в хинт-режиме остальные клавиши глотаем
+end
+
 local function handle_keys(cards, cols)
   if ImGui.IsAnyItemActive(ctx) then return end -- набор текста в поле
   if not ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows) then
     return
   end
+  if hints_input(cards) then return end
   local shift = ImGui.GetKeyMods(ctx) & ImGui.Mod_Shift ~= 0
   local entry
 
@@ -3953,6 +4043,31 @@ local function handle_keys(cards, cols)
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Slash) then
     state.focus_tag_input = true
   end
+  if state.view == 0 and ImGui.IsKeyPressed(ctx, ImGui.Key_F) then
+    hints_start(cards)
+  end
+  -- Ctrl/Cmd+1..5: играть луп N активного превью (фокус или первый выбранный)
+  local cmods = ImGui.GetKeyMods(ctx)
+  if cmods & ImGui.Mod_Ctrl ~= 0 or cmods & ImGui.Mod_Super ~= 0 then
+    local target = entry and entry.card
+      or (state.sel[1] and state.index.projects[state.sel[1]])
+    if target and target.loops then
+      for n = 1, 5 do
+        if ImGui.IsKeyPressed(ctx, ImGui.Key_1 + n - 1) then
+          local lp = target.loops[n]
+          local audio = lp and find_preview_audio(target)
+          if lp and audio then
+            preview_play(audio, false)
+            if players[audio] then
+              reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', lp.a)
+              loop_bounds[audio] = { a = lp.a, b = lp.b }
+              logf('act', string.format('⟲%d %s', n, target.name))
+            end
+          end
+        end
+      end
+    end
+  end
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
     -- каскад: инпут → карточка → выборка → фокус → закрыть окно
     if state.tag_add_path or state.dl_path or state.ren_path then
@@ -4013,7 +4128,8 @@ CMDS = {
     con_out('ls [n] · grep <pat> · fzf <text> · sel <pat>|clear · count')
     con_out('open <pat> · class <класс|-> · tag <имя|-имя> · dl <дд.мм|->')
     con_out('pin · unpin · render · demo · daw <ab|fl|rp|…> · sort <режим>')
-    con_out('rescan · undo · всё сцепляется через &&')
+    con_out('play [pat] · stop · seq · loop <n> · loops · goto <pat>')
+    con_out('view <вид> · size s|m|l · findprev · rescan · undo · чейн: &&')
   end,
   ls = function(args)
     local n = tonumber(args) or 10
@@ -4145,6 +4261,86 @@ CMDS = {
   end,
   rescan = function() rescan() end,
   undo = function() do_undo() end,
+  play = function(args)
+    local hits = args ~= '' and con_match(args, false) or nil
+    local c = hits and hits[1] and hits[1].card
+      or (state.sel[1] and state.index.projects[state.sel[1]])
+    if not c then con_out(T('не найдено')) return end
+    local a = find_preview_audio(c)
+    if not a then con_out(T('нет превью')) return end
+    preview_play(a, false)
+    con_out('♪ ' .. c.name)
+  end,
+  stop = function() preview_stop() end,
+  seq = function()
+    local q = {}
+    for _, p in ipairs(state.sel) do
+      local c = state.index.projects[p]
+      local a = c and find_preview_audio(c)
+      if a then q[#q + 1] = a end
+    end
+    if #q == 0 then con_out(T('выборка пуста (sel <pat>)')) return end
+    preview_stop()
+    playlist = { queue = q, i = 1, started = false }
+    con_out('▶▶ ' .. #q)
+  end,
+  loop = function(args)
+    local n = tonumber(args) or 1
+    local c = state.sel[1] and state.index.projects[state.sel[1]]
+    if not c and state.focus > 0 then
+      local cards = collect_cards()
+      c = cards[state.focus] and cards[state.focus].card
+    end
+    local lp = c and c.loops and c.loops[n]
+    local a = c and find_preview_audio(c)
+    if not (lp and a) then con_out(T('нет такого лупа')) return end
+    preview_play(a, false)
+    if players[a] then
+      reaper.CF_Preview_SetValue(players[a], 'D_POSITION', lp.a)
+      loop_bounds[a] = { a = lp.a, b = lp.b }
+    end
+    con_out('⟲' .. n .. ' ' .. c.name)
+  end,
+  loops = function()
+    local c = state.sel[1] and state.index.projects[state.sel[1]]
+    if not c then con_out(T('выборка пуста (sel <pat>)')) return end
+    for li, lp in ipairs(c.loops or {}) do
+      con_out('⟲%d %s–%s', li, fmt_duration(lp.a), fmt_duration(lp.b))
+    end
+    con_out(T('лупов: %d'), #(c.loops or {}))
+  end,
+  view = function(args)
+    local map = { grid = 0, timeline = 1, calendar = 2, kanban = 3,
+      ['сетка'] = 0, ['таймлайн'] = 1, ['календарь'] = 2, ['канбан'] = 3 }
+    local v = map[args]
+    if v then state.view = v con_out('view: ' .. args)
+    else con_out('view: grid|timeline|calendar|kanban') end
+  end,
+  size = function(args)
+    local map = { s = 1, m = 2, l = 3 }
+    local v = map[args:lower()]
+    if v then
+      state.card_size = v
+      core.set_setting('card_size', tostring(v))
+      con_out('size: ' .. args:upper())
+    else
+      con_out('size: s|m|l')
+    end
+  end,
+  ['goto'] = function(args)
+    local hits = con_match(args, false)
+    if #hits == 0 then con_out(T('не найдено')) return end
+    local cards = collect_cards()
+    for i, e in ipairs(cards) do
+      if e.card.path == hits[1].card.path then
+        state.focus = i
+        state.scroll_to_focus = true
+        con_out('→ ' .. e.card.name)
+        return
+      end
+    end
+  end,
+  findprev = function() findprev_start() end,
 }
 
 local function run_console(line)

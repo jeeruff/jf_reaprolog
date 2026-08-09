@@ -124,7 +124,8 @@
 переживают крэш REAPER; под полем видно каждую папку с ✓/✗.</td></tr>
   <tr><td><b>галерея</b></td><td>Экспорт текущего вида в HTML. Открывает браузер.</td></tr>
   <tr><td><b>merge</b></td><td>Соединяет выбранные проекты. Виден при выборе от двух.</td></tr>
-  <tr><td><b>merge as subs</b></td><td>Новый проект: выбранные — сабпроектами,
+  <tr><td><b>⧉ merge as subs</b> (янтарная)</td>
+      <td>Главная кнопка: новый проект, выбранные — сабпроектами,
       трек на проект, последовательно. Исходники не изменяются.</td></tr>
   <tr><td><b>subs → проект…</b></td><td>То же, но в конец выбранного по промпту проекта.</td></tr>
   <tr><td>бейдж «регионов: N»</td><td>Корзина регионов. «Собрать проект» —
@@ -168,9 +169,17 @@
   <tr><td><code>pin</code> / <code>unpin</code></td><td>Закрепить/открепить выборку.</td></tr>
   <tr><td><code>render</code> / <code>demo</code></td><td>Превью-батч / полное демо выборке.</td></tr>
   <tr><td><code>daw &lt;ab|fl|rp|…&gt;</code></td><td>Фильтр по DAW.</td></tr>
-  <tr><td><code>sort</code>, <code>count</code>, <code>clear</code>,
+  <tr><td><code>play [pat]</code> / <code>stop</code> /
+      <code>seq</code></td>
+      <td>Играть проект / стоп / выбранные по очереди.</td></tr>
+  <tr><td><code>loop &lt;n&gt;</code> / <code>loops</code></td>
+      <td>Играть луп N по кругу / список лупов.</td></tr>
+  <tr><td><code>goto &lt;pat&gt;</code></td><td>Фокус на проект.</td></tr>
+  <tr><td><code>view</code>, <code>size</code>, <code>findprev</code>,
+      <code>sort</code>, <code>count</code>, <code>clear</code>,
       <code>rescan</code>, <code>undo</code></td>
-      <td>Сортировка, счёт, сброс, рескан, отмена.</td></tr>
+      <td>Вид, размер, поиск превью, сортировка, счёт, сброс, рескан,
+      отмена.</td></tr>
 </table>
 <p>Пример: <code>fzf флейта &amp;&amp; sel . &amp;&amp; class луп &amp;&amp;
 dl 15.09</code> — найти, выбрать, поставить класс и дедлайн.</p>
@@ -188,6 +197,11 @@ dl 15.09</code> — найти, выбрать, поставить класс и
   <tr><td><kbd>x</kbd></td><td>Взять в выборку / убрать из выборки.</td></tr>
   <tr><td><kbd>p</kbd></td><td>Закрепить / открепить.</td></tr>
   <tr><td><kbd>Cmd</kbd>+<kbd>Z</kbd></td><td>Отменить последнее действие.</td></tr>
+  <tr><td><kbd>f</kbd></td><td>Vim-хинты на видимых карточках
+      (как Surfingkeys): буквы — фокус; <kbd>Shift</kbd>+метка —
+      выделить и остаться в режиме; <kbd>Esc</kbd> — выход.</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>1…5</kbd></td>
+      <td>Играть луп N активного превью по кругу.</td></tr>
   <tr><td><kbd>m</kbd></td><td>Merge выборки. Работает при выборе от двух.</td></tr>
   <tr><td><kbd>Shift</kbd>+<kbd>D</kbd></td><td>Удалить в Корзину. С подтверждением.</td></tr>
   <tr><td><kbd>Shift</kbd>+<kbd>H</kbd> / <kbd>L</kbd></td>
