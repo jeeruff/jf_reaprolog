@@ -126,6 +126,7 @@ local EN = {
   ['консоль'] = 'console',
   ['цепочка'] = 'chain',
   ['плеер: '] = 'player: ', ['луп'] = 'loop',
+  ['снэп'] = 'snap', [' (нет bpm)'] = ' (no bpm)',
   ['луп %s: %s–%s'] = 'loop %s: %s–%s',
   ['собрать из лупов'] = 'build from loops',
   ['у выбранных нет лупов (плеер → драг по волне → + луп)'] =
@@ -240,6 +241,7 @@ local state = {
   peak_style = tonumber(core.get_setting('peak_style')) or 0,   -- 0 волна / 1 спектр
   btn_tips = core.get_setting('btn_tips') ~= '0',               -- подсказки кнопок
   preview_vol = tonumber(core.get_setting('preview_vol')) or 1.0,
+  loop_snap = core.get_setting('loop_snap') ~= '0', -- снэп лупов к битам
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
   filter_daw = nil,         -- nil все | 'reaper' | 'ableton' | …
@@ -1717,6 +1719,9 @@ local function render_audio(card, kind)
   -- REAPER часто видит конец проекта сильно дальше звука (огибающие,
   -- маркеры) — отрезаем цифровую тишину в хвосте, оставляя секунду
   local trimmed, lead_cut, tail_cut = core.trim_wav_silence(pv_path, 0.5, 1.0)
+  -- сэмпл-точная привязка лупов: сколько срезано с начала — на столько
+  -- время превью отстаёт от времени проекта
+  card.pv_offset = trimmed and lead_cut or 0
   if trimmed then
     bounds_note = bounds_note .. string.format(T(' · тишина −%d c'),
       math.floor(lead_cut + tail_cut + 0.5))
@@ -3175,16 +3180,30 @@ local function draw_big_player(entry)
   if not w then return end
 
   local H = 64
+  -- битовая сетка проекта в координатах превью: узел k*beat − pv_offset
+  local bpm = core.card_bpm(card)
+  local beat = bpm and 60 / bpm or nil
+  local off = card.pv_offset or 0
+  local function snap_time(t)
+    if not (state.loop_snap and beat) then return t end
+    local k = math.floor((t + off) / beat + 0.5)
+    return math.min(math.max(k * beat - off, 0), w.len)
+  end
+
   ImGui.TextDisabled(ctx, T('плеер: ') .. card.name)
+  ImGui.SameLine(ctx)
+  if chip(T('снэп') .. (beat and '' or ' (нет bpm)') .. '###lsnap',
+      state.loop_snap and beat ~= nil, 0x7BB8D9FF) then
+    state.loop_snap = not state.loop_snap
+    core.set_setting('loop_snap', state.loop_snap and '1' or '0')
+  end
   local sel = bigsel[card.path]
   ImGui.SameLine(ctx)
   if sel then
     if ImGui.SmallButton(ctx, '+ ' .. T('луп') .. '###addloop') then
       card.loops = card.loops or {}
-      card.loops[#card.loops + 1] = {
-        a = math.floor(sel.a * w.len * 10 + 0.5) / 10,
-        b = math.floor(sel.b * w.len * 10 + 0.5) / 10,
-      }
+      card.loops[#card.loops + 1] =
+        { a = sel.a * w.len, b = sel.b * w.len }
       table.sort(card.loops, function(x, y) return x.a < y.a end)
       core.save_index(state.index)
       logf('act', string.format(T('луп %s: %s–%s'), card.name,
@@ -3212,6 +3231,23 @@ local function draw_big_player(entry)
     ImGui.DrawList_AddRectFilled(dl, x, mid - hi,
       x + math.max(step - 1, 1), mid + lo + 1, col)
   end
+  -- битовая сетка: доли тускло, такты (по размеру проекта) ярче
+  if state.loop_snap and beat and w.len > 0 then
+    local tsig = card.timesig_num or 4
+    local k0 = math.ceil(off / beat)
+    local k = k0
+    while true do
+      local t = k * beat - off
+      if t > w.len then break end
+      local gx = x0 + t / w.len * width
+      local is_bar = (k % tsig) == 0
+      ImGui.DrawList_AddLine(dl, gx, y0, gx, y0 + H,
+        is_bar and 0xFFFFFF2E or 0xFFFFFF14, 1)
+      k = k + 1
+      if k - k0 > 2000 then break end
+    end
+  end
+
   -- сохранённые лупы — янтарные скобки
   for li, lp in ipairs(card.loops or {}) do
     local lx0 = x0 + math.min(lp.a / w.len, 1) * width
@@ -3245,10 +3281,10 @@ local function draw_big_player(entry)
   if bigdrag and bigdrag.path == card.path and ImGui.IsItemActive(ctx) then
     if math.abs(frac - bigdrag.start) > 0.005 then
       bigdrag.moved = true
-      bigsel[card.path] = {
-        a = math.min(bigdrag.start, frac),
-        b = math.max(bigdrag.start, frac),
-      }
+      local ta = snap_time(math.min(bigdrag.start, frac) * w.len)
+      local tb = snap_time(math.max(bigdrag.start, frac) * w.len)
+      if tb - ta < 0.01 and beat then tb = math.min(ta + beat, w.len) end
+      bigsel[card.path] = { a = ta / w.len, b = tb / w.len }
     end
   end
   if bigdrag and bigdrag.path == card.path
@@ -3517,10 +3553,11 @@ local function draw_toolbar()
       for _, p in ipairs(state.sel) do
         local c = state.index.projects[p]
         if c and not c.daw then
+          local off = c.pv_offset or 0
           for li, lp in ipairs(c.loops or {}) do
             state.basket[#state.basket + 1] = {
               path = p,
-              region = { pos = lp.a, fin = lp.b,
+              region = { pos = lp.a + off, fin = lp.b + off,
                 name = c.name .. ' loop' .. li },
             }
           end
