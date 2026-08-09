@@ -128,6 +128,8 @@ local EN = {
   ['цепочка'] = 'chain',
   ['найти превью'] = 'find previews',
   ['нет такого лупа'] = 'no such loop', ['лупов: %d'] = 'loops: %d',
+  ['повтор'] = 'repeat', ['в проект'] = 'to project',
+  ['в плейлисте нечего экспортировать'] = 'nothing to export in playlist',
   ['обновить превью выделенных; нет файла — Spotlight по всему диску'] =
     'refresh previews of selected; if missing — Spotlight search disk-wide',
   ['Поиск превью: найдено %d из %d'] = 'Preview search: found %d of %d',
@@ -304,12 +306,14 @@ local function class_labels()
 end
 
 -- размеры карточек в сетке: ширина, высота, тамбнейл, макс. символов имени
--- размеры: S — горизонтальный клип (иконка слева, имя+волна справа,
--- кнопки снизу), M — обычная, L — всё развёрнуто сразу
+-- размеры: S — микро-строка (логотип+волна, play по ховеру логотипа),
+-- M — горизонтальный клип, L — обычная карточка.
+-- Режима «все развёрнуты» больше нет: 2000 развёрнутых карточек без
+-- виртуализации подвесили REAPER.
 local CARD_SIZES = {
-  { label = 'S', w = 280, h = 96, thumb = 56, name = 18, mini = true },
-  { label = 'M', w = 360, h = 198, thumb = 64, name = 20 },
-  { label = 'L', w = 400, h = 0, thumb = 64, name = 24, full = true },
+  { label = 'S', w = 240, h = 32, thumb = 22, name = 16, micro = true },
+  { label = 'M', w = 280, h = 96, thumb = 56, name = 18, mini = true },
+  { label = 'L', w = 360, h = 198, thumb = 64, name = 20 },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -1577,17 +1581,36 @@ local function players_step()
   end
   if playlist then
     local cur = playlist.queue[playlist.i]
-    if not cur then
-      playlist = nil
-    elseif not players[cur] then
-      if not playlist.started then
-        playlist.started = true
-        preview_play(cur, false)
-      elseif playlist.i < #playlist.queue then
+    local function start(el)
+      preview_play(el.audio, true) -- поверх параллельных лупов
+      if players[el.audio] and el.a then
+        reaper.CF_Preview_SetValue(players[el.audio], 'D_POSITION', el.a)
+      end
+    end
+    local function advance()
+      if playlist.i < #playlist.queue then
         playlist.i = playlist.i + 1
-        preview_play(playlist.queue[playlist.i], false)
+        start(playlist.queue[playlist.i])
+      elseif playlist.rep then
+        playlist.i = 1
+        start(playlist.queue[1])
       else
         playlist = nil
+      end
+    end
+    if not cur then
+      playlist = nil
+    elseif not playlist.started then
+      playlist.started = true
+      start(cur)
+    elseif not players[cur.audio] then
+      advance() -- элемент доиграл до конца файла
+    elseif cur.b then
+      local ok, pos = reaper.CF_Preview_GetValue(players[cur.audio],
+        'D_POSITION')
+      if ok and pos >= cur.b then
+        preview_stop(cur.audio)
+        advance()
       end
     end
   end
@@ -1644,7 +1667,8 @@ local function draw_wave_strip(card, width, height, multi)
   if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) then
     local mx = ImGui.GetMousePos(ctx)
     local frac = math.min(math.max((mx - x0) / width, 0), 1)
-    if not is_playing(audio) then preview_play(audio, multi) end
+    -- параллельно всегда: чужой луп в большом плеере не гасится
+    if not is_playing(audio) then preview_play(audio, true) end
     if players[audio] and w and w.len > 0 then
       reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', frac * w.len)
     end
@@ -2658,8 +2682,7 @@ end
 local function draw_card(entry, i, card_w)
   local card, meta = entry.card, entry.meta
   local cs = CARD_SIZES[state.card_size]
-  -- L: вся информация каждой карточки развёрнута сразу
-  local expanded = cs.full or state.expanded == card.path
+  local expanded = state.expanded == card.path
   local focused = state.focus == i
   local si = sel_index(card.path)
   local inner_click = false  -- клик по виджету внутри — не менять фокус
@@ -2691,8 +2714,34 @@ local function draw_card(entry, i, card_w)
         hx + tw + 6, hy + 15, 0xE8D44DFF, 3)
       ImGui.DrawList_AddText(hdl, hx + 1, hy - 3, 0x111213FF, lbl)
     end
+    if cs.micro then
+      -- S: микро-логотип слева + волна; ховер по логотипу — play/stop
+      local lx, ly = ImGui.GetCursorScreenPos(ctx)
+      draw_thumb(card, cs.thumb)
+      local over_logo = ImGui.IsItemHovered(ctx)
+      local audio = find_preview_audio(card)
+      if over_logo then
+        local pdl = ImGui.GetWindowDrawList(ctx)
+        ImGui.DrawList_AddRectFilled(pdl, lx, ly,
+          lx + cs.thumb, ly + cs.thumb, 0x000000AA, 3)
+        ImGui.DrawList_AddText(pdl, lx + 6, ly + 3, 0xFFFFFFFF,
+          (audio and is_playing(audio)) and '■' or '▶')
+        ImGui.SetTooltip(ctx, card.name)
+        if ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) then
+          if audio then preview_toggle(audio, true) end
+          inner_click = true
+        end
+      end
+      ImGui.SameLine(ctx)
+      if draw_wave_strip(card, ImGui.GetContentRegionAvail(ctx),
+          cs.thumb, true) then
+        inner_click = true
+      end
+      ImGui.EndChild(ctx)
+      goto card_done
+    end
     if cs.mini then
-      -- S: клип — тамбнейл слева, имя и волна справа, кнопки снизу
+      -- M: клип — тамбнейл слева, имя и волна справа, кнопки снизу
       draw_thumb(card, cs.thumb)
       ImGui.SameLine(ctx)
       ImGui.BeginGroup(ctx)
@@ -2880,7 +2929,8 @@ local function draw_grid(cards)
   -- Виртуализация: на 2000 карточках рисуем только видимые строки.
   -- Раскрытая карточка или режим L ломают равновысотность — тогда
   -- честный полный проход (редкий случай).
-  if state.expanded or cs.full then
+  if state.expanded then
+    -- одна раскрытая ломает равновысотность — честный полный проход
     state.vis_first, state.vis_last = 1, #cards
     for i, entry in ipairs(cards) do
       if (i - 1) % cols ~= 0 then ImGui.SameLine(ctx) end
@@ -3528,7 +3578,7 @@ local function draw_big_player(entry)
       -- клик без драга: играть с этого места (сброс выделения)
       bigsel[card.path] = nil
       loop_bounds[audio] = nil
-      if not is_playing(audio) then preview_play(audio, false) end
+      if not is_playing(audio) then preview_play(audio, true) end
       if players[audio] and w.len > 0 then
         reaper.CF_Preview_SetValue(players[audio], 'D_POSITION',
           frac * w.len)
@@ -3543,7 +3593,7 @@ local function draw_big_player(entry)
       if li > 1 then ImGui.SameLine(ctx) end
       if ImGui.SmallButton(ctx, string.format('▶%d %s–%s###lp%d', li,
           fmt_duration(lp.a), fmt_duration(lp.b), li)) then
-        preview_play(audio, false)
+        preview_play(audio, true)
         if players[audio] then
           reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', lp.a)
           loop_bounds[audio] = { a = lp.a, b = lp.b }
@@ -3559,6 +3609,95 @@ local function draw_big_player(entry)
     end
   end
   ImGui.Separator(ctx)
+end
+
+-- Плейлист выбранных: слева от стека плееров, в стиле region manager.
+-- Элементы — превью и все лупы каждого выбранного, по порядку выборки;
+-- ▶ — последовательно (поверх параллельных лупов), повтор — по кругу.
+local function build_playq()
+  local q = {}
+  for _, p in ipairs(state.sel) do
+    local c = state.index.projects[p]
+    if c then
+      local a = find_preview_audio(c)
+      if a then
+        q[#q + 1] = { label = '▸ ' .. trunc(c.name, 18), audio = a, card = c }
+        for li, lp in ipairs(c.loops or {}) do
+          q[#q + 1] = { label = string.format('⟲%d %s', li,
+            trunc(c.name, 14)), audio = a, a = lp.a, b = lp.b,
+            card = c, li = li }
+        end
+      end
+    end
+  end
+  return q
+end
+
+local function draw_playq_panel(stack_h)
+  local q = build_playq()
+  if ImGui.BeginChild(ctx, '##playq', 210, stack_h,
+      ImGui.ChildFlags_Border) then
+    if ImGui.SmallButton(ctx, '▶###pqplay') then
+      if #q > 0 then
+        playlist = { queue = q, i = 1, started = false,
+          rep = state.playq_rep }
+      end
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '■###pqstop') then
+      playlist = nil
+      preview_stop()
+    end
+    ImGui.SameLine(ctx)
+    if chip(T('повтор') .. '###pqrep', state.playq_rep, 0x7BB8D9FF) then
+      state.playq_rep = not state.playq_rep
+      if playlist then playlist.rep = state.playq_rep end
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('в проект') .. '###pqexp') then
+      -- десерт: плейлист → новый проект последовательными сабпроектами
+      state.basket = {}
+      for _, el in ipairs(q) do
+        local c = el.card
+        if c and not c.daw then
+          local off = c.pv_offset or 0
+          if el.a then
+            state.basket[#state.basket + 1] = { path = c.path,
+              region = { pos = el.a + off, fin = el.b + off,
+                name = c.name .. ' loop' .. (el.li or 0) } }
+          elseif (c.duration or 0) > 0 then
+            state.basket[#state.basket + 1] = { path = c.path,
+              region = { pos = 0, fin = c.duration, name = c.name } }
+          end
+        end
+      end
+      if #state.basket > 0 then
+        basket_build()
+      else
+        logf('warn', T('в плейлисте нечего экспортировать'))
+      end
+    end
+    ImGui.Separator(ctx)
+    for qi, el in ipairs(q) do
+      local active = playlist and playlist.queue[playlist.i]
+        and playlist.queue[playlist.i].audio == el.audio
+        and playlist.queue[playlist.i].a == el.a
+      if ImGui.Selectable(ctx, string.format('%2d %s###pq%d', qi,
+          el.label, qi), active) then
+        -- клик — играть элемент параллельно (лупы крутятся дальше)
+        preview_play(el.audio, true)
+        if players[el.audio] then
+          if el.a then
+            reaper.CF_Preview_SetValue(players[el.audio], 'D_POSITION', el.a)
+            loop_bounds[el.audio] = { a = el.a, b = el.b }
+          else
+            loop_bounds[el.audio] = nil
+          end
+        end
+      end
+    end
+    ImGui.EndChild(ctx)
+  end
 end
 
 local function draw_toolbar()
@@ -3784,10 +3923,9 @@ local function draw_toolbar()
       for _, p in ipairs(state.sel) do
         local c = state.index.projects[p]
         local a = c and find_preview_audio(c)
-        if a then q[#q + 1] = a end
+        if a then q[#q + 1] = { audio = a } end
       end
       if #q > 0 then
-        preview_stop()
         playlist = { queue = q, i = 1, started = false }
       end
     end
@@ -4057,7 +4195,7 @@ local function handle_keys(cards, cols)
           local lp = target.loops[n]
           local audio = lp and find_preview_audio(target)
           if lp and audio then
-            preview_play(audio, false)
+            preview_play(audio, true)
             if players[audio] then
               reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', lp.a)
               loop_bounds[audio] = { a = lp.a, b = lp.b }
@@ -4277,10 +4415,9 @@ CMDS = {
     for _, p in ipairs(state.sel) do
       local c = state.index.projects[p]
       local a = c and find_preview_audio(c)
-      if a then q[#q + 1] = a end
+      if a then q[#q + 1] = { audio = a } end
     end
     if #q == 0 then con_out(T('выборка пуста (sel <pat>)')) return end
-    preview_stop()
     playlist = { queue = q, i = 1, started = false }
     con_out('▶▶ ' .. #q)
   end,
@@ -4461,6 +4598,11 @@ local function loop()
     -- лупов из разных треков), иначе — сфокусированная карточка
     if state.view == 0 then
       if #state.sel > 0 then
+        local nshow = math.min(#state.sel, 4)
+        local stack_h = nshow * 118 + 24
+        draw_playq_panel(stack_h)
+        ImGui.SameLine(ctx)
+        ImGui.BeginGroup(ctx)
         local shown = 0
         for _, p in ipairs(state.sel) do
           local c = state.index.projects[p]
@@ -4474,6 +4616,7 @@ local function loop()
           ImGui.TextDisabled(ctx,
             string.format(T('…ещё %d выбрано'), #state.sel - 4))
         end
+        ImGui.EndGroup(ctx)
       elseif state.focus > 0 and cards[state.focus] then
         draw_big_player(cards[state.focus])
       end
