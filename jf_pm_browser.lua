@@ -13,7 +13,7 @@
 -- Cmd/Ctrl+Z — отменить последнее обратимое действие (класс, теги, закреп);
 -- журнал действий — консоль в правом верхнем углу.
 
-local VERSION = '0.9'
+local VERSION = '1.0'
 
 local SCRIPT_PATH = ({reaper.get_action_context()})[2]
 local SCRIPT_DIR = SCRIPT_PATH:match('^(.*)[/\\]')
@@ -440,6 +440,37 @@ end
 local search_cache = {}
 -- кэши превью/DAW-ссылок (объявлены здесь: их чистят rescan и refresh_card)
 local audio_cache, wave_cache, daw_cache = {}, {}, {}
+-- meta-кэш: card_meta() парсит todos/ml-поля — не считать 2000 раз за кадр
+local meta_cache = {}
+-- поколение данных: любой bump сбрасывает собранный список и агрегаты
+local data_gen = 0
+local function bump_gen()
+  data_gen = data_gen + 1
+end
+-- Отложенная запись индекса: 2000-карточный JSON не пишем на каждый клик.
+-- Любое изменение данных проходит здесь же: сброс меты и поколения.
+local function save_index_soon()
+  state.index_dirty = reaper.time_precise()
+  meta_cache = {}
+  bump_gen()
+end
+
+local function flush_index(force)
+  if state.index_dirty and (force
+      or reaper.time_precise() - state.index_dirty > 1.5) then
+    core.save_index(state.index) -- единственное место настоящей записи
+    state.index_dirty = nil
+  end
+end
+
+local function cached_meta(card)
+  local m = meta_cache[card.path]
+  if not m then
+    m = core.card_meta(card)
+    meta_cache[card.path] = m
+  end
+  return m
+end
 local dir_count_cache = {} -- dir -> число .rpp (для легаси-превью)
 local function search_text(card, meta)
   local s = search_cache[card.path]
@@ -489,7 +520,22 @@ local function last_save(card)
   return t
 end
 
+local collect_cache = { key = nil, gen = -1, cards = nil }
+
 local function collect_cards()
+  -- ключ пересборки: все входы, влияющие на состав и порядок; плюс
+  -- data_gen — любое изменение данных индекса
+  local tags_key = {}
+  for t in pairs(state.filter_tags) do tags_key[#tags_key + 1] = t end
+  table.sort(tags_key)
+  local ckey = table.concat({
+    state.filter_status, state.filter_text, state.filter_daw or '',
+    state.filter_empty and 1 or 0, state.sort_mode,
+    state.sort_rev and 1 or 0, table.concat(tags_key, ','), LANG,
+  }, '|')
+  if collect_cache.gen == data_gen and collect_cache.key == ckey then
+    return collect_cache.cards
+  end
   local cards = {}
   local needle_tokens
   if state.filter_text ~= '' then
@@ -501,7 +547,7 @@ local function collect_cards()
     if #needle_tokens == 0 then needle_tokens = nil end
   end
   for _, card in pairs(state.index.projects) do
-    local meta = core.card_meta(card)
+    local meta = cached_meta(card)
     local ok = true
     local f = state.filter_status
     if f == 0 then
@@ -598,6 +644,8 @@ local function collect_cards()
     if state.sort_rev then return less(b, a) end
     return less(a, b)
   end)
+  collect_cache.key, collect_cache.gen, collect_cache.cards =
+    ckey, data_gen, cards
   return cards
 end
 
@@ -685,7 +733,7 @@ local function rescan_step()
   end
   if rs.i >= rs.total then
     state.index = rs.idx
-    core.save_index(state.index)
+    save_index_soon()
     search_cache, audio_cache, wave_cache, daw_cache = {}, {}, {}, {}
     dir_count_cache = {}
     state.recent = core.recent_projects()
@@ -737,7 +785,7 @@ local function set_status(card, status, silent)
     card.status_over_base = (card.ext or {}).STATUS or ''
   end
   search_cache[card.path] = nil -- статус входит в поисковую строку
-  core.save_index(state.index)
+  save_index_soon()
   if not silent then
     local path = card.path
     push_undo(string.format(T('класс «%s» → %s'), card.name,
@@ -745,7 +793,7 @@ local function set_status(card, status, silent)
       local c = state.index.projects[path] or card
       c.status_over, c.status_over_base = prev, prev_base
       search_cache[path] = nil
-      core.save_index(state.index)
+      save_index_soon()
     end)
     logf('act', string.format(T('класс «%s» → %s'), card.name,
       status ~= '' and status or '—'))
@@ -755,12 +803,12 @@ end
 local function toggle_pin(card)
   local prev = card.pinned
   card.pinned = not card.pinned or nil
-  core.save_index(state.index)
+  save_index_soon()
   local path = card.path
   push_undo(string.format(T('закреп «%s»'), card.name), function()
     local c = state.index.projects[path] or card
     c.pinned = prev
-    core.save_index(state.index)
+    save_index_soon()
   end)
   logf('act', string.format(card.pinned and T('закреплён «%s»')
     or T('откреплён «%s»'), card.name))
@@ -822,7 +870,7 @@ local function delete_project(card)
   end
   drop_from_index(card.path, target == dir and dir or nil)
   state.focus = 0
-  core.save_index(state.index)
+  save_index_soon()
   logf('del', T('в Корзину: ') .. target ..
     ' — ' .. T('вернуть можно из Корзины Finder'))
 end
@@ -856,7 +904,7 @@ local function delete_selected()
     end
   end
   state.focus = 0
-  core.save_index(state.index)
+  save_index_soon()
   state.status_msg = string.format('В Корзине: %d из %d', removed, n)
 end
 
@@ -871,7 +919,7 @@ local function pin_selected()
     local c = state.index.projects[p]
     if c then c.pinned = (not all) or nil end
   end
-  core.save_index(state.index)
+  save_index_soon()
 end
 
 -- Merge: выделенные соединяются последовательно в порядке выделения.
@@ -894,7 +942,7 @@ local function merge_selected()
   local card = core.build_card(out, nil)
   if card then
     state.index.projects[out] = card
-    core.save_index(state.index)
+    save_index_soon()
   end
   state.sel = {}
   state.status_msg = 'Merge → ' .. out
@@ -1133,7 +1181,7 @@ local function refresh_card(path)
   local old = state.index.projects[path]
   local nc = core.build_card(path, old)
   if nc then state.index.projects[path] = nc end
-  core.save_index(state.index)
+  save_index_soon()
   search_cache[path], audio_cache[path], daw_cache[path] = nil, nil, nil
   dir_count_cache = {}
   return nc
@@ -1227,7 +1275,7 @@ local function rename_project(card, new_name)
   end
   local newcard = core.build_card(new_path, old)
   if newcard then state.index.projects[new_path] = newcard end
-  core.save_index(state.index)
+  save_index_soon()
   search_cache[card.path] = nil
   for i, p in ipairs(state.sel) do
     if p == card.path then state.sel[i] = new_path end
@@ -2081,14 +2129,14 @@ local function draw_card_icons(card, meta, i, expanded, compact)
     if rv and fn and fn ~= '' then
       card.thumb_user = fn
       img_cache[fn] = nil
-      core.save_index(state.index)
+      save_index_soon()
     end
   end
   if card.thumb_user then
     ImGui.SameLine(ctx)
     if icon('▧', 'unthumb', T('сбросить превью')) then
       card.thumb_user = nil
-      core.save_index(state.index)
+      save_index_soon()
     end
   end
   ImGui.SameLine(ctx)
@@ -2412,13 +2460,13 @@ local function draw_card_details(card, meta)
       for _, x in ipairs(card.tags_extra or {}) do prev_extra[#prev_extra + 1] = x end
       card.tags_extra = #extra > 0 and extra or nil
       search_cache[card.path] = nil
-      core.save_index(state.index)
+      save_index_soon()
       local upath = card.path
       push_undo(string.format(T('тег #%s на «%s»'), t, card.name), function()
         local c = state.index.projects[upath] or card
         c.tags_extra = #prev_extra > 0 and prev_extra or nil
         search_cache[upath] = nil
-        core.save_index(state.index)
+        save_index_soon()
       end)
       logf('act', string.format(T('тег #%s на «%s»'), t, card.name))
     end
@@ -2453,7 +2501,7 @@ local function draw_card_details(card, meta)
         extra[#extra + 1] = t
         card.tags_extra = extra
         search_cache[card.path] = nil
-        core.save_index(state.index)
+        save_index_soon()
       end
       state.tag_add_path = nil
     end
@@ -2685,12 +2733,56 @@ local function draw_grid(cards)
     ImGui.TextDisabled(ctx, T('Пусто. Rescan, или ослабь фильтры.'))
     return 1
   end
+  local cs = CARD_SIZES[state.card_size]
   local avail = ImGui.GetContentRegionAvail(ctx)
-  local card_w = CARD_SIZES[state.card_size].w
+  local card_w = cs.w
   local cols = math.max(1, math.floor(avail / (card_w + 8)))
-  for i, entry in ipairs(cards) do
-    if (i - 1) % cols ~= 0 then ImGui.SameLine(ctx) end
-    draw_card(entry, i, card_w)
+
+  -- Виртуализация: на 2000 карточках рисуем только видимые строки.
+  -- Раскрытая карточка или режим L ломают равновысотность — тогда
+  -- честный полный проход (редкий случай).
+  if state.expanded or cs.full then
+    for i, entry in ipairs(cards) do
+      if (i - 1) % cols ~= 0 then ImGui.SameLine(ctx) end
+      draw_card(entry, i, card_w)
+    end
+    return cols
+  end
+
+  local _, spacing_y = ImGui.GetStyleVar(ctx, ImGui.StyleVar_ItemSpacing)
+  local row_h = cs.h + spacing_y
+  local total_rows = math.ceil(#cards / cols)
+
+  -- фокус вне окна: подскроллить до отрисовки, чтобы строка попала в кадр
+  if state.scroll_to_focus and state.focus > 0 then
+    local frow = math.floor((state.focus - 1) / cols)
+    local vis_h = ImGui.GetWindowHeight(ctx)
+    local target = frow * row_h - vis_h / 2 + row_h / 2
+    ImGui.SetScrollY(ctx, math.max(0, target))
+    state.scroll_to_focus = false
+  end
+
+  local scroll = ImGui.GetScrollY(ctx)
+  local vis_h = ImGui.GetWindowHeight(ctx)
+  local first_row = math.max(0, math.floor(scroll / row_h) - 1)
+  local last_row = math.min(total_rows - 1,
+    math.ceil((scroll + vis_h) / row_h) + 1)
+
+  if first_row > 0 then
+    ImGui.Dummy(ctx, 1, first_row * row_h - spacing_y)
+  end
+  for row = first_row, last_row do
+    for col = 0, cols - 1 do
+      local i = row * cols + col + 1
+      local entry = cards[i]
+      if entry then
+        if col > 0 then ImGui.SameLine(ctx) end
+        draw_card(entry, i, card_w)
+      end
+    end
+  end
+  if last_row < total_rows - 1 then
+    ImGui.Dummy(ctx, 1, (total_rows - 1 - last_row) * row_h - spacing_y)
   end
   return cols
 end
@@ -3206,7 +3298,7 @@ local function draw_big_player(entry)
       card.loops[#card.loops + 1] =
         { a = sel.a * w.len, b = sel.b * w.len }
       table.sort(card.loops, function(x, y) return x.a < y.a end)
-      core.save_index(state.index)
+      save_index_soon()
       logf('act', string.format(T('луп %s: %s–%s'), card.name,
         fmt_duration(sel.a * w.len), fmt_duration(sel.b * w.len)))
       bigsel[card.path] = nil
@@ -3319,7 +3411,7 @@ local function draw_big_player(entry)
       if ImGui.SmallButton(ctx, '×###lpx' .. li) then
         table.remove(card.loops, li)
         if #card.loops == 0 then card.loops = nil end
-        core.save_index(state.index)
+        save_index_soon()
         break
       end
     end
@@ -3364,14 +3456,20 @@ local function draw_toolbar()
     T('fzf: всё — имя, треки, регионы, отчёты… ( / )'), state.filter_text)
   if schanged then state.filter_text = sval end
 
-  -- WIP-счётчик: >3 в активной работе — многовато, внимание расползается
-  local wip, no_report = 0, 0
-  for _, card in pairs(state.index.projects) do
-    local s = (card.ext or {}).STATUS or ''
-    s = core.STATUS_ALIASES[s] or s
-    if s == 'аранжировка' or s == 'микс' or s == 'мастер' then wip = wip + 1 end
-    if card.needs_report then no_report = no_report + 1 end
+  -- WIP-счётчик: >3 в активной работе — многовато; кэш по поколению
+  if not state.wip_cache or state.wip_gen ~= data_gen then
+    local wip, no_report = 0, 0
+    for _, card in pairs(state.index.projects) do
+      local s = (card.ext or {}).STATUS or ''
+      s = core.STATUS_ALIASES[s] or s
+      if s == 'аранжировка' or s == 'микс' or s == 'мастер' then
+        wip = wip + 1
+      end
+      if card.needs_report then no_report = no_report + 1 end
+    end
+    state.wip_cache, state.wip_gen = { wip = wip, nr = no_report }, data_gen
   end
+  local wip, no_report = state.wip_cache.wip, state.wip_cache.nr
   ImGui.SameLine(ctx)
   ImGui.TextColored(ctx, wip > 3 and 0xE06060FF or 0x8A8A8AFF,
     string.format('WIP: %d', wip))
@@ -3390,13 +3488,17 @@ local function draw_toolbar()
   if chip('∅ ' .. T('пустые') .. '###fempty', state.filter_empty) then
     state.filter_empty = not state.filter_empty
   end
-  -- чипы DAW: появляются, когда в индексе есть чужие проекты
-  local daws = {}
-  for _, card in pairs(state.index.projects) do
-    if card.daw and not daws[card.daw] then
-      daws[card.daw] = core.DAW_TYPES[card.daw_ext] or {}
+  -- чипы DAW: появляются, когда в индексе есть чужие проекты (кэш)
+  if not state.daws_cache or state.daws_gen ~= data_gen then
+    local daws = {}
+    for _, card in pairs(state.index.projects) do
+      if card.daw and not daws[card.daw] then
+        daws[card.daw] = core.DAW_TYPES[card.daw_ext] or {}
+      end
     end
+    state.daws_cache, state.daws_gen = daws, data_gen
   end
+  local daws = state.daws_cache
   if next(daws) then
     ImGui.SameLine(ctx)
     ImGui.TextDisabled(ctx, '|')
@@ -3580,15 +3682,19 @@ local function draw_toolbar()
 
   -- все теги (из списка + встретившиеся в проектах) чипами справа от поиска:
   -- клик — фильтр (AND по нескольким), повторный клик — снять
-  local seen, tags_all = {}, {}
-  for _, e in ipairs(TAGS) do
-    seen[e[1]] = true; tags_all[#tags_all + 1] = e[1]
-  end
-  for _, card in pairs(state.index.projects) do
-    for _, t in ipairs(all_tags(card, core.card_meta(card))) do
-      if not seen[t] then seen[t] = true; tags_all[#tags_all + 1] = t end
+  if not state.tags_all_cache or state.tags_all_gen ~= data_gen then
+    local seen, tags_all = {}, {}
+    for _, e in ipairs(TAGS) do
+      seen[e[1]] = true; tags_all[#tags_all + 1] = e[1]
     end
+    for _, card in pairs(state.index.projects) do
+      for _, t in ipairs(all_tags(card, cached_meta(card))) do
+        if not seen[t] then seen[t] = true; tags_all[#tags_all + 1] = t end
+      end
+    end
+    state.tags_all_cache, state.tags_all_gen = tags_all, data_gen
   end
+  local tags_all = state.tags_all_cache
   for _, t in ipairs(tags_all) do
     local label = '#' .. t
     local active = state.filter_tags[t]
@@ -3852,7 +3958,7 @@ CMDS = {
       c.tags_extra = #extra > 0 and extra or nil
       search_cache[c.path] = nil
     end
-    core.save_index(state.index)
+    save_index_soon()
     con_out((remove and T('тег снят: ') or T('тег: ')) .. t)
   end,
   dl = function(args)
@@ -4054,6 +4160,7 @@ local function loop()
       batch_step()   -- очередь «превью всем»: один проект за кадр
       rescan_step()  -- фоновый рескан: порция карточек за кадр
       players_step() -- очистка доигравших превью + шаг плейлиста
+      flush_index()  -- отложенная запись индекса
     end
 
     draw_console_bottom()
@@ -4074,7 +4181,8 @@ local function loop()
   if open and not state.quit then
     reaper.defer(loop)
   else
-    preview_stop() -- не оставлять играющий плеер после закрытия окна
+    preview_stop()    -- не оставлять играющий плеер после закрытия окна
+    flush_index(true) -- дописать индекс перед выходом
   end
 end
 
