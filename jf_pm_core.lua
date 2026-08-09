@@ -668,7 +668,12 @@ function M.scan_projects(paths)
         found[#found + 1] = dir .. '/' .. fn
       else
         local e = lower:match('%.([%w]+)$')
-        if e and M.DAW_TYPES[e] and not M.DAW_TYPES[e].is_dir then
+        if e and M.DAW_TYPES[e] and not M.DAW_TYPES[e].is_dir
+           -- автосейвы/бэкапы чужих DAW: FL «autosaved/overwritten»,
+           -- Pro Tools .bak.NNN, Renoise _Backups-копии
+           and not lower:find('autosaved', 1, true)
+           and not lower:find('overwritten', 1, true)
+           and not lower:find('%.bak%.') then
           foreign[#foreign + 1] = { path = dir .. '/' .. fn, ext = e }
         end
       end
@@ -682,8 +687,9 @@ function M.scan_projects(paths)
       if se and M.DAW_TYPES[se] and M.DAW_TYPES[se].is_dir then
         -- пакет-папка (Logic .logicx) — сам проект, внутрь не идём
         foreign[#foreign + 1] = { path = dir .. '/' .. sub, ext = se }
-      elseif sub:sub(1, 1) ~= '.' and sub ~= 'Backups' and sub ~= 'Backup' then
-        -- Backup — автосейвы Ableton, иначе десятки дублей .als
+      elseif sub:sub(1, 1) ~= '.' and not sub:match('^Backup')
+          and not sub:find('Backups', 1, true) then
+        -- Backup/Backup_N/…_Backups/Session File Backups — автосейвы DAW
         scandir(dir .. '/' .. sub, depth + 1)
       end
       j = j + 1

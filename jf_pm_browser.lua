@@ -127,6 +127,7 @@ local EN = {
   ['цепочка'] = 'chain',
   ['плеер: '] = 'player: ', ['луп'] = 'loop',
   ['снэп'] = 'snap', [' (нет bpm)'] = ' (no bpm)',
+  ['…ещё %d выбрано'] = '…%d more selected',
   ['луп %s: %s–%s'] = 'loop %s: %s–%s',
   ['собрать из лупов'] = 'build from loops',
   ['у выбранных нет лупов (плеер → драг по волне → + луп)'] =
@@ -3272,7 +3273,7 @@ local function draw_big_player(entry)
     end
   end
 
-  ImGui.InvisibleButton(ctx, '###bigwave', width, H)
+  ImGui.InvisibleButton(ctx, '###bigwave' .. card.path, width, H)
   local frac = math.min(math.max(
     (ImGui.GetMousePos(ctx) - x0) / width, 0), 1)
   if ImGui.IsItemActivated(ctx) then
@@ -3352,6 +3353,16 @@ local function draw_toolbar()
   if ImGui.IsItemDeactivatedAfterEdit(ctx) then
     core.set_setting('preview_vol', string.format('%.3f', state.preview_vol))
   end
+  -- поиск — на самом верху, всегда под рукой (клавиша /)
+  ImGui.SameLine(ctx)
+  ImGui.SetNextItemWidth(ctx, 260)
+  if state.focus_tag_input then
+    ImGui.SetKeyboardFocusHere(ctx)
+    state.focus_tag_input = false
+  end
+  local schanged, sval = ImGui.InputTextWithHint(ctx, '##tag',
+    T('fzf: всё — имя, треки, регионы, отчёты… ( / )'), state.filter_text)
+  if schanged then state.filter_text = sval end
 
   -- WIP-счётчик: >3 в активной работе — многовато, внимание расползается
   local wip, no_report = 0, 0
@@ -3444,17 +3455,7 @@ local function draw_toolbar()
     end
   end
 
-  ImGui.SameLine(ctx)
-  ImGui.TextDisabled(ctx, '|')
-  ImGui.SameLine(ctx)
-  ImGui.SetNextItemWidth(ctx, 160)
-  if state.focus_tag_input then
-    ImGui.SetKeyboardFocusHere(ctx)
-    state.focus_tag_input = false
-  end
-  local changed, val = ImGui.InputTextWithHint(ctx, '##tag',
-    T('fzf: всё — имя, треки, регионы, отчёты… ( / )'), state.filter_text)
-  if changed then state.filter_text = val end
+
 
   -- блок выборки: порядок номеров = порядок склейки; при нескольких
   -- выделенных — те же команды, что на карточке, но на всю выборку
@@ -4010,9 +4011,26 @@ local function loop()
     ImGui.Separator(ctx)
 
     local cards = collect_cards()
-    -- большой плеер сфокусированной карточки (выделение лупов мышью)
-    if state.view == 0 and state.focus > 0 and cards[state.focus] then
-      draw_big_player(cards[state.focus])
+    -- большие плееры: выбранные — стеком один над другим (совмещение
+    -- лупов из разных треков), иначе — сфокусированная карточка
+    if state.view == 0 then
+      if #state.sel > 0 then
+        local shown = 0
+        for _, p in ipairs(state.sel) do
+          local c = state.index.projects[p]
+          if c then
+            draw_big_player({ card = c })
+            shown = shown + 1
+            if shown >= 4 then break end
+          end
+        end
+        if #state.sel > 4 then
+          ImGui.TextDisabled(ctx,
+            string.format(T('…ещё %d выбрано'), #state.sel - 4))
+        end
+      elseif state.focus > 0 and cards[state.focus] then
+        draw_big_player(cards[state.focus])
+      end
     end
     local cols = 1
     -- контент в своём child: тулбар не скроллится, внизу консоль и статусбар
