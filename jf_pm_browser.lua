@@ -125,6 +125,11 @@ local EN = {
   ['сохранён'] = 'saved',
   ['консоль'] = 'console',
   ['цепочка'] = 'chain',
+  ['найти превью'] = 'find previews',
+  ['обновить превью выделенных; нет файла — Spotlight по всему диску'] =
+    'refresh previews of selected; if missing — Spotlight search disk-wide',
+  ['Поиск превью: найдено %d из %d'] = 'Preview search: found %d of %d',
+  ['поиск %d/%d'] = 'search %d/%d',
   ['плеер: '] = 'player: ', ['луп'] = 'loop',
   ['снэп'] = 'snap', [' (нет bpm)'] = ' (no bpm)',
   ['…ещё %d выбрано'] = '…%d more selected',
@@ -1379,7 +1384,11 @@ local function find_preview_audio(card)
     end
     dir_count_cache[dir] = nproj
   end
-  local cands = { dir .. '/' .. card.name .. '_preview.wav' }
+  local cands = {}
+  if card.preview_found then
+    cands[#cands + 1] = card.preview_found -- найден Spotlight-поиском
+  end
+  cands[#cands + 1] = dir .. '/' .. card.name .. '_preview.wav'
   if card.daw then
     -- чужая DAW: экспорт обычно лежит рядом с проектом под тем же именем
     for _, e in ipairs({ 'wav', 'mp3', 'aiff', 'aif', 'flac', 'm4a', 'ogg' }) do
@@ -1797,6 +1806,81 @@ local function render_audio(card, kind)
     or T('Превью отрендерено')) .. bounds_note .. ': ' .. pv_path
 end
 
+-- Поиск готового рендера по всей ФС (Spotlight). mdfind блокирует на
+-- десятки миллисекунд — зовётся только из очереди, по одному на кадр.
+local function fs_find_preview(card)
+  local clean = card.name:gsub('%[.-%]', ''):gsub('%s+', ' ')
+    :match('^%s*(.-)%s*$')
+  if #clean < 4 then return nil end
+  local out = reaper.ExecProcess(
+    '/usr/bin/mdfind -name "' .. clean .. '"', 8000)
+  if not out then return nil end
+  out = out:gsub('^%d+\n', '')
+  local function norm(s) return (s:lower():gsub('[%s%p_]+', '')) end
+  local full_n, clean_n = norm(card.name), norm(clean)
+  local best, best_score
+  for line in out:gmatch('[^\n]+') do
+    local ext = line:lower():match('%.([%w]+)$')
+    if ext and AUDIO_EXT[ext]
+       and not line:find('/Backup', 1, true)
+       and not line:find('%.app/')
+       and not line:find('_preview%.wav$') then
+      local base = norm((line:match('([^/]+)$') or ''):gsub('%.[%w]+$', ''))
+      local score
+      if base == full_n then score = 100
+      elseif base == clean_n then score = 95
+      elseif base:find(clean_n, 1, true) then
+        score = 80 - math.min(#base - #clean_n, 40)
+      end
+      if score and (not best_score or score > best_score) then
+        best, best_score = line, score
+      end
+    end
+  end
+  return best
+end
+
+local function findprev_start()
+  if #state.sel == 0 then
+    logf('warn', T('выборка пуста (sel <pat>)'))
+    return
+  end
+  local queue = {}
+  for i, p in ipairs(state.sel) do queue[i] = p end
+  state.findprev = { queue = queue, done = 0, hit = 0, total = #queue }
+end
+
+local function findprev_step()
+  local q = state.findprev
+  if not q then return end
+  local p = table.remove(q.queue, 1)
+  if not p then
+    logf('ok', string.format(T('Поиск превью: найдено %d из %d'),
+      q.hit, q.total))
+    state.findprev = nil
+    return
+  end
+  local c = state.index.projects[p]
+  if c then
+    audio_cache[p] = nil -- перечитать диск: вдруг превью появилось
+    if find_preview_audio(c) then
+      q.hit = q.hit + 1
+    else
+      local hit = fs_find_preview(c)
+      if hit then
+        c.preview_found = hit
+        audio_cache[p] = nil
+        save_index_soon()
+        q.hit = q.hit + 1
+        logf('ok', '✓ ' .. c.name .. ' → ' .. hit)
+      else
+        logf('warn', '✗ ' .. c.name)
+      end
+    end
+  end
+  q.done = q.done + 1
+end
+
 -- Батч «превью всем»: очередь путей, по одному проекту на кадр defer-цикла
 -- (каждый рендер — модальный, но между ними UI дышит и кнопка «стоп» жива)
 local function batch_step()
@@ -2099,10 +2183,53 @@ local function draw_card_icons(card, meta, i, expanded, compact)
     if icon('▸', 'dopen', T('открыть в ') .. (dt.daw or 'DAW'), dt.color) then
       open_project(card.path)
     end
-    if compact then return hit end
+    if compact then
+      -- S: ещё картинка, обновление и удаление
+      ImGui.SameLine(ctx)
+      if icon('▦', 'thumb', T('назначить картинку-превью…')) then
+        local rv, fn = reaper.GetUserFileNameForRead('',
+          'Картинка-превью проекта', '')
+        if rv and fn and fn ~= '' then
+          card.thumb_user = fn
+          img_cache[fn] = nil
+          save_index_soon()
+        end
+      end
+      ImGui.SameLine(ctx)
+      if icon('↻', 'refr', T('обновить карточку (перечитать .rpp)')) then
+        refresh_card(card.path)
+      end
+      ImGui.SameLine(ctx)
+      if icon('×', 'del', T('удалить в Корзину…'), 0xB06060FF) then
+        delete_project(card)
+      end
+      return hit
+    end
   elseif compact then
     if icon('▸', 'prev', T('отрендерить аудио-превью')) then
       render_audio(card, 'preview')
+    end
+    ImGui.SameLine(ctx)
+    if icon('▶', 'demo', T('отрендерить полное демо (весь проект)')) then
+      render_audio(card, 'demo')
+    end
+    ImGui.SameLine(ctx)
+    if icon('▦', 'thumb', T('назначить картинку-превью…')) then
+      local rv, fn = reaper.GetUserFileNameForRead('',
+        'Картинка-превью проекта', '')
+      if rv and fn and fn ~= '' then
+        card.thumb_user = fn
+        img_cache[fn] = nil
+        save_index_soon()
+      end
+    end
+    ImGui.SameLine(ctx)
+    if icon('↻', 'refr', T('обновить карточку (перечитать .rpp)')) then
+      refresh_card(card.path)
+    end
+    ImGui.SameLine(ctx)
+    if icon('×', 'del', T('удалить в Корзину…'), 0xB06060FF) then
+      delete_project(card)
     end
     return hit
   else
@@ -3649,6 +3776,14 @@ local function draw_toolbar()
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, '■###selstop') then preview_stop() end
     ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('найти превью') .. '###findprev') then
+      findprev_start()
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx,
+        T('обновить превью выделенных; нет файла — Spotlight по всему диску'))
+    end
+    ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, T('собрать из лупов') .. '###loopbuild') then
       -- лупы выбранных → корзина сабпроектов → новый проект (basket_build):
       -- каждый луп — открываемый subproject-айтем с обрезкой по лупу
@@ -4058,6 +4193,15 @@ local function draw_console_bottom()
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, '■###rsstop') then state.rescan = nil end
   end
+  if state.findprev then
+    ImGui.SameLine(ctx)
+    ImGui.ProgressBar(ctx,
+      state.findprev.done / math.max(state.findprev.total, 1), 170, 0,
+      string.format(T('поиск %d/%d'), state.findprev.done,
+        state.findprev.total))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '■###fpstop') then state.findprev = nil end
+  end
   if state.batch then
     ImGui.SameLine(ctx)
     local d = state.batch.done + (state.batch.skipped or 0)
@@ -4159,8 +4303,9 @@ local function loop()
       ImGui.EndChild(ctx)
       batch_step()   -- очередь «превью всем»: один проект за кадр
       rescan_step()  -- фоновый рескан: порция карточек за кадр
-      players_step() -- очистка доигравших превью + шаг плейлиста
-      flush_index()  -- отложенная запись индекса
+      players_step()  -- очистка доигравших превью + шаг плейлиста
+      findprev_step() -- поиск превью по ФС: один mdfind за кадр
+      flush_index()   -- отложенная запись индекса
     end
 
     draw_console_bottom()

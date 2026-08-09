@@ -819,6 +819,7 @@ function M.build_card(path, old_card, dir_sizes, dir_audio)
     card.tags_extra = old_card.tags_extra
     card.loops = old_card.loops
     card.pv_offset = old_card.pv_offset
+    card.preview_found = old_card.preview_found
     if old_card.status_over
        and (old_card.status_over_base or '') == (card.ext.STATUS or '') then
       card.status_over = old_card.status_over
@@ -864,6 +865,7 @@ function M.build_foreign_card(path, ext, old_card, dir_sizes)
     card.status_over_base = old_card.status_over_base
     card.loops = old_card.loops
     card.pv_offset = old_card.pv_offset
+    card.preview_found = old_card.preview_found
   end
   return card
 end
