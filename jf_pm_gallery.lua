@@ -112,6 +112,25 @@ function drawNav(canvas, card, size) {
     g.fillStyle = hsv((r.h % 360) / 360, 0.6, 0.9);
     g.fillRect(x0, size - 4, x1 - x0, 4);
   }
+  // лупы — янтарные скобки сверху (координаты — секунды проекта)
+  if (card.dur > 0) {
+    for (const lp of card.loops || []) {
+      let x0 = Math.max(lp.a / card.dur, 0) * size;
+      let x1 = Math.min(lp.b / card.dur, 1) * size;
+      if (x1 - x0 < 1) x1 = x0 + 1;
+      g.fillStyle = 'rgba(217,185,108,0.85)';
+      g.fillRect(x0, 0, x1 - x0, 4);
+    }
+  }
+  // плашка DAW в углу
+  if (card.daw) {
+    g.font = 'bold 11px system-ui';
+    const tw = g.measureText(card.daw.l).width;
+    g.fillStyle = card.daw.col;
+    g.fillRect(2, size - 18, tw + 8, 16);
+    g.fillStyle = '#111213';
+    g.fillText(card.daw.l, 6, size - 6);
+  }
 }
 
 const fmtDur = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
@@ -133,7 +152,7 @@ for (const card of DATA.cards) {
       <div class="status"></div>
       <div class="next"></div>
       <div class="meta">${card.mtime} · ${fmtDur(card.dur)}</div>
-      <div class="meta">${card.tracks} трк · ${card.n_items} айт · ${fmtSize(card.size)}</div>
+      <div class="meta">${card.tracks} трк · ${card.n_items} айт · ${fmtSize(card.size)}${card.loops ? ' · ⟲' + card.loops.length : ''}</div>
       <div class="tags"></div>
     </div>`;
   el.querySelector('.name').textContent = card.name;
@@ -185,6 +204,22 @@ function M.export(core, entries, out_path)
       next = meta.report_todo:match('^[^\n]+'),
       tags = meta.tags,
       thumb = c.thumb_user or c.thumb_file,
+      daw = (function()
+        if not c.daw then return nil end
+        local dt = core.DAW_TYPES[c.daw_ext] or {}
+        return { l = dt.label or '?', col = dt.color
+          and string.format('#%06X', dt.color >> 8) or '#8a8f93' }
+      end)(),
+      loops = (function()
+        -- лупы в секундах проекта (pv_offset уже скомпенсирован)
+        if not c.loops or #c.loops == 0 then return nil end
+        local off = c.pv_offset or 0
+        local out = {}
+        for _, lp in ipairs(c.loops) do
+          out[#out + 1] = { a = lp.a + off, b = lp.b + off }
+        end
+        return out
+      end)(),
     }
   end
   local json = core.json_encode({
