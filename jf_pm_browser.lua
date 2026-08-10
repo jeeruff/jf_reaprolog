@@ -138,6 +138,15 @@ local EN = {
   ['анализ %d/%d'] = 'analysis %d/%d',
   ['мастер-BPM'] = 'master BPM',
   ['стоп всех превью (глобальный)'] = 'stop all previews (global)',
+  ['мастер тональности (scale sync)'] = 'key master (scale sync)',
+  ['слейв: подстроить тональность под мастера'] =
+    'slave: pitch this clip to the master key',
+  ['это мастер — подстраивай другие клипы'] =
+    'this is the master — tune the other clips',
+  ['нет мастера или его тональности (M + analyze)'] =
+    'no master or its key (press M + analyze)',
+  ['у клипа нет тональности — жми analyze'] =
+    'clip has no key — press analyze',
   ['подгонять темп играющих под мастер-BPM (питч сохраняется)'] =
     'match playing previews to master BPM (pitch preserved)',
   ['в плейлисте нечего экспортировать'] = 'nothing to export in playlist',
@@ -1550,8 +1559,19 @@ local function preview_play(audio, keep_others)
     return
   end
   if not keep_others then
-    for _, c in pairs(players) do reaper.CF_Preview_Stop(c) end
-    players = {}
+    for a, c in pairs(players) do
+      if a ~= audio then
+        reaper.CF_Preview_Stop(c)
+        players[a] = nil
+      end
+    end
+  end
+  -- один плеер на файл: повторный запуск переиспользует существующий
+  -- (иначе старый cfp сиротел и играл до конца мимо любого стопа)
+  local ex = players[audio]
+  if ex then
+    reaper.CF_Preview_SetValue(ex, 'D_POSITION', 0)
+    return
   end
   local src = reaper.PCM_Source_CreateFromFile(audio)
   if not src then return end
@@ -1576,6 +1596,19 @@ local pitch_map = {}   -- card.path -> полутоны (перформанс-п
 -- bpm карточки: тег в имени > найденный анализом > TEMPO из .rpp
 local function eff_bpm(card)
   return core.name_bpm(card.name) or card.bpm_detected or card.tempo
+end
+
+-- тональность карточки: анализ приоритетнее парсинга имён
+local KEY_IDX = { A = 0, ['A#'] = 1, B = 2, C = 3, ['C#'] = 4, D = 5,
+                  ['D#'] = 6, E = 7, F = 8, ['F#'] = 9, G = 10, ['G#'] = 11 }
+local function card_key(card)
+  return (card.keys_detected and card.keys_detected[1])
+    or (card.keys and card.keys[1])
+end
+local function key_root(k)
+  if not k then return nil end
+  local root = k:match('^([A-G]#?)m?$')
+  return root and KEY_IDX[root]
 end
 
 -- применить питч и BPM-синк к только что запущенному превью
@@ -3750,6 +3783,40 @@ local function draw_big_player(entry)
   end
   if state.btn_tips and ImGui.IsItemHovered(ctx) then
     ImGui.SetTooltip(ctx, T('анализ: тональность и BPM (по wav-превью)'))
+  end
+  -- scale sync: M — этот клип задаёт тональность, S — подстроить этот
+  -- клип питчем под мастера (кратчайший сдвиг корня, ±6 полутонов)
+  ImGui.SameLine(ctx)
+  if chip('M###km' .. card.path, state.key_master == card.path,
+      0xD98ABDFF) then
+    state.key_master = state.key_master ~= card.path and card.path or nil
+  end
+  if state.btn_tips and ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, T('мастер тональности (scale sync)'))
+  end
+  ImGui.SameLine(ctx)
+  if ImGui.SmallButton(ctx, 'S###ks' .. card.path) then
+    local mc = state.key_master and state.index.projects[state.key_master]
+    local mroot = mc and key_root(card_key(mc))
+    local sroot = key_root(card_key(card))
+    if state.key_master == card.path then
+      logf('warn', T('это мастер — подстраивай другие клипы'))
+    elseif not mroot then
+      logf('warn', T('нет мастера или его тональности (M + analyze)'))
+    elseif not sroot then
+      logf('warn', T('у клипа нет тональности — жми analyze'))
+    else
+      local d = ((mroot - sroot + 6) % 12) - 6
+      pitch_map[card.path] = d ~= 0 and d or nil
+      if players[audio] then
+        reaper.CF_Preview_SetValue(players[audio], 'D_PITCH', d)
+      end
+      logf('act', string.format('scale: %s %s → %s (%+d st)',
+        card.name, card_key(card), card_key(mc), d))
+    end
+  end
+  if state.btn_tips and ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, T('слейв: подстроить тональность под мастера'))
   end
   ImGui.SameLine(ctx)
   if chip(T('снэп') .. (beat and '' or ' (нет bpm)') .. '###lsnap',
