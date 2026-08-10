@@ -1697,8 +1697,11 @@ local function draw_wave_strip(card, width, height, multi)
       T('пики не построились'))
   end
   ImGui.InvisibleButton(ctx, '###wave' .. card.path, width, height)
-  -- клик — играть с места клика / сик; правый клик — стоп
-  if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) then
+  local wmods = ImGui.GetKeyMods(ctx)
+  local sel_mod = wmods & ImGui.Mod_Ctrl ~= 0 or wmods & ImGui.Mod_Super ~= 0
+  -- клик — играть с места клика / сик; Cmd+клик — мимо плеера, карточке
+  -- (выделение → карточка попадает в плейлист); правый клик — стоп
+  if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) and not sel_mod then
     local mx = ImGui.GetMousePos(ctx)
     local frac = math.min(math.max((mx - x0) / width, 0), 1)
     -- параллельно всегда: чужой луп в большом плеере не гасится
@@ -2969,7 +2972,11 @@ local function draw_card(entry, i, card_w)
         ImGui.DrawList_AddText(pdl, lx + 6, ly + 3, 0xFFFFFFFF,
           (audio and is_playing(audio)) and '■' or '▶')
         ImGui.SetTooltip(ctx, card.name)
-        if ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left) then
+        local lm = ImGui.GetKeyMods(ctx)
+        local lsel = lm & ImGui.Mod_Ctrl ~= 0 or lm & ImGui.Mod_Super ~= 0
+        if ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left)
+           and not lsel then
+          -- cmd+клик пропускаем карточке: выделение вместо плей
           if audio then preview_toggle(audio, true) end
           inner_click = true
         end
