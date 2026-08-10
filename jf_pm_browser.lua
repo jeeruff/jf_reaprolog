@@ -2077,19 +2077,12 @@ local function get_image(path)
   return img or nil
 end
 
--- Плашка DAW поверх тамбнейла: цветной прямоугольник с меткой программы
+-- DAW-метка тамбнейла: только цветная рамка — плашка закрывала картинку
+-- (текстовый бейдж [Ab] и так стоит перед именем карточки)
 local function draw_daw_overlay(card, x0, y0, size)
   if not card.daw then return end
   local dt = core.DAW_TYPES[card.daw_ext] or {}
   local dl = ImGui.GetWindowDrawList(ctx)
-  local label = dt.label or '?'
-  local pad = 3
-  local tw = ImGui.CalcTextSize(ctx, label)
-  local bx0, by1 = x0 + 2, y0 + size - 2
-  local by0 = by1 - ImGui.GetTextLineHeight(ctx) - pad
-  ImGui.DrawList_AddRectFilled(dl, bx0, by0, bx0 + tw + pad * 2, by1,
-    dt.color or 0x8A8F93FF, 3)
-  ImGui.DrawList_AddText(dl, bx0 + pad, by0 + pad / 2, 0x111213FF, label)
   ImGui.DrawList_AddRect(dl, x0, y0, x0 + size, y0 + size,
     dt.color or 0x8A8F93FF, 4, 0, 1.5)
 end
@@ -2704,15 +2697,19 @@ local function draw_card(entry, i, card_w)
       focused and 0xE8E8E8FF or 0xD9B96CFF)
   end
   if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags, win_flags) then
-    -- vim-хинт (режим f): жёлтая плашка с буквами в углу
+    -- vim-хинт (режим f): жёлтый прямоугольник справа от иконки, на
+    -- первой линии карточки; foreground-слой — ничто его не перекроет
     if state.hints and state.hints.labels[i] then
       local hx, hy = ImGui.GetCursorScreenPos(ctx)
-      local hdl = ImGui.GetWindowDrawList(ctx)
+      local fdl = ImGui.GetForegroundDrawList(ctx)
       local lbl = state.hints.labels[i]
       local tw = ImGui.CalcTextSize(ctx, lbl)
-      ImGui.DrawList_AddRectFilled(hdl, hx - 4, hy - 4,
-        hx + tw + 6, hy + 15, 0xE8D44DFF, 3)
-      ImGui.DrawList_AddText(hdl, hx + 1, hy - 3, 0x111213FF, lbl)
+      local bx = hx + cs.thumb + 8
+      ImGui.DrawList_AddRectFilled(fdl, bx, hy,
+        bx + tw + 10, hy + 17, 0xE8D44DFF, 3)
+      ImGui.DrawList_AddRect(fdl, bx, hy, bx + tw + 10, hy + 17,
+        0x111213FF, 3)
+      ImGui.DrawList_AddText(fdl, bx + 5, hy + 1, 0x111213FF, lbl)
     end
     if cs.micro then
       -- S: микро-логотип слева + волна; ховер по логотипу — play/stop
