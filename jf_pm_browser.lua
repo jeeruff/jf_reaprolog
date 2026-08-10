@@ -137,6 +137,7 @@ local EN = {
   ['(нужен wav-превью)'] = '(wav preview required)',
   ['анализ %d/%d'] = 'analysis %d/%d',
   ['мастер-BPM'] = 'master BPM',
+  ['стоп всех превью (глобальный)'] = 'stop all previews (global)',
   ['подгонять темп играющих под мастер-BPM (питч сохраняется)'] =
     'match playing previews to master BPM (pitch preserved)',
   ['в плейлисте нечего экспортировать'] = 'nothing to export in playlist',
@@ -3737,7 +3738,7 @@ local function draw_big_player(entry)
     ImGui.SetTooltip(ctx, T('питч, полутоны · двойной клик — ввод'))
   end
   ImGui.SameLine(ctx)
-  if ImGui.SmallButton(ctx, '⚙###an' .. card.path) then
+  if ImGui.SmallButton(ctx, 'analyze###an' .. card.path) then
     analyze_start({ card.path })
   end
   if state.btn_tips and ImGui.IsItemHovered(ctx) then
@@ -3906,7 +3907,7 @@ end
 
 local function draw_playq_panel(stack_h)
   local q = build_playq()
-  if ImGui.BeginChild(ctx, '##playq', 210, stack_h,
+  if ImGui.BeginChild(ctx, '##playq', 270, stack_h,
       ImGui.ChildFlags_Border) then
     if ImGui.SmallButton(ctx, '▶###pqplay') then
       if #q > 0 then
@@ -3917,7 +3918,10 @@ local function draw_playq_panel(stack_h)
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, '■###pqstop') then
       playlist = nil
-      preview_stop()
+      preview_stop() -- главный плеер: гасит все превью, где бы ни играли
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, T('стоп всех превью (глобальный)'))
     end
     ImGui.SetNextItemWidth(ctx, 48)
     local bchg, bnew = ImGui.DragInt(ctx, '###mbpm', state.master_bpm,
