@@ -129,6 +129,16 @@ local EN = {
   ['найти превью'] = 'find previews',
   ['нет такого лупа'] = 'no such loop', ['лупов: %d'] = 'loops: %d',
   ['повтор'] = 'repeat', ['в проект'] = 'to project',
+  ['питч, полутоны · двойной клик — ввод'] =
+    'pitch, semitones · double click to type',
+  ['анализ: тональность и BPM (по wav-превью)'] =
+    'analyze key and BPM (from wav preview)',
+  ['Анализ готов: %d'] = 'Analysis done: %d',
+  ['(нужен wav-превью)'] = '(wav preview required)',
+  ['анализ %d/%d'] = 'analysis %d/%d',
+  ['мастер-BPM'] = 'master BPM',
+  ['подгонять темп играющих под мастер-BPM (питч сохраняется)'] =
+    'match playing previews to master BPM (pitch preserved)',
   ['в плейлисте нечего экспортировать'] = 'nothing to export in playlist',
   ['обновить превью выделенных; нет файла — Spotlight по всему диску'] =
     'refresh previews of selected; if missing — Spotlight search disk-wide',
@@ -252,6 +262,8 @@ local state = {
   btn_tips = core.get_setting('btn_tips') ~= '0',               -- подсказки кнопок
   preview_vol = tonumber(core.get_setting('preview_vol')) or 1.0,
   loop_snap = core.get_setting('loop_snap') ~= '0', -- снэп лупов к битам
+  master_bpm = tonumber(core.get_setting('master_bpm')) or 120,
+  bpm_sync = false,         -- подгонять rate играющих под мастер-BPM
   view = 0,                 -- 0 сетка, 1 таймлайн, 2 календарь, 3 канбан
   filter_status = 0,        -- 0 активные, 1 все, 2 без отчёта, 3.. статусы
   filter_daw = nil,         -- nil все | 'reaper' | 'ableton' | …
@@ -1558,6 +1570,26 @@ local function preview_toggle(audio, keep_others)
 end
 
 local loop_bounds = {} -- audio -> {a, b} сек: активный луп-плейбек
+local pitch_map = {}   -- card.path -> полутоны (перформанс-параметр, RAM)
+
+-- bpm карточки: тег в имени > найденный анализом > TEMPO из .rpp
+local function eff_bpm(card)
+  return core.name_bpm(card.name) or card.bpm_detected or card.tempo
+end
+
+-- применить питч и BPM-синк к только что запущенному превью
+local function apply_play_fx(card, audio)
+  local c = players[audio]
+  if not c then return end
+  reaper.CF_Preview_SetValue(c, 'D_PITCH', pitch_map[card.path] or 0)
+  if state.bpm_sync and state.master_bpm > 0 then
+    local pb = eff_bpm(card)
+    if pb and pb > 0 then
+      reaper.CF_Preview_SetValue(c, 'B_PPITCH', 1) -- питч не плывёт
+      reaper.CF_Preview_SetValue(c, 'D_PLAYRATE', state.master_bpm / pb)
+    end
+  end
+end
 
 -- каждый кадр: убрать доигравшие, вернуть луп на начало, продвинуть плейлист
 local function players_step()
@@ -1583,6 +1615,7 @@ local function players_step()
     local cur = playlist.queue[playlist.i]
     local function start(el)
       preview_play(el.audio, true) -- поверх параллельных лупов
+      if el.card then apply_play_fx(el.card, el.audio) end
       if players[el.audio] and el.a then
         reaper.CF_Preview_SetValue(players[el.audio], 'D_POSITION', el.a)
       end
@@ -1830,6 +1863,217 @@ local function render_audio(card, kind)
   end
   state.status_msg = (kind == 'demo' and T('Демо отрендерено')
     or T('Превью отрендерено')) .. bounds_note .. ': ' .. pv_path
+end
+
+-- ---------------------------------------------------------------------------
+-- Анализ аудио превью: тональность и BPM. Чанками в defer — не виснем.
+-- Тональность: хрома Гёрцелем по 36 нотам (A2..G#5) на окнах 4096@8кГц,
+-- корреляция с профилями Крумхансла (24 ключа), топ-2.
+-- BPM: RMS-огибающая (шаг 32 мс) → автокорреляция 60–180 BPM.
+
+local KRUMHANSL_MAJ = { 6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+                        2.52, 5.19, 2.39, 3.66, 2.29, 2.88 }
+local KRUMHANSL_MIN = { 6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+                        2.54, 4.75, 3.98, 2.69, 3.34, 3.17 }
+local NOTE_NAMES = { 'A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F',
+                     'F#', 'G', 'G#' }
+
+-- Разбор WAV → функция чтения кадра в моно [-1..1]; PCM 16/24/32 и float32
+local function wav_open(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil end
+  local data = f:read('*a')
+  f:close()
+  if data:sub(1, 4) ~= 'RIFF' or data:sub(9, 12) ~= 'WAVE' then return nil end
+  local pos = 13
+  local fmt, ch, srate, bits, doff, dsize
+  while pos + 8 <= #data do
+    local id = data:sub(pos, pos + 3)
+    local sz = string.unpack('<I4', data, pos + 4)
+    if id == 'fmt ' then
+      fmt = string.unpack('<I2', data, pos + 8)
+      ch = string.unpack('<I2', data, pos + 10)
+      srate = string.unpack('<I4', data, pos + 12)
+      bits = string.unpack('<I2', data, pos + 22)
+    elseif id == 'data' then
+      doff, dsize = pos + 8, sz
+      break
+    end
+    pos = pos + 8 + sz + (sz % 2)
+  end
+  if not (fmt and doff) or (fmt ~= 1 and fmt ~= 3) then return nil end
+  local bytes = bits // 8
+  local frame = bytes * ch
+  local nframes = dsize // frame
+  local function sample(i) -- i: 0-based кадр → моно
+    local off = doff + i * frame
+    local s = 0
+    if fmt == 3 then
+      s = string.unpack('<f', data, off)
+    elseif bits == 16 then
+      s = string.unpack('<i2', data, off) / 32768
+    elseif bits == 24 then
+      local b1, b2, b3 = data:byte(off, off + 2)
+      local v = b1 + b2 * 256 + b3 * 65536
+      if v >= 8388608 then v = v - 16777216 end
+      s = v / 8388608
+    elseif bits == 32 then
+      s = string.unpack('<i4', data, off) / 2147483648
+    end
+    return s
+  end
+  return { sample = sample, srate = srate, nframes = nframes }
+end
+
+-- состояние анализа одной карточки
+local function an_begin(card, audio)
+  local wav = wav_open(audio)
+  if not wav then return nil end
+  local step = math.max(1, wav.srate // 8000) -- децимация до ~8кГц
+  local sr = wav.srate / step
+  local WIN = 4096
+  local total = math.min(wav.nframes // step, math.floor(sr * 90)) -- ≤90 c
+  -- частоты 36 нот A2..G#5 (110..~830 Гц) → коэффициенты Гёрцеля
+  local coef = {}
+  for n = 0, 35 do
+    local freq = 110 * 2 ^ (n / 12)
+    coef[n] = 2 * math.cos(2 * math.pi * freq / sr)
+  end
+  return {
+    card = card, audio = audio, wav = wav, step = step, sr = sr,
+    WIN = WIN, total = total, pos = 0, coef = coef,
+    chroma = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    env = {}, -- RMS каждые 256 децимированных сэмплов (32 мс)
+  }
+end
+
+local function an_window(an)
+  -- одно окно: Гёрцель 36 нот + под-RMS в огибающую
+  local WIN = an.WIN
+  local n0 = an.pos
+  if n0 + WIN > an.total then return false end
+  local s = {}
+  local wav, step = an.wav, an.step
+  for i = 0, WIN - 1 do
+    s[i] = wav.sample((n0 + i) * step)
+  end
+  for note = 0, 35 do
+    local c = an.coef[note]
+    local q0, q1, q2 = 0, 0, 0
+    for i = 0, WIN - 1 do
+      q0 = c * q1 - q2 + s[i]
+      q2 = q1
+      q1 = q0
+    end
+    local power = q1 * q1 + q2 * q2 - c * q1 * q2
+    local pc = (note % 12) + 1
+    an.chroma[pc] = an.chroma[pc] + math.sqrt(math.max(power, 0))
+  end
+  for sub = 0, WIN // 256 - 1 do
+    local acc = 0
+    for i = sub * 256, sub * 256 + 255 do acc = acc + s[i] * s[i] end
+    an.env[#an.env + 1] = math.sqrt(acc / 256)
+  end
+  an.pos = n0 + WIN
+  return true
+end
+
+local function an_finish(an)
+  -- тональности: корреляция хромы с 24 профилями
+  local function corr(profile, rot)
+    local acc = 0
+    for i = 1, 12 do
+      acc = acc + profile[i] * an.chroma[((i - 1 + rot) % 12) + 1]
+    end
+    return acc
+  end
+  local scored = {}
+  for rot = 0, 11 do
+    scored[#scored + 1] = { s = corr(KRUMHANSL_MAJ, rot),
+      name = NOTE_NAMES[rot + 1] }
+    scored[#scored + 1] = { s = corr(KRUMHANSL_MIN, rot),
+      name = NOTE_NAMES[rot + 1] .. 'm' }
+  end
+  table.sort(scored, function(x, y) return x.s > y.s end)
+  local keys = { scored[1].name }
+  -- вторая тональность — если почти не уступает первой
+  if scored[2].s > scored[1].s * 0.97 then keys[2] = scored[2].name end
+
+  -- BPM: автокорреляция огибающей (убираем среднее)
+  local env, n = an.env, #an.env
+  local bpm
+  if n > 64 then
+    local mean = 0
+    for i = 1, n do mean = mean + env[i] end
+    mean = mean / n
+    for i = 1, n do env[i] = env[i] - mean end
+    local dt = 256 / an.sr -- шаг огибающей, сек
+    local best, best_lag = -math.huge, nil
+    local lag_min = math.max(2, math.floor(60 / 180 / dt))
+    local lag_max = math.min(n // 2, math.ceil(60 / 60 / dt))
+    for lag = lag_min, lag_max do
+      local acc = 0
+      for i = 1, n - lag do acc = acc + env[i] * env[i + lag] end
+      acc = acc / (n - lag)
+      if acc > best then best, best_lag = acc, lag end
+    end
+    if best_lag then
+      bpm = math.floor(60 / (best_lag * dt) + 0.5)
+    end
+  end
+  return keys, bpm
+end
+
+-- очередь анализа: карточка за карточкой, окна порциями по бюджету кадра
+local function analyze_start(paths)
+  local queue = {}
+  for _, p in ipairs(paths) do queue[#queue + 1] = p end
+  if #queue == 0 then
+    logf('warn', T('выборка пуста (sel <pat>)'))
+    return
+  end
+  state.analysis = { queue = queue, cur = nil, done = 0, total = #queue }
+end
+
+local function analyze_step()
+  local A = state.analysis
+  if not A then return end
+  if not A.cur then
+    local p = table.remove(A.queue, 1)
+    if not p then
+      logf('ok', string.format(T('Анализ готов: %d'), A.done))
+      state.analysis = nil
+      return
+    end
+    local c = state.index.projects[p]
+    local audio = c and find_preview_audio(c)
+    if not (audio and audio:lower():match('%.wav$')) then
+      if c then logf('warn', '✗ ' .. c.name .. ' ' .. T('(нужен wav-превью)')) end
+      return
+    end
+    A.cur = an_begin(c, audio)
+    if not A.cur then
+      logf('warn', '✗ ' .. c.name)
+      return
+    end
+    return
+  end
+  local an = A.cur
+  local frame_end = reaper.time_precise() + 0.015
+  local more = true
+  while more and reaper.time_precise() < frame_end do
+    more = an_window(an)
+  end
+  if not more then
+    local keys, bpm = an_finish(an)
+    an.card.keys_detected = keys
+    an.card.bpm_detected = bpm
+    save_index_soon()
+    logf('ok', string.format('♪ %s: %s%s', an.card.name,
+      table.concat(keys, '/'), bpm and (' · ' .. bpm .. 'bpm') or ''))
+    A.done = A.done + 1
+    A.cur = nil
+  end
 end
 
 -- Поиск готового рендера по всей ФС (Spotlight). mdfind блокирует на
@@ -3472,7 +3716,33 @@ local function draw_big_player(entry)
     return math.min(math.max(k * beat - off, 0), w.len)
   end
 
-  ImGui.TextDisabled(ctx, T('плеер: ') .. card.name)
+  local ebpm = eff_bpm(card)
+  ImGui.TextDisabled(ctx, T('плеер: ') .. card.name
+    .. (ebpm and ('  ' .. ebpm .. 'bpm') or '')
+    .. (card.keys_detected and ('  ' ..
+        table.concat(card.keys_detected, '/')) or ''))
+  ImGui.SameLine(ctx)
+  -- питч-крутилка: полутоны, live на играющее превью
+  ImGui.SetNextItemWidth(ctx, 74)
+  local pv = pitch_map[card.path] or 0
+  local pchg, pnew = ImGui.DragDouble(ctx, '###pitch' .. card.path,
+    pv, 0.05, -12, 12, 'pt %+.1f')
+  if pchg then
+    pitch_map[card.path] = pnew ~= 0 and pnew or nil
+    if players[audio] then
+      reaper.CF_Preview_SetValue(players[audio], 'D_PITCH', pnew)
+    end
+  end
+  if state.btn_tips and ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, T('питч, полутоны · двойной клик — ввод'))
+  end
+  ImGui.SameLine(ctx)
+  if ImGui.SmallButton(ctx, '⚙###an' .. card.path) then
+    analyze_start({ card.path })
+  end
+  if state.btn_tips and ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, T('анализ: тональность и BPM (по wav-превью)'))
+  end
   ImGui.SameLine(ctx)
   if chip(T('снэп') .. (beat and '' or ' (нет bpm)') .. '###lsnap',
       state.loop_snap and beat ~= nil, 0x7BB8D9FF) then
@@ -3575,7 +3845,10 @@ local function draw_big_player(entry)
       -- клик без драга: играть с этого места (сброс выделения)
       bigsel[card.path] = nil
       loop_bounds[audio] = nil
-      if not is_playing(audio) then preview_play(audio, true) end
+      if not is_playing(audio) then
+        preview_play(audio, true)
+        apply_play_fx(card, audio)
+      end
       if players[audio] and w.len > 0 then
         reaper.CF_Preview_SetValue(players[audio], 'D_POSITION',
           frac * w.len)
@@ -3591,6 +3864,7 @@ local function draw_big_player(entry)
       if ImGui.SmallButton(ctx, string.format('▶%d %s–%s###lp%d', li,
           fmt_duration(lp.a), fmt_duration(lp.b), li)) then
         preview_play(audio, true)
+        apply_play_fx(card, audio)
         if players[audio] then
           reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', lp.a)
           loop_bounds[audio] = { a = lp.a, b = lp.b }
@@ -3645,6 +3919,41 @@ local function draw_playq_panel(stack_h)
       playlist = nil
       preview_stop()
     end
+    ImGui.SetNextItemWidth(ctx, 48)
+    local bchg, bnew = ImGui.DragInt(ctx, '###mbpm', state.master_bpm,
+      0.2, 40, 240, '%d')
+    if bchg then
+      state.master_bpm = bnew
+      core.set_setting('master_bpm', tostring(bnew))
+      if state.bpm_sync then
+        -- живое обновление rate всех играющих
+        for p, cc in pairs(state.index.projects) do
+          local a = audio_cache[p]
+          if a and players[a] then apply_play_fx(cc, a) end
+        end
+      end
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, T('мастер-BPM'))
+    end
+    ImGui.SameLine(ctx)
+    if chip('sync###bsync', state.bpm_sync, 0x7FD98AFF) then
+      state.bpm_sync = not state.bpm_sync
+      for p, cc in pairs(state.index.projects) do
+        local a = audio_cache[p]
+        if a and players[a] then
+          if state.bpm_sync then
+            apply_play_fx(cc, a)
+          else
+            reaper.CF_Preview_SetValue(players[a], 'D_PLAYRATE', 1)
+          end
+        end
+      end
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx,
+        T('подгонять темп играющих под мастер-BPM (питч сохраняется)'))
+    end
     ImGui.SameLine(ctx)
     if chip(T('повтор') .. '###pqrep', state.playq_rep, 0x7BB8D9FF) then
       state.playq_rep = not state.playq_rep
@@ -3683,6 +3992,7 @@ local function draw_playq_panel(stack_h)
           el.label, qi), active) then
         -- клик — играть элемент параллельно (лупы крутятся дальше)
         preview_play(el.audio, true)
+        apply_play_fx(el.card, el.audio)
         if players[el.audio] then
           if el.a then
             reaper.CF_Preview_SetValue(players[el.audio], 'D_POSITION', el.a)
@@ -4193,6 +4503,7 @@ local function handle_keys(cards, cols)
           local audio = lp and find_preview_audio(target)
           if lp and audio then
             preview_play(audio, true)
+            apply_play_fx(target, audio)
             if players[audio] then
               reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', lp.a)
               loop_bounds[audio] = { a = lp.a, b = lp.b }
@@ -4264,7 +4575,7 @@ CMDS = {
     con_out('open <pat> · class <класс|-> · tag <имя|-имя> · dl <дд.мм|->')
     con_out('pin · unpin · render · demo · daw <ab|fl|rp|…> · sort <режим>')
     con_out('play [pat] · stop · seq · loop <n> · loops · goto <pat>')
-    con_out('view <вид> · size s|m|l · findprev · rescan · undo · чейн: &&')
+    con_out('view <вид> · size s|m|l · findprev · analyze · rescan · undo')
   end,
   ls = function(args)
     local n = tonumber(args) or 10
@@ -4475,6 +4786,9 @@ CMDS = {
     end
   end,
   findprev = function() findprev_start() end,
+  analyze = function()
+    analyze_start(state.sel)
+  end,
 }
 
 local function run_console(line)
@@ -4522,6 +4836,15 @@ local function draw_console_bottom()
       170, 0, string.format('rescan %d/%d', state.rescan.i, state.rescan.total))
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, '■###rsstop') then state.rescan = nil end
+  end
+  if state.analysis then
+    ImGui.SameLine(ctx)
+    ImGui.ProgressBar(ctx,
+      state.analysis.done / math.max(state.analysis.total, 1), 170, 0,
+      string.format(T('анализ %d/%d'), state.analysis.done,
+        state.analysis.total))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '■###anstop') then state.analysis = nil end
   end
   if state.findprev then
     ImGui.SameLine(ctx)
@@ -4641,6 +4964,7 @@ local function loop()
       rescan_step()  -- фоновый рескан: порция карточек за кадр
       players_step()  -- очистка доигравших превью + шаг плейлиста
       findprev_step() -- поиск превью по ФС: один mdfind за кадр
+      analyze_step()  -- анализ тональности/BPM порциями
       flush_index()   -- отложенная запись индекса
     end
 
