@@ -138,6 +138,11 @@ local EN = {
   ['анализ %d/%d'] = 'analysis %d/%d',
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
+  ['собрать #todo из регионов и заметок'] =
+    'collect #todo from regions and notes',
+  ['#todo: %d проектов'] = '#todo: %d projects',
+  ['сохранить'] = 'save', ['TODO сохранён'] = 'TODO saved',
+  ['собранное'] = 'collected',
   ['очистить плейлист'] = 'clear playlist',
   ['играть по очереди'] = 'play in sequence',
   ['стартовать все одновременно'] = 'start all at once',
@@ -4995,10 +5000,133 @@ local function run_console(line)
 end
 
 -- Нижняя консоль: лог (новые снизу), прогрессы процессов, строка ввода
+-- ---------------------------------------------------------------------------
+-- TODO-блок справа от консоли: собирает #todo из регионов и заметок всех
+-- проектов + свободный текст пользователя. Всё живёт в одном текстовом
+-- файле jf_pm_todo.txt рядом со скриптом: свои строки выше маркера,
+-- собранные — ниже (перезаписываются при обновлении).
+
+local TODO_FILE = SCRIPT_DIR .. '/jf_pm_todo.txt'
+local TODO_MARK = '--- собрано из проектов ---'
+
+local function todo_load()
+  local f = io.open(TODO_FILE, 'rb')
+  if not f then return '', '' end
+  local all = f:read('*a')
+  f:close()
+  local mine, auto = all:match('^(.-)\n?' ..
+    TODO_MARK:gsub('%-', '%%-') .. '\n?(.*)$')
+  if not mine then return all, '' end
+  return mine, auto
+end
+
+local function todo_save(mine, auto)
+  local f = io.open(TODO_FILE, 'wb')
+  if not f then return end
+  f:write(mine:gsub('%s+$', ''), '\n\n', TODO_MARK, '\n', auto or '')
+  f:close()
+end
+
+-- собрать #todo: имена регионов/маркеров + строки заметок с тегом
+local function todo_collect()
+  local out = {}
+  for path, card in pairs(state.index.projects) do
+    local hits = {}
+    local function scan(text, where)
+      if not text or text == '' then return end
+      for line in (text .. '\n'):gmatch('(.-)\n') do
+        if line:lower():find('#todo', 1, true) then
+          local clean = line:gsub('#[Tt][Oo][Dd][Oo]', ''):gsub('%s+', ' ')
+            :match('^%s*(.-)%s*$')
+          hits[#hits + 1] = (where and (where .. ': ') or '') ..
+            (clean ~= '' and clean or '(без текста)')
+        end
+      end
+    end
+    for _, r in ipairs(card.regions or {}) do
+      scan(r.name, fmt_duration(r.pos))
+    end
+    for _, m in ipairs(card.markers or {}) do scan(m.name, fmt_duration(m.pos)) end
+    scan(card.notes)
+    for _, n in ipairs(card.track_notes or {}) do scan(n.s) end
+    for _, n in ipairs(card.item_notes or {}) do scan(n.s) end
+    if #hits > 0 then
+      out[#out + 1] = { name = card.name, path = path, hits = hits }
+    end
+  end
+  table.sort(out, function(x, y) return x.name < y.name end)
+  local lines = {}
+  for _, e in ipairs(out) do
+    lines[#lines + 1] = '# ' .. e.name
+    for _, h in ipairs(e.hits) do lines[#lines + 1] = '  - ' .. h end
+  end
+  return table.concat(lines, '\n'), #out
+end
+
+local TODO_W = 320
 local CONSOLE_H = 158
-local function draw_console_bottom()
-  if not ImGui.BeginChild(ctx, '##consoleb', 0, CONSOLE_H,
+local function draw_todo_panel()
+  if not state.todo_loaded then
+    state.todo_mine, state.todo_auto = todo_load()
+    state.todo_loaded = true
+  end
+  if ImGui.BeginChild(ctx, '##todo', TODO_W, CONSOLE_H,
       ImGui.ChildFlags_Border) then
+    ImGui.TextDisabled(ctx, 'TODO')
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '↻###todoscan') then
+      local auto, n = todo_collect()
+      state.todo_auto = auto
+      todo_save(state.todo_mine or '', auto)
+      logf('ok', string.format(T('#todo: %d проектов'), n))
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, T('собрать #todo из регионов и заметок'))
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, T('сохранить') .. '###todosave') then
+      todo_save(state.todo_mine or '', state.todo_auto or '')
+      logf('ok', T('TODO сохранён'))
+    end
+    ImGui.SameLine(ctx)
+    if chip(T('собранное') .. '###todoauto', state.todo_show_auto,
+        0x7BD9D0FF) then
+      state.todo_show_auto = not state.todo_show_auto
+    end
+    if state.todo_show_auto then
+      -- собранное — только чтение, обновляется кнопкой ↻
+      if ImGui.BeginChild(ctx, '##todoauto', 0, 0) then
+        for line in ((state.todo_auto or '') .. '\n'):gmatch('(.-)\n') do
+          if line:sub(1, 1) == '#' then
+            ImGui.TextColored(ctx, 0xD9B96CFF, line)
+          elseif line ~= '' then
+            ImGui.TextDisabled(ctx, line)
+          end
+        end
+        ImGui.EndChild(ctx)
+      end
+    else
+      local chg, v = ImGui.InputTextMultiline(ctx, '##todomine',
+        state.todo_mine or '', -1, -1)
+      if chg then
+        state.todo_mine = v
+        state.todo_dirty = reaper.time_precise()
+      end
+      -- автосохранение через полторы секунды после последней правки
+      if state.todo_dirty
+         and reaper.time_precise() - state.todo_dirty > 1.5 then
+        todo_save(state.todo_mine or '', state.todo_auto or '')
+        state.todo_dirty = nil
+      end
+    end
+    ImGui.EndChild(ctx)
+  end
+end
+
+local function draw_console_bottom()
+  if not ImGui.BeginChild(ctx, '##consoleb', -(TODO_W + 8), CONSOLE_H,
+      ImGui.ChildFlags_Border) then
+    draw_todo_panel()
     return
   end
   ImGui.TextDisabled(ctx, T('консоль'))
@@ -5082,6 +5210,9 @@ local function draw_console_bottom()
     state.con_focus = true
   end
   ImGui.EndChild(ctx)
+  -- TODO-блок справа от консоли, той же высоты
+  ImGui.SameLine(ctx)
+  draw_todo_panel()
 end
 
 local function loop()
