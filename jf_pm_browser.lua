@@ -137,6 +137,13 @@ local EN = {
   ['(нужен wav-превью)'] = '(wav preview required)',
   ['анализ %d/%d'] = 'analysis %d/%d',
   ['мастер-BPM'] = 'master BPM',
+  ['плейлист'] = 'playlist', ['выборка'] = 'selection',
+  ['очистить плейлист'] = 'clear playlist',
+  ['играть по очереди'] = 'play in sequence',
+  ['стартовать все одновременно'] = 'start all at once',
+  ['sync play: %d'] = 'sync play: %d',
+  ['перетащи сюда карточки'] = 'drag cards here',
+  ['в плейлист: '] = 'to playlist: ',
   ['стоп всех превью (глобальный)'] = 'stop all previews (global)',
   ['мастер тональности (scale sync)'] = 'key master (scale sync)',
   ['слейв: подстроить тональность под мастера'] =
@@ -280,6 +287,8 @@ local state = {
   filter_text = '',         -- fzf: имя, теги, треки
   sel = {},                 -- упорядоченный список путей — порядок = порядок merge
   basket = {},              -- корзина регионов: {path, region} для сборки проекта
+  playq = {},               -- плейлист: пути проектов (drag&drop, порядок)
+  show_playq = false,       -- панель плейлиста открыта
   recent = core.recent_projects(), -- порядок открытия из reaper.ini
   log = {},                 -- консоль: последние действия (новые сверху)
   con_text = '',            -- ввод консоли
@@ -1734,7 +1743,12 @@ local function draw_wave_strip(card, width, height, multi)
   local sel_mod = wmods & ImGui.Mod_Ctrl ~= 0 or wmods & ImGui.Mod_Super ~= 0
   -- клик — играть с места клика / сик; Cmd+клик — мимо плеера, карточке
   -- (выделение → карточка попадает в плейлист); правый клик — стоп
-  if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) and not sel_mod then
+  if ImGui.IsMouseDoubleClicked(ctx, ImGui.MouseButton_Left)
+     and ImGui.IsItemHovered(ctx) then
+    -- двойной клик по волне — открыть проект (как по карточке)
+    open_project(card.path)
+    clicked = true
+  elseif ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) and not sel_mod then
     local mx = ImGui.GetMousePos(ctx)
     local frac = math.min(math.max((mx - x0) / width, 0), 1)
     -- параллельно всегда: чужой луп в большом плеере не гасится
@@ -3007,7 +3021,10 @@ local function draw_card(entry, i, card_w)
         ImGui.SetTooltip(ctx, card.name)
         local lm = ImGui.GetKeyMods(ctx)
         local lsel = lm & ImGui.Mod_Ctrl ~= 0 or lm & ImGui.Mod_Super ~= 0
-        if ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left)
+        if ImGui.IsMouseDoubleClicked(ctx, ImGui.MouseButton_Left) then
+          open_project(card.path) -- двойной клик по логотипу — открыть
+          inner_click = true
+        elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left)
            and not lsel then
           -- cmd+клик пропускаем карточке: выделение вместо плей
           if audio then preview_toggle(audio, true) end
@@ -3172,6 +3189,12 @@ local function draw_card(entry, i, card_w)
     if expanded then draw_card_details(card, meta) end
     if draw_card_icons(card, meta, i, expanded) then inner_click = true end
     ImGui.EndChild(ctx)
+  end
+  -- карточку можно перетащить в плейлист (payload как в канбане)
+  if ImGui.BeginDragDropSource(ctx) then
+    ImGui.SetDragDropPayload(ctx, 'JF_PM_CARD', card.path)
+    ImGui.Text(ctx, card.name)
+    ImGui.EndDragDropSource(ctx)
   end
   ::card_done::
   if hilite then
@@ -3962,7 +3985,8 @@ end
 -- ▶ — последовательно (поверх параллельных лупов), повтор — по кругу.
 local function build_playq()
   local q = {}
-  for _, p in ipairs(state.sel) do
+  local src = #state.playq > 0 and state.playq or state.sel
+  for _, p in ipairs(src) do
     local c = state.index.projects[p]
     if c then
       local a = find_preview_audio(c)
@@ -3983,11 +4007,52 @@ local function draw_playq_panel(stack_h)
   local q = build_playq()
   if ImGui.BeginChild(ctx, '##playq', 270, stack_h,
       ImGui.ChildFlags_Border) then
+    ImGui.TextDisabled(ctx, T('плейлист') ..
+      (#state.playq > 0 and (' (' .. #state.playq .. ')') or
+        (' · ' .. T('выборка'))))
+    ImGui.SameLine(ctx)
+    if ImGui.SmallButton(ctx, '×###pqclear') then
+      state.playq = {}
+      playlist = nil
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, T('очистить плейлист'))
+    end
     if ImGui.SmallButton(ctx, '▶###pqplay') then
       if #q > 0 then
         playlist = { queue = q, i = 1, started = false,
           rep = state.playq_rep }
       end
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, T('играть по очереди'))
+    end
+    ImGui.SameLine(ctx)
+    -- sync play: всё стартует одновременно (с BPM-синком ложится в грув)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x7FD98AFF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x111213FF)
+    local syncgo = ImGui.SmallButton(ctx, '⇉ sync###pqsync')
+    ImGui.PopStyleColor(ctx, 2)
+    if syncgo then
+      playlist = nil
+      preview_stop()
+      for _, el in ipairs(q) do
+        preview_play(el.audio, true)
+        if el.card then apply_play_fx(el.card, el.audio) end
+        if players[el.audio] then
+          if el.a then
+            reaper.CF_Preview_SetValue(players[el.audio], 'D_POSITION', el.a)
+            loop_bounds[el.audio] = { a = el.a, b = el.b }
+          else
+            reaper.CF_Preview_SetValue(players[el.audio], 'D_POSITION', 0)
+            loop_bounds[el.audio] = nil
+          end
+        end
+      end
+      logf('act', string.format(T('sync play: %d'), #q))
+    end
+    if state.btn_tips and ImGui.IsItemHovered(ctx) then
+      ImGui.SetTooltip(ctx, T('стартовать все одновременно'))
     end
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, '■###pqstop') then
@@ -4066,6 +4131,15 @@ local function draw_playq_panel(stack_h)
       local active = playlist and playlist.queue[playlist.i]
         and playlist.queue[playlist.i].audio == el.audio
         and playlist.queue[playlist.i].a == el.a
+      if ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Right)
+         and ImGui.IsItemHovered(ctx) and #state.playq > 0 then
+        for k, pp in ipairs(state.playq) do
+          if el.card and pp == el.card.path then
+            table.remove(state.playq, k)
+            break
+          end
+        end
+      end
       if ImGui.Selectable(ctx, string.format('%2d %s###pq%d', qi,
           el.label, qi), active) then
         -- клик — играть элемент параллельно (лупы крутятся дальше)
@@ -4081,7 +4155,26 @@ local function draw_playq_panel(stack_h)
         end
       end
     end
+    if #q == 0 then
+      ImGui.TextDisabled(ctx, T('перетащи сюда карточки'))
+    end
     ImGui.EndChild(ctx)
+  end
+  -- drop-зона: карточка из сетки → в плейлист
+  if ImGui.BeginDragDropTarget(ctx) then
+    local ok, payload = ImGui.AcceptDragDropPayload(ctx, 'JF_PM_CARD')
+    if ok and payload then
+      local dup = false
+      for _, p in ipairs(state.playq) do
+        if p == payload then dup = true break end
+      end
+      if not dup then
+        state.playq[#state.playq + 1] = payload
+        logf('act', T('в плейлист: ') ..
+          (state.index.projects[payload] or {}).name or payload)
+      end
+    end
+    ImGui.EndDragDropTarget(ctx)
   end
 end
 
@@ -4097,6 +4190,15 @@ local function draw_toolbar()
   end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, T('галерея')) then export_gallery() end
+  ImGui.SameLine(ctx)
+  if chip('playlist' .. (#state.playq > 0 and
+      (' ' .. #state.playq) or '') .. '###pqtoggle',
+      state.show_playq, 0x7FD98AFF) then
+    state.show_playq = not state.show_playq
+  end
+  if state.btn_tips and ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, T('панель плейлиста: перетащи карточки, sync play'))
+  end
   -- громкость превью (слайдер — согласованное исключение, как выпадашка)
   ImGui.SameLine(ctx)
   ImGui.SetNextItemWidth(ctx, 90)
@@ -4995,9 +5097,11 @@ local function loop()
     -- большие плееры: выбранные — стеком один над другим (совмещение
     -- лупов из разных треков), иначе — сфокусированная карточка
     if state.view == 0 then
-      if #state.sel > 0 then
-        local nshow = math.min(#state.sel, 4)
-        local stack_h = nshow * 118 + 24
+      local want_panel = state.show_playq or #state.playq > 0
+        or #state.sel > 0
+      if want_panel then
+        local nshow = math.max(1, math.min(#state.sel, 4))
+        local stack_h = (#state.sel > 0 and nshow * 118 or 132) + 24
         draw_playq_panel(stack_h)
         ImGui.SameLine(ctx)
         ImGui.BeginGroup(ctx)
