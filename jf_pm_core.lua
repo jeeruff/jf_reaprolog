@@ -1193,6 +1193,80 @@ function M.trim_wav_silence(path, max_lead_sec, max_tail_sec)
 end
 
 -- ===========================================================================
+-- Авто-категория и рейтинг: подсказка по содержимому проекта
+-- ===========================================================================
+
+-- Категория выводится из формы материала, а не из желания пользователя:
+-- имя с test/тест → тест; коротыш < 60 c → семпл; длинный джем > 30 мин;
+-- много треков и регионов → аранжировка. Возвращает nil, если не уверены.
+function M.auto_category(card)
+  local n = (card.name or ''):lower()
+  if n:find('test', 1, true) or n:find('тест', 1, true)
+     or n:find('проба', 1, true) then
+    return 'тест'
+  end
+  local dur = card.duration or 0
+  local tracks = card.track_count or 0
+  local regions = #(card.regions or {})
+  if dur > 0 and dur < 60 then return 'семпл' end
+  if dur > 1800 then return 'джем' end
+  if tracks >= 6 and regions >= 3 then return 'аранжировка' end
+  if dur > 0 and dur < 240 and regions <= 1 and tracks <= 3 then
+    return 'скетч'
+  end
+  return nil
+end
+
+-- Рейтинг тейков: '#+', '#++'… в именах регионов → максимум плюсов.
+-- Проект с плюсами помечается смайликом на карточке.
+function M.take_rating(card)
+  local best = 0
+  for _, r in ipairs(card.regions or {}) do
+    for plus in (r.name or ''):gmatch('#(%+*)') do
+      if #plus > best then best = #plus end
+    end
+  end
+  return best
+end
+
+-- Ключ дубликата: имя без версий/дат/bpm-тегов и служебных суффиксов.
+-- 'sv-track_v3 [140] copy 2' и 'sv track v3' дают один ключ.
+function M.dup_key(name)
+  local s = (name or ''):lower()
+  s = s:gsub('%[.-%]', ' ')                       -- [140], [bpm]
+  s = s:gsub('%d%d%d%d%-%d%d%-%d%d', ' ')          -- ISO-даты
+  s = s:gsub('%f[%w]%d%d%d%d%d%d%f[%D]', ' ')      -- ддммгг/ггммдд
+  s = s:gsub('%f[%w]v%d+%f[%D]', ' ')              -- v2, v13
+  s = s:gsub('[%s%p_]+', ' ')                       -- разделители → пробел
+  -- служебные слова целиком (после нормализации разделителей)
+  for _, w in ipairs({ 'copy', 'копия', 'final', 'финал', 'bpm',
+                       'export', 'экспорт', 'backup', 'бэкап' }) do
+    s = s:gsub('%f[%w]' .. w .. '%f[%W]', ' ')
+  end
+  s = s:gsub('%s+', '')                            -- сжать окончательно
+  s = s:gsub('%d+$', '')                           -- хвостовые номера
+  return s
+end
+
+-- Группы вероятных дублей по всему индексу: {ключ → {карточки}}, только
+-- группы от двух. Для отчёта и фильтра «дубли».
+function M.duplicate_groups(projects)
+  local by = {}
+  for _, card in pairs(projects) do
+    local k = M.dup_key(card.name)
+    if #k >= 3 then
+      by[k] = by[k] or {}
+      by[k][#by[k] + 1] = card
+    end
+  end
+  local groups = {}
+  for k, list in pairs(by) do
+    if #list > 1 then groups[k] = list end
+  end
+  return groups
+end
+
+-- ===========================================================================
 -- Переименование проекта
 -- ===========================================================================
 -- Переименовывает всё с префиксом старого имени: .rpp, бэкапы (в папке и в

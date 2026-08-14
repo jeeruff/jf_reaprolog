@@ -138,6 +138,15 @@ local EN = {
   ['анализ %d/%d'] = 'analysis %d/%d',
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
+  ['дубли'] = 'dups',
+  ['проекты с похожими именами (версии, копии)'] =
+    'projects with similar names (versions, copies)',
+  ['удачные тейки: %s'] = 'good takes: %s',
+  ['подсказка по содержимому · клик — принять'] =
+    'guess from content · click to accept',
+  ['групп дублей: %d'] = 'duplicate groups: %d',
+  ['фильтр категории снят'] = 'category filter off',
+  ['классов проставлено: %d'] = 'classes set: %d',
   ['собрать #todo из регионов и заметок'] =
     'collect #todo from regions and notes',
   ['#todo: %d проектов'] = '#todo: %d projects',
@@ -314,7 +323,9 @@ local state = {
   tag_add_path = nil,       -- карточка с открытым полем нового тега
   tag_add_text = '',
   filter_tags = {},         -- активные теги-фильтры (AND)
-  filter_empty = false,     -- показывать только пустышки (∅)
+  filter_empty = false,
+  filter_dups = false,      -- только вероятные дубли
+  filter_cat = nil,         -- авто-категория: тест/семпл/скетч/джем/аранжировка     -- показывать только пустышки (∅)
 }
 
 local STATUS_ORDER = {}
@@ -570,6 +581,13 @@ end
 local collect_cache = { key = nil, gen = -1, cards = nil }
 
 local function collect_cards()
+  -- группы дублей — по поколению данных (дорого, но редко)
+  if state.filter_dups and state.dup_gen ~= data_gen then
+    local groups = core.duplicate_groups(state.index.projects)
+    local keys = {}
+    for k in pairs(groups) do keys[k] = true end
+    state.dup_keys, state.dup_gen = keys, data_gen
+  end
   -- ключ пересборки: все входы, влияющие на состав и порядок; плюс
   -- data_gen — любое изменение данных индекса
   local tags_key = {}
@@ -577,7 +595,8 @@ local function collect_cards()
   table.sort(tags_key)
   local ckey = table.concat({
     state.filter_status, state.filter_text, state.filter_daw or '',
-    state.filter_empty and 1 or 0, state.sort_mode,
+    state.filter_empty and 1 or 0, state.filter_dups and 1 or 0,
+    state.filter_cat or '', state.sort_mode,
     state.sort_rev and 1 or 0, table.concat(tags_key, ','), LANG,
   }, '|')
   if collect_cache.gen == data_gen and collect_cache.key == ckey then
@@ -607,6 +626,12 @@ local function collect_cards()
     if ok and state.filter_empty then ok = core.is_empty_project(card) end
     if ok and state.filter_daw then
       ok = (card.daw or 'reaper') == state.filter_daw
+    end
+    if ok and state.filter_cat then
+      ok = core.auto_category(card) == state.filter_cat
+    end
+    if ok and state.filter_dups then
+      ok = (state.dup_keys or {})[core.dup_key(card.name)] ~= nil
     end
     -- фильтр по тегам-чипам: карточка должна иметь все активные (AND)
     if ok and next(state.filter_tags) then
@@ -3089,6 +3114,16 @@ local function draw_card(entry, i, card_w)
     ImGui.SameLine(ctx,
       card_w - ImGui.CalcTextSize(ctx, right) - 12)
     ImGui.TextDisabled(ctx, right)
+    -- рейтинг тейков: смайлик, если в регионах есть #+
+    local rating = core.take_rating(card)
+    if rating > 0 then
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, 0x7FD98AFF, rating >= 3 and '★' or '☺')
+      if state.btn_tips and ImGui.IsItemHovered(ctx) then
+        ImGui.SetTooltip(ctx, string.format(T('удачные тейки: %s'),
+          string.rep('+', rating)))
+      end
+    end
     if core.is_empty_project(card) then
       -- пустышка: ни одного айтема или ни одного аудиофайла в папке
       ImGui.SameLine(ctx)
@@ -3140,6 +3175,21 @@ local function draw_card(entry, i, card_w)
       ImGui.SameLine(ctx)
       ImGui.TextColored(ctx, deadline_color(meta.deadline, os.time()),
         '→ ' .. os.date('%d.%m', meta.deadline))
+    end
+    if meta.status == '' then
+      -- класса нет — показываем догадку по содержимому
+      local cat = core.auto_category(card)
+      if cat then
+        ImGui.SameLine(ctx)
+        ImGui.TextColored(ctx, CAT_COLORS[cat] or 0x8A8F93FF, '~' .. cat)
+        if state.btn_tips and ImGui.IsItemHovered(ctx) then
+          ImGui.SetTooltip(ctx, T('подсказка по содержимому · клик — принять'))
+        end
+        if ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) then
+          set_status(card, cat)
+          inner_click = true
+        end
+      end
     end
     if card.needs_report then
       ImGui.SameLine(ctx)
@@ -3752,6 +3802,11 @@ local function draw_settings()
   ImGui.Separator(ctx)
 end
 
+local CAT_COLORS = {
+  ['тест'] = 0x8A8F93FF, ['семпл'] = 0x7BD9D0FF, ['скетч'] = 0x9A9AD9FF,
+  ['джем'] = 0xD9A87BFF, ['аранжировка'] = 0xD9B96CFF,
+}
+
 local LOG_COLORS = {
   act = 0xB5B8BAFF, undo = 0x7BB8D9FF, del = 0xE06060FF,
   warn = 0xD9B96CFF, ok = 0x7FD98AFF, cmd = 0x7BD9D0FF, ['in'] = 0xD9B96CFF,
@@ -4261,6 +4316,20 @@ local function draw_toolbar()
   if chip('∅ ' .. T('пустые') .. '###fempty', state.filter_empty) then
     state.filter_empty = not state.filter_empty
   end
+  ImGui.SameLine(ctx)
+  if chip('⧉ ' .. T('дубли') .. '###fdups', state.filter_dups, 0xE06060FF) then
+    state.filter_dups = not state.filter_dups
+  end
+  if state.btn_tips and ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, T('проекты с похожими именами (версии, копии)'))
+  end
+  for _, cat in ipairs({ 'семпл', 'скетч', 'джем', 'аранжировка', 'тест' }) do
+    ImGui.SameLine(ctx)
+    if chip('~' .. cat .. '###fcat' .. cat, state.filter_cat == cat,
+        CAT_COLORS[cat]) then
+      state.filter_cat = state.filter_cat ~= cat and cat or nil
+    end
+  end
   -- чипы DAW: появляются, когда в индексе есть чужие проекты (кэш)
   if not state.daws_cache or state.daws_gen ~= data_gen then
     local daws = {}
@@ -4761,6 +4830,7 @@ CMDS = {
     con_out('pin · unpin · render · demo · daw <ab|fl|rp|…> · sort <режим>')
     con_out('play [pat] · stop · seq · loop <n> · loops · goto <pat>')
     con_out('view <вид> · size s|m|l · findprev · analyze · rescan · undo')
+    con_out('dups · cat <категория|off> · autoclass')
   end,
   ls = function(args)
     local n = tonumber(args) or 10
@@ -4969,6 +5039,43 @@ CMDS = {
         return
       end
     end
+  end,
+  dups = function()
+    local groups = core.duplicate_groups(state.index.projects)
+    local list = {}
+    for k, g in pairs(groups) do list[#list + 1] = { k = k, n = #g, g = g } end
+    table.sort(list, function(x, y) return x.n > y.n end)
+    for i = 1, math.min(10, #list) do
+      con_out('%2d× %s', list[i].n, list[i].g[1].name)
+    end
+    con_out(T('групп дублей: %d'), #list)
+  end,
+  cat = function(args)
+    if args == '' or args == 'off' then
+      state.filter_cat = nil
+      con_out(T('фильтр категории снят'))
+      return
+    end
+    state.filter_cat = args
+    con_out('~%s: %d', args, #collect_cards())
+  end,
+  autoclass = function()
+    -- принять авто-категорию для всех без класса (в выборке или везде)
+    local src = {}
+    if #state.sel > 0 then
+      for _, p in ipairs(state.sel) do src[#src + 1] = state.index.projects[p] end
+    else
+      for _, e in ipairs(collect_cards()) do src[#src + 1] = e.card end
+    end
+    local n = 0
+    for _, c in ipairs(src) do
+      if c and cached_meta(c).status == '' then
+        local cat = core.auto_category(c)
+        if cat then set_status(c, cat, true) n = n + 1 end
+      end
+    end
+    save_index_soon()
+    con_out(T('классов проставлено: %d'), n)
   end,
   findprev = function() findprev_start() end,
   analyze = function()

@@ -265,6 +265,41 @@ do
   _G.reaper = nil
 end
 
+print('== auto_category / take_rating / dup_key ==')
+do
+  local function C(t) return t end
+  eq(core.auto_category({ name = 'flute test 3', duration = 500 }), 'тест',
+    'test в имени')
+  eq(core.auto_category({ name = 'kick', duration = 12 }), 'семпл',
+    'коротыш → семпл')
+  eq(core.auto_category({ name = 'long night', duration = 3600 }), 'джем',
+    'длинный → джем')
+  eq(core.auto_category({ name = 'song', duration = 300, track_count = 9,
+    regions = { {}, {}, {} } }), 'аранжировка', 'треки+регионы')
+  eq(core.auto_category({ name = 'idea', duration = 120, track_count = 2,
+    regions = {} }), 'скетч', 'короткий и простой → скетч')
+  eq(core.auto_category({ name = 'x', duration = 600, track_count = 2,
+    regions = {} }), nil, 'неуверенно → nil')
+
+  eq(core.take_rating({ regions = { { name = 'intro' },
+    { name = 'hook #++' }, { name = 'v2 #+' } } }), 2, 'максимум плюсов')
+  eq(core.take_rating({ regions = { { name = 'intro' } } }), 0, 'без рейтинга')
+
+  eq(core.dup_key('slawa-tunnel-flver_5'), core.dup_key('slawa tunnel flver'),
+    'версии дают один ключ')
+  eq(core.dup_key('track [140] v3'), core.dup_key('track copy'),
+    'bpm-тег, версия и copy вычищаются')
+  check(core.dup_key('bass') ~= core.dup_key('drums'), 'разные — разный ключ')
+
+  local groups = core.duplicate_groups({
+    a = { name = 'song v1' }, b = { name = 'song v2' },
+    c = { name = 'other' },
+  })
+  local n = 0
+  for _ in pairs(groups) do n = n + 1 end
+  eq(n, 1, 'одна группа дублей')
+end
+
 print('== rename_project ==')
 do
   -- стаб reaper.* поверх ls (как в рескан-харнессе)
