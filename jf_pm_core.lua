@@ -1249,7 +1249,8 @@ function M.dup_key(name)
 end
 
 -- Группы вероятных дублей по всему индексу: {ключ → {карточки}}, только
--- группы от двух. Для отчёта и фильтра «дубли».
+-- группы от двух. Имя — лишь кандидат; настоящую проверку делает
+-- M.duplicate_verdict по содержимому.
 function M.duplicate_groups(projects)
   local by = {}
   for _, card in pairs(projects) do
@@ -1264,6 +1265,98 @@ function M.duplicate_groups(projects)
     if #list > 1 then groups[k] = list end
   end
   return groups
+end
+
+-- Отпечаток файла: размер + хеш выборки байт (голова, середина, хвост).
+-- Читаем максимум 3×64 КБ — дёшево даже для гигабайтных сессий.
+function M.file_fingerprint(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil end
+  local size = f:seek('end')
+  local CH = 65536
+  local parts = {}
+  local spots = { 0, math.max(0, size // 2 - CH // 2), math.max(0, size - CH) }
+  for _, off in ipairs(spots) do
+    f:seek('set', off)
+    parts[#parts + 1] = f:read(math.min(CH, size)) or ''
+  end
+  f:close()
+  local h = 2166136261
+  for _, chunk in ipairs(parts) do
+    for i = 1, #chunk do
+      h = ((h ~ chunk:byte(i)) * 16777619) & 0xFFFFFFFF
+    end
+  end
+  return { size = size, hash = h }
+end
+
+-- Настоящая проверка пары: 'copy' — побайтно одинаковые (безопасно
+-- удалять), 'version' — тот же проект в развитии (разный размер/содержимое,
+-- но общая структура), 'backup' — один из файлов лежит в папке бэкапов
+-- или помечен как автосейв, 'different' — просто похожие имена.
+function M.duplicate_verdict(a, b)
+  local function is_backup(card)
+    local p = (card.path or ''):lower()
+    local n = (card.name or ''):lower()
+    return p:find('/backup', 1, true) ~= nil
+      or p:find('backups/', 1, true) ~= nil
+      or n:find('autosave', 1, true) ~= nil
+      or n:find('autosaved', 1, true) ~= nil
+      or n:find('%.bak%.') ~= nil
+      or n:find('overwritten', 1, true) ~= nil
+  end
+  if is_backup(a) or is_backup(b) then return 'backup' end
+
+  local fa = M.file_fingerprint(a.path)
+  local fb = M.file_fingerprint(b.path)
+  if fa and fb and fa.size == fb.size and fa.hash == fb.hash then
+    return 'copy'
+  end
+
+  -- разные DAW — разные вещи, как бы ни звались
+  if (a.daw or 'reaper') ~= (b.daw or 'reaper') then return 'different' end
+
+  -- .rpp: сравниваем структуру, а не байты
+  if not a.daw and not b.daw then
+    local da = a.duration or 0
+    local db = b.duration or 0
+    local ta = a.track_count or 0
+    local tb = b.track_count or 0
+    local same_tracks = ta > 0 and tb > 0
+      and math.abs(ta - tb) <= math.max(1, math.floor(math.max(ta, tb) * 0.25))
+    local same_dur = da > 0 and db > 0
+      and math.abs(da - db) <= math.max(5, math.max(da, db) * 0.15)
+    if same_tracks and same_dur then return 'version' end
+    return 'different'
+  end
+
+  -- чужие DAW: содержимое не парсим — судим по размеру файла
+  local sa, sb = a.size or 0, b.size or 0
+  if sa > 0 and sb > 0 then
+    local ratio = math.min(sa, sb) / math.max(sa, sb)
+    if ratio > 0.7 then return 'version' end
+  end
+  return 'different'
+end
+
+-- Разбор группы: вердикты для всех пар относительно самого свежего файла.
+-- Возвращает { copies = {…}, versions = {…}, backups = {…}, others = {…} }.
+function M.classify_group(list)
+  local sorted = {}
+  for i, c in ipairs(list) do sorted[i] = c end
+  table.sort(sorted, function(x, y) return (x.mtime or 0) > (y.mtime or 0) end)
+  local newest = sorted[1]
+  local out = { newest = newest, copies = {}, versions = {},
+                backups = {}, others = {} }
+  for i = 2, #sorted do
+    local v = M.duplicate_verdict(newest, sorted[i])
+    local bucket = (v == 'copy' and out.copies)
+      or (v == 'version' and out.versions)
+      or (v == 'backup' and out.backups)
+      or out.others
+    bucket[#bucket + 1] = sorted[i]
+  end
+  return out
 end
 
 -- ===========================================================================

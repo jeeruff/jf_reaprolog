@@ -300,6 +300,35 @@ do
   eq(n, 1, 'одна группа дублей')
 end
 
+print('== duplicate_verdict ==')
+do
+  local tmp1, tmp2 = os.tmpname(), os.tmpname()
+  local body = string.rep('REAPER-PROJECT-DATA', 5000)
+  io.open(tmp1, 'wb'):write(body):close()
+  io.open(tmp2, 'wb'):write(body):close()
+  local a = { path = tmp1, name = 'song', duration = 100, track_count = 4 }
+  local b2 = { path = tmp2, name = 'song copy', duration = 100, track_count = 4 }
+  eq(core.duplicate_verdict(a, b2), 'copy', 'побайтно равные → copy')
+
+  io.open(tmp2, 'wb'):write(body .. 'MORE'):close()
+  eq(core.duplicate_verdict(a, b2), 'version',
+    'структура совпала, байты нет → version')
+
+  local far = { path = tmp2, name = 'song', duration = 900, track_count = 30 }
+  eq(core.duplicate_verdict(a, far), 'different', 'разная структура → different')
+
+  local bak = { path = '/x/Backup/song.als', name = 'song', daw = 'ableton' }
+  eq(core.duplicate_verdict(a, bak), 'backup', 'папка Backup → backup')
+  local auto = { path = '/x/song (autosaved at 14h).flp', daw = 'flstudio',
+    name = 'song (autosaved at 14h)' }
+  eq(core.duplicate_verdict(a, auto), 'backup', 'autosaved → backup')
+
+  local ab = { path = tmp1, name = 'x', daw = 'ableton', size = 100 }
+  local fl = { path = tmp2, name = 'x', daw = 'flstudio', size = 100 }
+  eq(core.duplicate_verdict(ab, fl), 'different', 'разные DAW → different')
+  os.remove(tmp1) os.remove(tmp2)
+end
+
 print('== rename_project ==')
 do
   -- стаб reaper.* поверх ls (как в рескан-харнессе)

@@ -139,6 +139,10 @@ local EN = {
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
   ['дубли'] = 'dups',
+  ['побайтная копия — можно удалять'] = 'byte-identical copy — safe to delete',
+  ['версия того же проекта'] = 'version of the same project',
+  ['групп: %d · побайтных копий: %d · версий: %d'] =
+    'groups: %d · byte copies: %d · versions: %d',
   ['проекты с похожими именами (версии, копии)'] =
     'projects with similar names (versions, copies)',
   ['удачные тейки: %s'] = 'good takes: %s',
@@ -583,10 +587,19 @@ local collect_cache = { key = nil, gen = -1, cards = nil }
 local function collect_cards()
   -- группы дублей — по поколению данных (дорого, но редко)
   if state.filter_dups and state.dup_gen ~= data_gen then
+    -- проверяем содержимым: в фильтр попадают только подтверждённые
+    -- копии и версии (и их «оригинал»), похожие имена отсеиваются
     local groups = core.duplicate_groups(state.index.projects)
-    local keys = {}
-    for k in pairs(groups) do keys[k] = true end
-    state.dup_keys, state.dup_gen = keys, data_gen
+    local marks = {}
+    for _, list in pairs(groups) do
+      local r = core.classify_group(list)
+      if #r.copies > 0 or #r.versions > 0 then
+        marks[r.newest.path] = 'newest'
+        for _, c in ipairs(r.copies) do marks[c.path] = 'copy' end
+        for _, c in ipairs(r.versions) do marks[c.path] = 'version' end
+      end
+    end
+    state.dup_marks, state.dup_gen = marks, data_gen
   end
   -- ключ пересборки: все входы, влияющие на состав и порядок; плюс
   -- data_gen — любое изменение данных индекса
@@ -631,7 +644,7 @@ local function collect_cards()
       ok = core.auto_category(card) == state.filter_cat
     end
     if ok and state.filter_dups then
-      ok = (state.dup_keys or {})[core.dup_key(card.name)] ~= nil
+      ok = (state.dup_marks or {})[card.path] ~= nil
     end
     -- фильтр по тегам-чипам: карточка должна иметь все активные (AND)
     if ok and next(state.filter_tags) then
@@ -3114,6 +3127,18 @@ local function draw_card(entry, i, card_w)
     ImGui.SameLine(ctx,
       card_w - ImGui.CalcTextSize(ctx, right) - 12)
     ImGui.TextDisabled(ctx, right)
+    -- метка дубля (когда включён фильтр «дубли»)
+    local dmark = state.filter_dups and (state.dup_marks or {})[card.path]
+    if dmark and dmark ~= 'newest' then
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, dmark == 'copy' and 0xE06060FF or 0xD9B96CFF,
+        dmark == 'copy' and '⧉' or '⧉v')
+      if state.btn_tips and ImGui.IsItemHovered(ctx) then
+        ImGui.SetTooltip(ctx, dmark == 'copy'
+          and T('побайтная копия — можно удалять')
+          or T('версия того же проекта'))
+      end
+    end
     -- рейтинг тейков: смайлик, если в регионах есть #+
     local rating = core.take_rating(card)
     if rating > 0 then
@@ -5040,15 +5065,31 @@ CMDS = {
       end
     end
   end,
-  dups = function()
+  dups = function(args)
     local groups = core.duplicate_groups(state.index.projects)
-    local list = {}
-    for k, g in pairs(groups) do list[#list + 1] = { k = k, n = #g, g = g } end
+    local list, tc, tv = {}, 0, 0
+    for _, g in pairs(groups) do
+      local r = core.classify_group(g)
+      tc = tc + #r.copies
+      tv = tv + #r.versions
+      if #r.copies > 0 or #r.versions > 0 then
+        list[#list + 1] = { r = r, n = #r.copies * 100 + #r.versions }
+      end
+    end
     table.sort(list, function(x, y) return x.n > y.n end)
     for i = 1, math.min(10, #list) do
-      con_out('%2d× %s', list[i].n, list[i].g[1].name)
+      local r = list[i].r
+      con_out('%s — копий %d, версий %d', trunc(r.newest.name, 26),
+        #r.copies, #r.versions)
     end
-    con_out(T('групп дублей: %d'), #list)
+    con_out(T('групп: %d · побайтных копий: %d · версий: %d'),
+      #list, tc, tv)
+    if args == 'copies' then
+      -- список именно копий: их безопасно удалять
+      for _, e in ipairs(list) do
+        for _, c in ipairs(e.r.copies) do con_out('  ⧉ ' .. c.path) end
+      end
+    end
   end,
   cat = function(args)
     if args == '' or args == 'off' then
