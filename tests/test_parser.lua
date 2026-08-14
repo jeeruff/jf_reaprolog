@@ -300,6 +300,21 @@ do
   eq(n, 1, 'одна группа дублей')
 end
 
+print('== trash ==')
+do
+  local fresh = { trashed = os.time() }
+  eq(core.trash_days_left(fresh), core.TRASH_DAYS, 'свежий: полный срок')
+  eq(core.trash_expired(fresh), false, 'свежий не просрочен')
+
+  local old_c = { trashed = os.time() - (core.TRASH_DAYS + 1) * 86400 }
+  eq(core.trash_expired(old_c), true, 'старше срока — просрочен')
+  eq(core.trash_days_left(old_c), 0, 'дней не осталось')
+
+  local half = { trashed = os.time() - 10 * 86400 }
+  eq(core.trash_days_left(half), core.TRASH_DAYS - 10, '10 дней прошло')
+  eq(core.trash_days_left({}), nil, 'не в корзине → nil')
+end
+
 print('== duplicate_verdict ==')
 do
   local tmp1, tmp2 = os.tmpname(), os.tmpname()

@@ -822,6 +822,7 @@ function M.build_card(path, old_card, dir_sizes, dir_audio)
     card.preview_found = old_card.preview_found
     card.keys_detected = old_card.keys_detected
     card.bpm_detected = old_card.bpm_detected
+    card.trashed = old_card.trashed
     if old_card.status_over
        and (old_card.status_over_base or '') == (card.ext.STATUS or '') then
       card.status_over = old_card.status_over
@@ -868,6 +869,7 @@ function M.build_foreign_card(path, ext, old_card, dir_sizes)
     card.loops = old_card.loops
     card.pv_offset = old_card.pv_offset
     card.preview_found = old_card.preview_found
+    card.trashed = old_card.trashed
     card.keys_detected = old_card.keys_detected
     card.bpm_detected = old_card.bpm_detected
   end
@@ -1190,6 +1192,25 @@ function M.trim_wav_silence(path, max_lead_sec, max_tail_sec)
   out:write(data:sub(start, start + new_dsize - 1))
   out:close()
   return true, skip / srate, (frames_total - keep_end) / srate
+end
+
+-- ===========================================================================
+-- Виртуальная корзина: файлы остаются на месте, карточка помечается
+-- временем удаления. Скрыта из каталога, но восстанавливается одним
+-- кликом. Через TRASH_DAYS дней содержимое уезжает в Корзину macOS.
+-- ===========================================================================
+
+M.TRASH_DAYS = 30
+
+function M.trash_days_left(card)
+  if not card.trashed then return nil end
+  local left = M.TRASH_DAYS - (os.time() - card.trashed) / 86400
+  return math.max(0, math.floor(left + 0.5))
+end
+
+function M.trash_expired(card)
+  return card.trashed ~= nil
+    and (os.time() - card.trashed) > M.TRASH_DAYS * 86400
 end
 
 -- ===========================================================================

@@ -138,7 +138,21 @@ local EN = {
   ['анализ %d/%d'] = 'analysis %d/%d',
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
-  ['дубли'] = 'dups',
+  ['дубли'] = 'dups', ['корзина'] = 'trash',
+  ['в корзину: %s · %d дней до удаления'] =
+    'to trash: %s · %d days before deletion',
+  ['в корзину: %d · %d дней до удаления'] =
+    'to trash: %d · %d days before deletion',
+  ['в корзину: '] = 'to trash: ', ['в корзину: %d'] = 'to trash: %d',
+  ['возвращено из корзины: '] = 'restored from trash: ',
+  ['в корзине · %d дней до удаления · × — вернуть'] =
+    'in trash · %d days before deletion · × to restore',
+  ['вернуть все'] = 'restore all',
+  ['удалить просроченные'] = 'purge expired',
+  ['корзина очищена — всё возвращено'] = 'trash emptied — all restored',
+  ['корзина: удалено %d просроченных'] = 'trash: %d expired purged',
+  ['в корзине нет просроченных'] = 'no expired items in trash',
+  ['в корзине: %d'] = 'in trash: %d', ['возвращено: %d'] = 'restored: %d',
   ['побайтная копия — можно удалять'] = 'byte-identical copy — safe to delete',
   ['версия того же проекта'] = 'version of the same project',
   ['групп: %d · побайтных копий: %d · версий: %d'] =
@@ -329,6 +343,7 @@ local state = {
   filter_tags = {},         -- активные теги-фильтры (AND)
   filter_empty = false,
   filter_dups = false,      -- только вероятные дубли
+  filter_trash = false,     -- показывать корзину вместо каталога
   filter_cat = nil,         -- авто-категория: тест/семпл/скетч/джем/аранжировка     -- показывать только пустышки (∅)
 }
 
@@ -609,6 +624,7 @@ local function collect_cards()
   local ckey = table.concat({
     state.filter_status, state.filter_text, state.filter_daw or '',
     state.filter_empty and 1 or 0, state.filter_dups and 1 or 0,
+    state.filter_trash and 1 or 0,
     state.filter_cat or '', state.sort_mode,
     state.sort_rev and 1 or 0, table.concat(tags_key, ','), LANG,
   }, '|')
@@ -645,6 +661,14 @@ local function collect_cards()
     end
     if ok and state.filter_dups then
       ok = (state.dup_marks or {})[card.path] ~= nil
+    end
+    -- корзина: скрыта везде, кроме собственного фильтра
+    if ok then
+      if state.filter_trash then
+        ok = card.trashed ~= nil
+      else
+        ok = card.trashed == nil
+      end
     end
     -- фильтр по тегам-чипам: карточка должна иметь все активные (AND)
     if ok and next(state.filter_tags) then
@@ -930,18 +954,14 @@ local function drop_from_index(path, removed_dir)
 end
 
 -- Удаление в Корзину. Папку целиком — только если это не корень сканирования.
-local function delete_project(card)
+-- Физическое удаление в Корзину macOS (Finder «Положить обратно» работает).
+-- Зовётся из очистки просроченной корзины и по «удалить навсегда».
+local function purge_project(card, whole_dir)
   local dir = card.path:match('^(.*)[/\\]')
   local roots = {}
   for _, p in ipairs(core.get_scan_paths()) do roots[(p:gsub('/+$', ''))] = true end
   local dir_ok = dir and not roots[dir]
-  local r = reaper.MB(
-    'Удалить «' .. card.name .. '» в Корзину?\n\n' ..
-    (dir_ok and 'Да — папку проекта целиком\nНет — только .rpp'
-            or 'Да/Нет — только .rpp (папка — корень сканирования)'),
-    'JF PM — удаление', 3)
-  if r ~= 6 and r ~= 7 then return end
-  local target = (r == 6 and dir_ok) and dir or card.path
+  local target = (whole_dir and dir_ok) and dir or card.path
 
   if not trash_path(target) then
     state.status_msg = 'Удаление: tmp недоступен'
@@ -960,37 +980,70 @@ local function delete_project(card)
     ' — ' .. T('вернуть можно из Корзины Finder'))
 end
 
--- Массовое удаление выделенных: один вопрос на всех
+-- Виртуальная корзина: файлы не двигаются, карточка помечается временем.
+-- Скрыта из каталога, восстанавливается кликом, через месяц уезжает
+-- в Корзину macOS (см. trash_sweep).
+local function delete_project(card)
+  if card.trashed then
+    card.trashed = nil
+    save_index_soon()
+    logf('undo', T('возвращено из корзины: ') .. card.name)
+    return
+  end
+  card.trashed = os.time()
+  save_index_soon()
+  if state.expanded == card.path then state.expanded = nil end
+  local i = sel_index(card.path)
+  if i then table.remove(state.sel, i) end
+  local path = card.path
+  push_undo(T('в корзину: ') .. card.name, function()
+    local c = state.index.projects[path] or card
+    c.trashed = nil
+    save_index_soon()
+  end)
+  logf('del', string.format(T('в корзину: %s · %d дней до удаления'),
+    card.name, core.TRASH_DAYS))
+end
+
+-- Просроченные (>30 дней) — физически в Корзину macOS. Раз в сессию.
+local function trash_sweep(force)
+  local due = {}
+  for _, card in pairs(state.index.projects) do
+    if core.trash_expired(card) then due[#due + 1] = card end
+  end
+  if #due == 0 then
+    if force then logf('ok', T('в корзине нет просроченных')) end
+    return
+  end
+  for _, card in ipairs(due) do
+    purge_project(card, false) -- только .rpp: папку не трогаем без спроса
+  end
+  logf('del', string.format(T('корзина: удалено %d просроченных'), #due))
+end
+
+-- Массовое удаление выделенных — в виртуальную корзину
 local function delete_selected()
   local n = #state.sel
   if n == 0 then return end
-  local roots = {}
-  for _, p in ipairs(core.get_scan_paths()) do roots[(p:gsub('/+$', ''))] = true end
-  local r = reaper.MB(
-    string.format('Удалить %d проект(ов) в Корзину?\n\n' ..
-      'Да — папки целиком (корни сканирования — только .rpp)\nНет — только .rpp', n),
-    'JF PM — удаление', 3)
-  if r ~= 6 and r ~= 7 then return end
-  local removed = 0
+  local marked = {}
   for _, path in ipairs({table.unpack(state.sel)}) do
     local card = state.index.projects[path]
-    if card then
-      local dir = path:match('^(.*)[/\\]')
-      local dir_ok = r == 6 and dir and not roots[dir]
-      local target = dir_ok and dir or path
-      trash_path(target)
-      local still = io.open(path, 'rb')
-      if still then
-        still:close()
-      else
-        drop_from_index(path, dir_ok and dir or nil)
-        removed = removed + 1
-      end
+    if card and not card.trashed then
+      card.trashed = os.time()
+      marked[#marked + 1] = path
     end
   end
-  state.focus = 0
+  state.sel = {}
   save_index_soon()
-  state.status_msg = string.format('В Корзине: %d из %d', removed, n)
+  push_undo(string.format(T('в корзину: %d'), #marked), function()
+    for _, p in ipairs(marked) do
+      local c = state.index.projects[p]
+      if c then c.trashed = nil end
+    end
+    save_index_soon()
+  end)
+  logf('del', string.format(T('в корзину: %d · %d дней до удаления'),
+    #marked, core.TRASH_DAYS))
 end
 
 -- Закрепить все выделенные; если уже все закреплены — открепить
@@ -3127,6 +3180,15 @@ local function draw_card(entry, i, card_w)
     ImGui.SameLine(ctx,
       card_w - ImGui.CalcTextSize(ctx, right) - 12)
     ImGui.TextDisabled(ctx, right)
+    if card.trashed then
+      local left = core.trash_days_left(card)
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, 0xE06060FF, '🗑' .. (left or 0))
+      if state.btn_tips and ImGui.IsItemHovered(ctx) then
+        ImGui.SetTooltip(ctx, string.format(
+          T('в корзине · %d дней до удаления · × — вернуть'), left or 0))
+      end
+    end
     -- метка дубля (когда включён фильтр «дубли»)
     local dmark = state.filter_dups and (state.dup_marks or {})[card.path]
     if dmark and dmark ~= 'newest' then
@@ -4345,6 +4407,31 @@ local function draw_toolbar()
   if chip('⧉ ' .. T('дубли') .. '###fdups', state.filter_dups, 0xE06060FF) then
     state.filter_dups = not state.filter_dups
   end
+  -- корзина: счётчик и вход
+  local ntrash = 0
+  for _, c in pairs(state.index.projects) do
+    if c.trashed then ntrash = ntrash + 1 end
+  end
+  if ntrash > 0 or state.filter_trash then
+    ImGui.SameLine(ctx)
+    if chip('🗑 ' .. T('корзина') .. ' ' .. ntrash .. '###ftrash',
+        state.filter_trash, 0xE06060FF) then
+      state.filter_trash = not state.filter_trash
+      state.filter_dups, state.filter_empty = false, false
+    end
+    if state.filter_trash then
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, T('вернуть все') .. '###trestore') then
+        for _, c in pairs(state.index.projects) do c.trashed = nil end
+        save_index_soon()
+        logf('undo', T('корзина очищена — всё возвращено'))
+      end
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, T('удалить просроченные') .. '###tsweep') then
+        trash_sweep(true)
+      end
+    end
+  end
   if state.btn_tips and ImGui.IsItemHovered(ctx) then
     ImGui.SetTooltip(ctx, T('проекты с похожими именами (версии, копии)'))
   end
@@ -4856,6 +4943,7 @@ CMDS = {
     con_out('play [pat] · stop · seq · loop <n> · loops · goto <pat>')
     con_out('view <вид> · size s|m|l · findprev · analyze · rescan · undo')
     con_out('dups · cat <категория|off> · autoclass')
+    con_out('trash [sweep|restore] — виртуальная корзина (30 дней)')
   end,
   ls = function(args)
     local n = tonumber(args) or 10
@@ -5117,6 +5205,29 @@ CMDS = {
     end
     save_index_soon()
     con_out(T('классов проставлено: %d'), n)
+  end,
+  trash = function(args)
+    if args == 'sweep' then
+      trash_sweep(true)
+    elseif args == 'restore' then
+      local n = 0
+      for _, c in pairs(state.index.projects) do
+        if c.trashed then c.trashed = nil n = n + 1 end
+      end
+      save_index_soon()
+      con_out(T('возвращено: %d'), n)
+    else
+      local n = 0
+      for _, c in pairs(state.index.projects) do
+        if c.trashed then
+          n = n + 1
+          if n <= 10 then
+            con_out('🗑%2d %s', core.trash_days_left(c) or 0, c.name)
+          end
+        end
+      end
+      con_out(T('в корзине: %d'), n)
+    end
   end,
   findprev = function() findprev_start() end,
   analyze = function()
@@ -5426,6 +5537,10 @@ local function loop()
       players_step()  -- очистка доигравших превью + шаг плейлиста
       findprev_step() -- поиск превью по ФС: один mdfind за кадр
       analyze_step()  -- анализ тональности/BPM порциями
+      if not state.trash_swept then
+        state.trash_swept = true
+        trash_sweep(false) -- просроченное — в Корзину macOS, раз за сессию
+      end
       flush_index()   -- отложенная запись индекса
     end
 
