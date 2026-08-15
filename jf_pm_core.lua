@@ -1509,16 +1509,24 @@ function M.auto_category(card)
   return nil
 end
 
--- Рейтинг тейков: '#+', '#++'… в именах регионов → максимум плюсов.
--- Проект с плюсами помечается смайликом на карточке.
+-- Рейтинг: '#*' … '#*****' (звёзды, 5 — лучшее) в именах регионов,
+-- маркеров и в имени проекта. Плюсы '#+' поддерживаются как легаси.
+-- Проект с рейтингом помечается звёздочками на карточке.
 function M.take_rating(card)
   local best = 0
-  for _, r in ipairs(card.regions or {}) do
-    for plus in (r.name or ''):gmatch('#(%+*)') do
+  local function scan(s)
+    if not s or s == '' then return end
+    for stars in s:gmatch('#(%*+)') do
+      if #stars > best then best = #stars end
+    end
+    for plus in s:gmatch('#(%+*)') do
       if #plus > best then best = #plus end
     end
   end
-  return best
+  for _, r in ipairs(card.regions or {}) do scan(r.name) end
+  for _, m in ipairs(card.markers or {}) do scan(m.name) end
+  scan(card.name)
+  return math.min(best, 5)
 end
 
 -- Ключ дубликата: имя без версий/дат/bpm-тегов и служебных суффиксов.

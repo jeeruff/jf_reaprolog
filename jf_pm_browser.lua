@@ -169,7 +169,7 @@ local EN = {
     'groups: %d · byte copies: %d · versions: %d',
   ['проекты с похожими именами (версии, копии)'] =
     'projects with similar names (versions, copies)',
-  ['удачные тейки: %s'] = 'good takes: %s',
+  ['рейтинг: %d из 5'] = 'rating: %d of 5', ['рейтинг'] = 'rating',
   ['подсказка по содержимому · клик — принять'] =
     'guess from content · click to accept',
   ['групп дублей: %d'] = 'duplicate groups: %d',
@@ -361,9 +361,9 @@ local STATUS_ORDER = {}
 for i, s in ipairs(core.STATUSES) do STATUS_ORDER[s] = i end
 
 local SORT_CHIPS = { 'дата', 'открыт', 'сохранён', 'статус', 'длительность',
-                     'имя', 'размер', 'bpm', 'daw' }
+                     'имя', 'размер', 'bpm', 'daw', 'рейтинг' }
 -- естественное направление: true = по убыванию (новое/большое сверху)
-local SORT_DESC_NATURAL = { true, true, true, false, true, false, true, false, false }
+local SORT_DESC_NATURAL = { true, true, true, false, true, false, true, false, false, true }
 local VIEW_CHIPS = { 'сетка', 'таймлайн', 'календарь', 'канбан' }
 
 -- лейблы выпадашки классов: «—» + core.STATUSES (исключение из правила
@@ -463,17 +463,44 @@ local function hash_color(h, s, v)
   return ImGui.ColorConvertDouble4ToU32(r, g, b, 1.0)
 end
 
+-- #хэштеги из текста: имена регионов/маркеров, заметки. Рейтинги (#+++)
+-- и служебный #todo сюда не идут — у них своя семантика.
+local function scan_hashtags(text, seen, out)
+  if not text or text == '' then return end
+  for tag in text:gmatch('#([%w_%-\208\176-\209\143\208\144-\208\175]+)') do
+    local low = tag:lower()
+    -- #todo — своя панель, #*** / #+++ — рейтинг (в паттерн не попадают)
+    if low ~= 'todo' and #tag >= 2 and not seen[low] then
+      seen[low] = true
+      out[#out + 1] = tag
+    end
+  end
+end
+
 local function all_tags(card, meta)
   local seen, out = {}, {}
-  for _, t in ipairs(meta.tags) do
-    if not seen[t] then seen[t] = true; out[#out + 1] = t end
+  local function add(t)
+    local low = t:lower()
+    if not seen[low] then seen[low] = true; out[#out + 1] = t end
   end
-  for _, t in ipairs(card.fs_tags or {}) do
-    if not seen[t] then seen[t] = true; out[#out + 1] = t end
+  for _, t in ipairs(meta.tags) do add(t) end
+  for _, t in ipairs(card.fs_tags or {}) do add(t) end
+  for _, t in ipairs(card.tags_extra or {}) do add(t) end
+  -- хэштеги из содержимого проекта
+  for _, r in ipairs(card.regions or {}) do
+    scan_hashtags(r.name, seen, out)
   end
-  for _, t in ipairs(card.tags_extra or {}) do
-    if not seen[t] then seen[t] = true; out[#out + 1] = t end
+  for _, m in ipairs(card.markers or {}) do
+    scan_hashtags(m.name, seen, out)
   end
+  scan_hashtags(card.notes, seen, out)
+  for _, n in ipairs(card.track_notes or {}) do
+    scan_hashtags(n.s, seen, out)
+  end
+  for _, n in ipairs(card.item_notes or {}) do
+    scan_hashtags(n.s, seen, out)
+  end
+  scan_hashtags(card.name, seen, out)
   return out
 end
 
@@ -742,6 +769,10 @@ local function collect_cards()
       local da = a.card.daw or ''
       local db = b.card.daw or ''
       if da ~= db then return da < db end
+    elseif m == 10 then
+      local ra = core.take_rating(a.card)
+      local rb = core.take_rating(b.card)
+      if ra ~= rb then return ra > rb end
     end
     if (a.card.mtime or 0) ~= (b.card.mtime or 0) then
       return (a.card.mtime or 0) > (b.card.mtime or 0)
@@ -3268,10 +3299,11 @@ local function draw_card(entry, i, card_w)
     local rating = core.take_rating(card)
     if rating > 0 then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0x7FD98AFF, rating >= 3 and '★' or '☺')
+      -- 5 звёзд — лучшее; цвет теплеет с рейтингом
+      ImGui.TextColored(ctx, rating >= 4 and 0xE8D44DFF or 0x7FD98AFF,
+        string.rep('★', math.min(rating, 5)))
       if state.btn_tips and ImGui.IsItemHovered(ctx) then
-        ImGui.SetTooltip(ctx, string.format(T('удачные тейки: %s'),
-          string.rep('+', rating)))
+        ImGui.SetTooltip(ctx, string.format(T('рейтинг: %d из 5'), rating))
       end
     end
     if core.is_empty_project(card) then

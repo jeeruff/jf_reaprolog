@@ -282,8 +282,16 @@ do
     regions = {} }), nil, 'неуверенно → nil')
 
   eq(core.take_rating({ regions = { { name = 'intro' },
-    { name = 'hook #++' }, { name = 'v2 #+' } } }), 2, 'максимум плюсов')
+    { name = 'hook #++' }, { name = 'v2 #+' } } }), 2, 'легаси плюсы')
   eq(core.take_rating({ regions = { { name = 'intro' } } }), 0, 'без рейтинга')
+  eq(core.take_rating({ regions = { { name = 'drop #***' } } }), 3,
+    'звёзды #***')
+  eq(core.take_rating({ name = 'best #*****', regions = {} }), 5,
+    'рейтинг из имени проекта')
+  eq(core.take_rating({ markers = { { name = '#****' } }, regions = {} }), 4,
+    'рейтинг из маркера')
+  eq(core.take_rating({ regions = { { name = '#*******' } } }), 5,
+    'больше пяти — кап')
 
   eq(core.dup_key('slawa-tunnel-flver_5'), core.dup_key('slawa tunnel flver'),
     'версии дают один ключ')
