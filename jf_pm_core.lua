@@ -1338,6 +1338,134 @@ function M.parse_foreign(path, ext)
 end
 
 -- ===========================================================================
+-- GUT: выпотрошить чужой проект — собрать все его семплы
+-- ===========================================================================
+-- .xrns — семплы лежат внутри архива, распаковываем во временную папку.
+-- .als/.flp — внутри только ссылки: собираем существующие пути.
+-- Возвращает { {path=…, name=…}, … } либо nil, err.
+
+local AUDIO_RE = '%.([wWmMfFaAoO][aApPlLiIgG][vVfF3cCiIgG]?%w*)$'
+local GUT_EXT = { wav = true, aif = true, aiff = true, flac = true,
+                  mp3 = true, ogg = true, m4a = true, wv = true }
+
+local function is_audio_path(p)
+  local e = p:lower():match('%.([%w]+)$')
+  return e ~= nil and GUT_EXT[e] == true
+end
+
+-- Ableton: <Path Value="…"> — абсолютные пути к семплам. Библиотечные
+-- пресеты Live (в .app) отсекаем: это не материал проекта.
+-- Семпл мог переехать: ищем рядом с проектом, затем Spotlight по имени.
+local function resolve_audio(p, project_dir)
+  local f = io.open(p, 'rb')
+  if f then f:close() return p end
+  local base = p:match('([^/\\]+)$')
+  if not base then return nil end
+  if project_dir then
+    local near = project_dir .. '/' .. base
+    local nf = io.open(near, 'rb')
+    if nf then nf:close() return near end
+  end
+  local out = shell_read('/usr/bin/mdfind -name "' .. base .. '"')
+  if out then
+    for line in out:gmatch('[^\n]+') do
+      if line:sub(-#base) == base then
+        local lf = io.open(line, 'rb')
+        if lf then lf:close() return line end
+      end
+    end
+  end
+  return nil
+end
+
+function M.gut_als(path)
+  local xml = shell_read('/usr/bin/gzip -dc "' .. path .. '"')
+  if not xml then return nil, 'не читается' end
+  local dir = path:match('^(.*)[/\\]')
+  local out, seen, missing = {}, {}, 0
+  for p in xml:gmatch('<Path Value="([^"]+)"') do
+    if is_audio_path(p) and not seen[p] and not p:find('%.app/') then
+      seen[p] = true
+      local real = resolve_audio(p, dir)
+      if real then
+        out[#out + 1] = { path = real, name = real:match('([^/]+)$') }
+      else
+        missing = missing + 1
+      end
+    end
+  end
+  out.missing = missing
+  return out
+end
+
+-- Renoise: семплы внутри zip — распаковываем в подпапку назначения
+function M.gut_xrns(path, dest_dir)
+  local list = shell_read('/usr/bin/unzip -Z1 "' .. path .. '"')
+  if not list then return nil, 'не читается' end
+  local wanted = {}
+  for line in list:gmatch('[^\n]+') do
+    if is_audio_path(line) then wanted[#wanted + 1] = line end
+  end
+  if #wanted == 0 then return {} end
+  reaper.RecursiveCreateDirectory(dest_dir, 0)
+  -- распаковываем без структуры папок (-j), имена уже уникальны
+  reaper.ExecProcess('/usr/bin/unzip -j -o "' .. path .. '" "SampleData/*" -d "'
+    .. dest_dir .. '"', 120000)
+  local out = {}
+  local i = 0
+  while true do
+    local fn = reaper.EnumerateFiles(dest_dir, i)
+    if not fn then break end
+    if is_audio_path(fn) then
+      out[#out + 1] = { path = dest_dir .. '/' .. fn, name = fn }
+    end
+    i = i + 1
+  end
+  return out
+end
+
+-- FL Studio: пути к семплам лежат UTF-16LE строками
+function M.gut_flp(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil, 'не читается' end
+  local data = f:read(8 * 1024 * 1024)
+  f:close()
+  local out, seen = {}, {}
+  local i = 1
+  while i < #data - 2 do
+    local b1, b2 = data:byte(i), data:byte(i + 1)
+    if b2 == 0 and b1 and b1 >= 32 and b1 <= 126 then
+      local j, chars = i, {}
+      while j < #data - 1 do
+        local ch, z = data:byte(j), data:byte(j + 1)
+        if z ~= 0 or not ch or ch < 32 or ch > 126 then break end
+        chars[#chars + 1] = string.char(ch)
+        j = j + 2
+      end
+      local s = table.concat(chars)
+      if #s > 8 and is_audio_path(s) and not seen[s] then
+        seen[s] = true
+        local real = resolve_audio(s, path:match('^(.*)[/\\]'))
+        if real then
+          out[#out + 1] = { path = real, name = real:match('([^/\\]+)$') }
+        end
+      end
+      i = math.max(j, i + 1)
+    else
+      i = i + 1
+    end
+  end
+  return out
+end
+
+function M.gut_project(path, ext, dest_dir)
+  if ext == 'als' then return M.gut_als(path) end
+  if ext == 'flp' then return M.gut_flp(path) end
+  if ext == 'xrns' then return M.gut_xrns(path, dest_dir) end
+  return nil, 'формат закрыт: ' .. tostring(ext)
+end
+
+-- ===========================================================================
 -- Виртуальная корзина: файлы остаются на месте, карточка помечается
 -- временем удаления. Скрыта из каталога, но восстанавливается одним
 -- кликом. Через TRASH_DAYS дней содержимое уезжает в Корзину macOS.

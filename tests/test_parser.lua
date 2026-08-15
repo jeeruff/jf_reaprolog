@@ -361,6 +361,62 @@ do
   _G.reaper = nil
 end
 
+print('== gut (потрошение чужих проектов) ==')
+do
+  _G.reaper = {
+    ExecProcess = function(cmd)
+      local p = io.popen(cmd .. ' 2>/dev/null')
+      if not p then return nil end
+      local o = p:read('*a') or ''
+      p:close()
+      return '0\n' .. o
+    end,
+    RecursiveCreateDirectory = function(d)
+      os.execute("mkdir -p '" .. d .. "'")
+    end,
+    EnumerateFiles = function(d, i)
+      local p = io.popen("ls -A '" .. d .. "' 2>/dev/null")
+      local t2 = {}
+      if p then for l in p:lines() do t2[#t2 + 1] = l end p:close() end
+      return t2[i + 1]
+    end,
+  }
+  -- .xrns: семплы внутри архива
+  local dir = os.tmpname()
+  os.remove(dir)
+  os.execute("mkdir -p '" .. dir .. "/SampleData'")
+  io.open(dir .. '/Song.xml', 'wb'):write('<RenoiseSong/>'):close()
+  io.open(dir .. '/SampleData/kick.wav', 'wb'):write('RIFFDATA'):close()
+  io.open(dir .. '/SampleData/snare.wav', 'wb'):write('RIFFDATA'):close()
+  local xrns = os.tmpname() .. '.xrns'
+  os.execute("cd '" .. dir .. "' && zip -qr '" .. xrns .. "' Song.xml SampleData")
+  local dest = os.tmpname()
+  os.remove(dest)
+  local got = core.gut_xrns(xrns, dest)
+  check(got ~= nil, 'gut_xrns вернул список')
+  eq(got and #got or 0, 2, 'извлечено два семпла')
+  os.execute("rm -rf '" .. dir .. "' '" .. dest .. "'")
+  os.remove(xrns)
+
+  -- .als: ссылка на существующий файл резолвится, на битую — нет
+  local real = os.tmpname() .. '.wav'
+  io.open(real, 'wb'):write('RIFF'):close()
+  local als_xml = '<Ableton><Path Value="' .. real .. '" />' ..
+    '<Path Value="/nope/ghost-sample-xyz.wav" /></Ableton>'
+  local tmpx = os.tmpname()
+  io.open(tmpx, 'wb'):write(als_xml):close()
+  local als = os.tmpname() .. '.als'
+  os.execute("gzip -c '" .. tmpx .. "' > '" .. als .. "'")
+  local g2 = core.gut_als(als)
+  eq(g2 and #g2 or 0, 1, 'найден существующий семпл')
+  eq(g2 and g2.missing or -1, 1, 'потерянный посчитан')
+  os.remove(real) os.remove(tmpx) os.remove(als)
+
+  local _, err = core.gut_project('/x.ptx', 'ptx')
+  check(err ~= nil, 'закрытый формат — ошибка')
+  _G.reaper = nil
+end
+
 print('== trash ==')
 do
   local fresh = { trashed = os.time() }

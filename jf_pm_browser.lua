@@ -139,6 +139,15 @@ local EN = {
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
   ['теги'] = 'tags', ['играет'] = 'playing', ['тишина'] = 'silence',
+  ['gut: только для проектов других DAW'] = 'gut: foreign DAW projects only',
+  ['gut: потрошу '] = 'gut: gutting ',
+  ['gut: семплов не найдено (потеряно %d)'] =
+    'gut: no samples found (%d missing)',
+  ['gut: %d семплов из «%s»%s'] = 'gut: %d samples from "%s"%s',
+  [' · потеряно %d'] = ' · %d missing',
+  ['gut: семплы проекта в новый проект REAPER'] =
+    'gut: project samples into a new REAPER project',
+  ['формат закрыт'] = 'closed format',
   ['дубли'] = 'dups', ['корзина'] = 'trash',
   ['в корзину: %s · %d дней до удаления'] =
     'to trash: %s · %d days before deletion',
@@ -1223,6 +1232,48 @@ local function merge_as_subprojects(target_path)
   state.status_msg = string.format('Subprojects: %d%s', #placed,
     target_path and (' → ' .. target_path) or ' в новом проекте (не сохранён)')
   state.sel = {}
+end
+
+-- GUT: выпотрошить чужой проект — все его семплы в новый проект REAPER,
+-- каждый на своём треке подряд. Оригинал не трогаем; для .xrns семплы
+-- распаковываются в папку рядом с проектом.
+local function gut_project(card)
+  if not card.daw then
+    logf('warn', T('gut: только для проектов других DAW'))
+    return
+  end
+  local dir = card.path:match('^(.*)[/\\]') or '.'
+  local dest = dir .. '/' .. card.name .. '_samples'
+  logf('act', T('gut: потрошу ') .. card.name .. '…')
+  local ok, list, err = pcall(core.gut_project, card.path, card.daw_ext, dest)
+  if not ok then
+    logf('warn', 'gut: ' .. tostring(list))
+    return
+  end
+  if not list then
+    logf('warn', 'gut: ' .. tostring(err or T('формат закрыт')))
+    return
+  end
+  local missing = list.missing or 0
+  if #list == 0 then
+    logf('warn', string.format(T('gut: семплов не найдено (потеряно %d)'),
+      missing))
+    return
+  end
+  reaper.Main_OnCommand(40859, 0) -- новый таб
+  local pos = 0
+  for i, s in ipairs(list) do
+    reaper.InsertTrackAtIndex(i - 1, true)
+    local tr = reaper.GetTrack(0, i - 1)
+    reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME',
+      (s.name or ''):gsub('%.%w+$', ''), true)
+    reaper.SetOnlyTrackSelected(tr)
+    reaper.SetEditCurPos(0, false, false)
+    reaper.InsertMedia(s.path, 0)
+  end
+  reaper.UpdateArrange()
+  logf('ok', string.format(T('gut: %d семплов из «%s»%s'), #list, card.name,
+    missing > 0 and string.format(T(' · потеряно %d'), missing) or ''))
 end
 
 -- Регион кликом → сабпроект в активный проект (обрезанный до региона)
@@ -2595,6 +2646,15 @@ local function draw_card_icons(card, meta, i, expanded, compact)
     local dt = core.DAW_TYPES[card.daw_ext] or {}
     if icon('▸', 'dopen', T('открыть в ') .. (dt.daw or 'DAW'), dt.color) then
       open_project(card.path)
+    end
+    local gut_ok = card.daw_ext == 'als' or card.daw_ext == 'flp'
+      or card.daw_ext == 'xrns'
+    if gut_ok then
+      ImGui.SameLine(ctx)
+      if icon('⚰', 'gut', T('gut: семплы проекта в новый проект REAPER'),
+          0xD98A8AFF) then
+        gut_project(card)
+      end
     end
     if compact then
       -- S: ещё картинка, обновление и удаление
@@ -5241,6 +5301,13 @@ CMDS = {
       end
       con_out(T('в корзине: %d'), n)
     end
+  end,
+  gut = function(args)
+    local hits = args ~= '' and con_match(args, false) or nil
+    local c = hits and hits[1] and hits[1].card
+      or (state.sel[1] and state.index.projects[state.sel[1]])
+    if not c then con_out(T('не найдено')) return end
+    gut_project(c)
   end,
   findprev = function() findprev_start() end,
   analyze = function()
