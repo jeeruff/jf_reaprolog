@@ -138,6 +138,7 @@ local EN = {
   ['анализ %d/%d'] = 'analysis %d/%d',
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
+  ['теги'] = 'tags', ['играет'] = 'playing', ['тишина'] = 'silence',
   ['дубли'] = 'dups', ['корзина'] = 'trash',
   ['в корзину: %s · %d дней до удаления'] =
     'to trash: %s · %d days before deletion',
@@ -379,7 +380,9 @@ end
 local CARD_SIZES = {
   { label = 'S', w = 240, h = 32, thumb = 22, name = 16, micro = true },
   { label = 'M', w = 280, h = 96, thumb = 56, name = 18, mini = true },
-  { label = 'L', w = 360, h = 198, thumb = 64, name = 20 },
+  -- L: высота ровно под контент (шапка+класс+мета+теги+волна+кнопки),
+  -- без пустой середины — раньше было 198 и треть карточки пустовала
+  { label = 'L', w = 340, h = 150, thumb = 56, name = 20 },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -3320,8 +3323,9 @@ local function draw_card(entry, i, card_w)
 
     -- превью всегда видно: волна прижата к низу, под ней ряд кнопок
     if not expanded then
+      -- прижать волну и кнопки к низу, но карточка уже подогнана
+      -- по высоте — большого пустого поля не остаётся
       local _, resty = ImGui.GetContentRegionAvail(ctx)
-      -- 22 волна + 26 ряд кнопок: строго внутри рамки
       if resty and resty > 50 then ImGui.Dummy(ctx, 1, resty - 50) end
     end
     if draw_wave_strip(card, ImGui.GetContentRegionAvail(ctx), 20) then
@@ -4325,6 +4329,42 @@ local function draw_playq_panel(stack_h)
   end
 end
 
+-- Боковая панель тегов: справа от сетки. Клик — фильтр (AND по нескольким),
+-- повторный — снять. Раньше теги жили в тулбаре и съедали верх.
+local TAGS_W = 132
+local function draw_tags_panel(h)
+  if ImGui.BeginChild(ctx, '##tagspanel', TAGS_W, h,
+      ImGui.ChildFlags_Border) then
+    ImGui.TextDisabled(ctx, T('теги'))
+    if next(state.filter_tags) then
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, '×###tagsclear') then
+        state.filter_tags = {}
+      end
+    end
+    if not state.tags_all_cache or state.tags_all_gen ~= data_gen then
+      local seen, tags_all = {}, {}
+      for _, e in ipairs(TAGS) do
+        seen[e[1]] = true; tags_all[#tags_all + 1] = e[1]
+      end
+      for _, card in pairs(state.index.projects) do
+        for _, t in ipairs(all_tags(card, cached_meta(card))) do
+          if not seen[t] then seen[t] = true; tags_all[#tags_all + 1] = t end
+        end
+      end
+      table.sort(tags_all)
+      state.tags_all_cache, state.tags_all_gen = tags_all, data_gen
+    end
+    for _, t in ipairs(state.tags_all_cache) do
+      local active = state.filter_tags[t]
+      if chip('#' .. t .. '###stag' .. t, active, tag_color(t)) then
+        state.filter_tags[t] = not active or nil
+      end
+    end
+    ImGui.EndChild(ctx)
+  end
+end
+
 local function draw_toolbar()
   if ImGui.Button(ctx, state.rescan
       and string.format('Rescan %d/%d ■', state.rescan.i, state.rescan.total)
@@ -4647,34 +4687,7 @@ local function draw_toolbar()
   end
 
 
-  -- все теги (из списка + встретившиеся в проектах) чипами справа от поиска:
-  -- клик — фильтр (AND по нескольким), повторный клик — снять
-  if not state.tags_all_cache or state.tags_all_gen ~= data_gen then
-    local seen, tags_all = {}, {}
-    for _, e in ipairs(TAGS) do
-      seen[e[1]] = true; tags_all[#tags_all + 1] = e[1]
-    end
-    for _, card in pairs(state.index.projects) do
-      for _, t in ipairs(all_tags(card, cached_meta(card))) do
-        if not seen[t] then seen[t] = true; tags_all[#tags_all + 1] = t end
-      end
-    end
-    state.tags_all_cache, state.tags_all_gen = tags_all, data_gen
-  end
-  local tags_all = state.tags_all_cache
-  for _, t in ipairs(tags_all) do
-    local label = '#' .. t
-    local active = state.filter_tags[t]
-    ImGui.SameLine(ctx)
-    if ImGui.CalcTextSize(ctx, label) + 12 > ImGui.GetContentRegionAvail(ctx) then
-      ImGui.NewLine(ctx)
-    end
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, active and tag_color(t) or 0x777777FF)
-    if ImGui.SmallButton(ctx, label .. '###ftag' .. t) then
-      state.filter_tags[t] = not active or nil
-    end
-    ImGui.PopStyleColor(ctx)
-  end
+
 end
 
 -- ---------------------------------------------------------------------------
@@ -5382,9 +5395,58 @@ local function draw_todo_panel()
   end
 end
 
+-- Мини-плейлист «сейчас играет»: слева внизу, половина ширины консоли.
+-- Показывает всё, что звучит прямо сейчас, с прогрессом и стопом.
+local NOWPLAY_W = 300
+local function draw_nowplaying()
+  if ImGui.BeginChild(ctx, '##nowplay', NOWPLAY_W, CONSOLE_H,
+      ImGui.ChildFlags_Border) then
+    local list = {}
+    for a, c in pairs(players) do list[#list + 1] = { audio = a, cfp = c } end
+    table.sort(list, function(x, y) return x.audio < y.audio end)
+    ImGui.TextDisabled(ctx, T('играет') .. ' (' .. #list .. ')')
+    if #list > 0 then
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, '■###npstop') then
+        playlist = nil
+        preview_stop()
+      end
+    end
+    if playlist then
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, 0x7BB8D9FF, string.format('▶▶ %d/%d',
+        playlist.i, #playlist.queue))
+    end
+    for _, el in ipairs(list) do
+      local name = el.audio:match('([^/\\]+)%.%w+$') or el.audio
+      name = name:gsub('_preview$', '')
+      local ok, pos = reaper.CF_Preview_GetValue(el.cfp, 'D_POSITION')
+      local lb = loop_bounds[el.audio]
+      local okl, len = reaper.CF_Preview_GetValue(el.cfp, 'D_LENGTH')
+      local total = (lb and lb.b) or (okl and len) or 0
+      local from = (lb and lb.a) or 0
+      local frac = (total > from) and
+        math.min(math.max(((pos or 0) - from) / (total - from), 0), 1) or 0
+      ImGui.ProgressBar(ctx, frac, -22, 0,
+        trunc(name, 22) .. (lb and ' ⟲' or ''))
+      ImGui.SameLine(ctx)
+      if ImGui.SmallButton(ctx, '×###np' .. el.audio) then
+        preview_stop(el.audio)
+      end
+    end
+    if #list == 0 then
+      ImGui.TextDisabled(ctx, T('тишина'))
+    end
+    ImGui.EndChild(ctx)
+  end
+end
+
 local function draw_console_bottom()
+  draw_nowplaying()
+  ImGui.SameLine(ctx)
   if not ImGui.BeginChild(ctx, '##consoleb', -(TODO_W + 8), CONSOLE_H,
       ImGui.ChildFlags_Border) then
+    ImGui.SameLine(ctx)
     draw_todo_panel()
     return
   end
@@ -5522,7 +5584,13 @@ local function loop()
     if ImGui.BeginChild(ctx, '##content', 0, -footer_h,
         ImGui.ChildFlags_None, wflags) then
       if state.view == 0 then
-        cols = draw_grid(cards)
+        -- сетка слева, панель тегов справа
+        if ImGui.BeginChild(ctx, '##gridwrap', -(TAGS_W + 8), 0) then
+          cols = draw_grid(cards)
+          ImGui.EndChild(ctx)
+        end
+        ImGui.SameLine(ctx)
+        draw_tags_panel(0)
       elseif state.view == 1 then
         draw_timeline(cards)
       elseif state.view == 2 then
