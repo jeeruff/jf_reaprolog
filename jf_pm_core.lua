@@ -859,6 +859,17 @@ function M.build_foreign_card(path, ext, old_card, dir_sizes)
   card.fs_tags = M.finder_tags(path)
   card.thumb_file = M.find_thumb(path, name)
   card.keys = M.find_keys_in(name, false)
+  -- открытые форматы читаем по-настоящему: темп, треки, тональность
+  local ok, parsed = pcall(M.parse_foreign, path, ext)
+  if ok and parsed then
+    card.tempo = parsed.tempo or card.tempo
+    card.track_names = parsed.track_names or card.track_names
+    card.track_count = parsed.track_count or 0
+    card.item_count = parsed.item_count
+    card.markers = parsed.markers or card.markers
+    if parsed.keys and #parsed.keys > 0 then card.keys = parsed.keys end
+    card.parsed_daw = true
+  end
   card.needs_report = false
   if old_card then
     card.pinned = old_card.pinned
@@ -1192,6 +1203,138 @@ function M.trim_wav_silence(path, max_lead_sec, max_tail_sec)
   out:write(data:sub(start, start + new_dsize - 1))
   out:close()
   return true, skip / srate, (frames_total - keep_end) / srate
+end
+
+-- ===========================================================================
+-- Парсеры чужих DAW: достаём темп, треки, тональность — без их установки
+-- ===========================================================================
+-- .als (Ableton) и .xrns (Renoise) — сжатый XML, читаем распаковкой;
+-- .flp (FL Studio) — бинарные события, вытаскиваем строки и темп.
+-- Всё через shell (gzip/unzip), поэтому только внутри REAPER.
+
+local NOTE_NAMES_C = { 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#',
+                       'A', 'A#', 'B' }
+
+local function shell_read(cmd)
+  local out = reaper.ExecProcess(cmd, 20000)
+  if not out then return nil end
+  return (out:gsub('^%d+\n', ''))
+end
+
+-- Ableton: gzip → XML
+function M.parse_als(path)
+  local xml = shell_read('/usr/bin/gzip -dc "' .. path .. '"')
+  if not xml or #xml < 100 then return nil end
+  local card = { track_names = {}, regions = {}, markers = {}, keys = {} }
+  local tempo = xml:match('<Tempo>.-<Manual Value="([%d%.]+)"')
+  card.tempo = tonumber(tempo)
+  for name in xml:gmatch('<EffectiveName Value="([^"]*)"') do
+    if name ~= '' and #card.track_names < 64 then
+      card.track_names[#card.track_names + 1] = name
+    end
+  end
+  local ntracks = 0
+  for _ in xml:gmatch('<[AM][ui][dd][ii]oTrack Id') do ntracks = ntracks + 1 end
+  for _ in xml:gmatch('<MidiTrack Id') do ntracks = ntracks + 1 end
+  card.track_count = ntracks > 0 and ntracks or #card.track_names
+  local items = 0
+  for _ in xml:gmatch('<AudioClip ') do items = items + 1 end
+  for _ in xml:gmatch('<MidiClip ') do items = items + 1 end
+  card.item_count = items
+  -- тональность проекта: корень + мажор/минор
+  local root, scale = xml:match(
+    '<ScaleInformation>.-<RootNote Value="(%d+)".-<Name Value="([^"]*)"')
+  if root then
+    local n = NOTE_NAMES_C[(tonumber(root) % 12) + 1]
+    if n then
+      card.keys = { scale == 'Minor' and (n .. 'm') or n }
+    end
+  end
+  -- локаторы Live = маркеры
+  for time, name in xml:gmatch('<Locator>.-<Time Value="([%d%.]+)".-<Name Value="([^"]*)"') do
+    card.markers[#card.markers + 1] = { pos = tonumber(time) or 0, name = name }
+  end
+  return card
+end
+
+-- Renoise: zip → Song.xml
+function M.parse_xrns(path)
+  local xml = shell_read('/usr/bin/unzip -p "' .. path .. '" Song.xml')
+  if not xml or #xml < 100 then return nil end
+  local card = { track_names = {}, regions = {}, markers = {}, keys = {} }
+  card.tempo = tonumber(xml:match('<BeatsPerMin>([%d%.]+)</BeatsPerMin>'))
+  -- имена треков лежат в <SequencerTrack>…<Name>
+  for block in xml:gmatch('<SequencerTrack[^>]*>(.-)</SequencerTrack>') do
+    local n = block:match('<Name>([^<]*)</Name>')
+    if n and n ~= '' and #card.track_names < 64 then
+      card.track_names[#card.track_names + 1] = n
+    end
+  end
+  card.track_count = #card.track_names
+  local instr = 0
+  for _ in xml:gmatch('<Instrument>') do instr = instr + 1 end
+  local pats = 0
+  for _ in xml:gmatch('<Pattern>') do pats = pats + 1 end
+  card.item_count = instr
+  card.pattern_count = pats
+  return card
+end
+
+-- FL Studio: бинарь FLhd/FLdt. Темп — событие 0x9C (dword ×1000),
+-- строки — UTF-16LE. Формат недокументирован: берём только надёжное.
+function M.parse_flp(path)
+  local f = io.open(path, 'rb')
+  if not f then return nil end
+  local data = f:read(4 * 1024 * 1024) -- шапки хватает
+  f:close()
+  if not data or data:sub(1, 4) ~= 'FLhd' then return nil end
+  local card = { track_names = {}, regions = {}, markers = {}, keys = {} }
+  -- UTF-16LE строки: имена паттернов/каналов/плагинов
+  local seen = {}
+  local i = 1
+  while i < #data - 8 do
+    local b1, b2 = data:byte(i), data:byte(i + 1)
+    if b1 and b2 == 0 and b1 >= 32 and b1 <= 126 then
+      local j, chars = i, {}
+      while j < #data - 1 do
+        local c, z = data:byte(j), data:byte(j + 1)
+        if z ~= 0 or not c or c < 32 or c > 126 then break end
+        chars[#chars + 1] = string.char(c)
+        j = j + 2
+      end
+      if #chars >= 4 then
+        local s = table.concat(chars)
+        -- мусор бинаря: без букв или с большой долей спецсимволов
+        local letters = select(2, s:gsub('%a', ''))
+        local junk = select(2, s:gsub('[%p]', ''))
+        local ok_str = letters >= 3 and junk <= #s / 3
+        if ok_str and not seen[s] and not s:find('/')
+           and #card.track_names < 48 then
+          seen[s] = true
+          card.track_names[#card.track_names + 1] = s
+        end
+        i = j
+      end
+    end
+    i = i + 1
+  end
+  card.track_count = #card.track_names
+  -- FL пишет имя гаммы строкой: «D Minor Natural (Aeolian)»
+  for _, s in ipairs(card.track_names) do
+    local root, mode = s:match('^([A-G]#?b?)%s+(%a+)')
+    if root and (mode == 'Minor' or mode == 'Major') then
+      card.keys = { mode == 'Minor' and (root .. 'm') or root }
+      break
+    end
+  end
+  return card
+end
+
+function M.parse_foreign(path, ext)
+  if ext == 'als' then return M.parse_als(path) end
+  if ext == 'xrns' then return M.parse_xrns(path) end
+  if ext == 'flp' then return M.parse_flp(path) end
+  return nil
 end
 
 -- ===========================================================================

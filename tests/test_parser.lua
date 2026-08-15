@@ -300,6 +300,67 @@ do
   eq(n, 1, 'одна группа дублей')
 end
 
+print('== parse_foreign (чужие DAW) ==')
+do
+  -- .als и .xrns — сжатый XML; проверяем на синтетических архивах
+  _G.reaper = { ExecProcess = function(cmd)
+    local p = io.popen(cmd .. ' 2>/dev/null')
+    if not p then return nil end
+    local o = p:read('*a') or ''
+    p:close()
+    return '0\n' .. o
+  end }
+
+  local als_xml = [[<?xml version="1.0"?><Ableton><LiveSet>
+<Tempo><Manual Value="128" /></Tempo>
+<MidiTrack Id="1"><EffectiveName Value="Drums" /></MidiTrack>
+<AudioTrack Id="2"><EffectiveName Value="Bass" /></AudioTrack>
+<AudioClip /><AudioClip /><MidiClip />
+<ScaleInformation><RootNote Value="9" /><Name Value="Minor" /></ScaleInformation>
+<Locator><Time Value="16" /><Name Value="drop" /></Locator>
+</LiveSet></Ableton>]]
+  local tmp_xml = os.tmpname()
+  io.open(tmp_xml, 'wb'):write(als_xml):close()
+  local als = os.tmpname() .. '.als'
+  os.execute("gzip -c '" .. tmp_xml .. "' > '" .. als .. "'")
+  local a = core.parse_als(als)
+  check(a ~= nil, 'als распарсился')
+  if a then
+    eq(a.tempo, 128, 'als tempo')
+    eq(a.track_count, 2, 'als треков')
+    eq(a.item_count, 3, 'als клипов')
+    eq(a.keys[1], 'Am', 'als тональность (root 9 + Minor)')
+    eq(a.markers[1] and a.markers[1].name, 'drop', 'als локатор')
+  end
+  os.remove(tmp_xml) os.remove(als)
+
+  local song = [[<?xml version="1.0"?><RenoiseSong>
+<GlobalSongData><BeatsPerMin>174</BeatsPerMin></GlobalSongData>
+<SequencerTrack><Name>kick</Name></SequencerTrack>
+<SequencerTrack><Name>pad</Name></SequencerTrack>
+<Instrument></Instrument><Instrument></Instrument>
+<Pattern></Pattern>
+</RenoiseSong>]]
+  local dir = os.tmpname()
+  os.remove(dir)
+  os.execute("mkdir -p '" .. dir .. "'")
+  io.open(dir .. '/Song.xml', 'wb'):write(song):close()
+  local xrns = os.tmpname() .. '.xrns'
+  os.execute("cd '" .. dir .. "' && zip -q '" .. xrns .. "' Song.xml")
+  local x = core.parse_xrns(xrns)
+  check(x ~= nil, 'xrns распарсился')
+  if x then
+    eq(x.tempo, 174, 'xrns bpm')
+    eq(x.track_count, 2, 'xrns треков')
+    eq(x.track_names[1], 'kick', 'xrns имя трека')
+    eq(x.item_count, 2, 'xrns инструментов')
+  end
+  os.execute("rm -rf '" .. dir .. "'") os.remove(xrns)
+
+  eq(core.parse_foreign('/nope.ptx', 'ptx'), nil, 'закрытый формат → nil')
+  _G.reaper = nil
+end
+
 print('== trash ==')
 do
   local fresh = { trashed = os.time() }
