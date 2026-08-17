@@ -140,8 +140,9 @@ local EN = {
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
   ['теги'] = 'tags', ['играет'] = 'playing', ['тишина'] = 'silence',
   ['открытые проекты: обновлено %d'] = 'open projects: %d updated',
-  ['открытые проекты: изменений нет'] = 'open projects: no changes',
+  ['открытых вкладок: %d · изменений нет'] = 'open tabs: %d · no changes',
   ['новые теги: '] = 'new tags: ',
+  ['новый проект в каталоге: '] = 'new project in catalog: ',
   ['перечитать открытые проекты (теги, регионы)'] =
     'reread open projects (tags, regions)',
   ['gut: только для проектов других DAW'] = 'gut: foreign DAW projects only',
@@ -1434,8 +1435,27 @@ end
 
 local function live_scan_project(proj, fn)
   local card = state.index.projects[fn]
-  if not card then return false end
-  local changed = false
+  local created = false
+  if not card then
+    -- проект открыт, но в каталоге его нет: заводим карточку прямо сейчас,
+    -- не дожидаясь Rescan (файл мог ещё ни разу не сохраняться)
+    card = core.build_card(fn, nil)
+    if not card then
+      card = {
+        path = fn, name = fn:match('([^/\\]+)%.[rR][pP][pP]$') or fn,
+        ext = {}, regions = {}, markers = {}, track_names = {}, items = {},
+        notes = '', track_notes = {}, item_notes = {}, backups = {},
+        fs_tags = {}, keys = {}, duration = 0, render_file = '',
+        render_pattern = '', needs_report = false,
+        mtime = os.time(), atime = os.time(), size = 0, dir_size = 0,
+      }
+    end
+    state.index.projects[fn] = card
+    created = true
+    bump_gen()
+    logf('ok', T('новый проект в каталоге: ') .. card.name)
+  end
+  local changed = created
 
   -- регионы и маркеры прямо из сессии
   local regions, markers = {}, {}
@@ -1518,6 +1538,7 @@ local function live_scan_all(quiet)
   while true do
     local proj, fn = reaper.EnumProjects(i)
     if not proj then break end
+    -- безымянные вкладки (несохранённые) пропускаем: пути ещё нет
     if fn and fn ~= '' and live_scan_project(proj, fn) then
       n = n + 1
       local card = state.index.projects[fn]
@@ -1535,7 +1556,7 @@ local function live_scan_all(quiet)
     end
     logf('ok', msg)
   elseif not quiet then
-    logf('ok', T('открытые проекты: изменений нет'))
+    logf('ok', string.format(T('открытых вкладок: %d · изменений нет'), i))
   end
   return n
 end
