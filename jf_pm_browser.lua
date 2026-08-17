@@ -3354,7 +3354,11 @@ local function draw_card(entry, i, card_w)
     ImGui.PushStyleColor(ctx, ImGui.Col_Border,
       focused and 0xE8E8E8FF or 0xD9B96CFF)
   end
-  if ImGui.BeginChild(ctx, card.path, card_w, h, child_flags, win_flags) then
+  -- ImGui 1.90+: EndChild зовётся ВСЕГДА, даже если BeginChild вернул
+  -- false (карточка вне видимой области) — иначе «Missing EndChild()»
+  local card_open = ImGui.BeginChild(ctx, card.path, card_w, h,
+    child_flags, win_flags)
+  if card_open then
     -- vim-хинт (режим f): жёлтый прямоугольник справа от иконки, на
     -- первой линии карточки; foreground-слой — ничто его не перекроет
     if state.hints and state.hints.labels[i] then
@@ -3403,7 +3407,7 @@ local function draw_card(entry, i, card_w)
         inner_click = true
       end
       ImGui.EndChild(ctx)
-      goto card_done
+      goto card_done_open
     end
     if cs.mini then
       -- M: клип — тамбнейл слева, имя и волна справа, кнопки снизу
@@ -3425,7 +3429,7 @@ local function draw_card(entry, i, card_w)
       ImGui.EndGroup(ctx)
       if draw_card_icons(card, meta, i, false, true) then inner_click = true end
       ImGui.EndChild(ctx)
-      goto card_done
+      goto card_done_open
     end
     draw_thumb(card, cs.thumb)
     ImGui.SameLine(ctx)
@@ -3611,9 +3615,12 @@ local function draw_card(entry, i, card_w)
     if expanded then draw_card_details(card, meta) end
     if draw_card_icons(card, meta, i, expanded) then inner_click = true end
     ImGui.EndChild(ctx)
+  else
+    ImGui.EndChild(ctx) -- невидимая карточка: пара обязательна
   end
+  ::card_done_open::
   -- карточку можно перетащить в плейлист (payload как в канбане)
-  if ImGui.BeginDragDropSource(ctx) then
+  if card_open and ImGui.BeginDragDropSource(ctx) then
     ImGui.SetDragDropPayload(ctx, 'JF_PM_CARD', card.path)
     ImGui.Text(ctx, card.name)
     ImGui.EndDragDropSource(ctx)
@@ -3994,6 +4001,8 @@ local function draw_kanban(cards)
           end
         end
       end
+      ImGui.EndChild(ctx)
+    else
       ImGui.EndChild(ctx)
     end
     if ImGui.BeginDragDropTarget(ctx) then
@@ -4586,6 +4595,8 @@ local function draw_playq_panel(stack_h)
       ImGui.TextDisabled(ctx, T('перетащи сюда карточки'))
     end
     ImGui.EndChild(ctx)
+  else
+    ImGui.EndChild(ctx) -- пара обязательна и при невидимой панели
   end
   -- drop-зона: карточка из сетки → в плейлист
   if ImGui.BeginDragDropTarget(ctx) then
@@ -4644,6 +4655,8 @@ local function draw_tags_panel(h)
         tag_color(t))
     end
     ImGui.EndChild(ctx)
+  else
+    ImGui.EndChild(ctx) -- пара обязательна и при невидимой панели
   end
 end
 
@@ -5673,6 +5686,8 @@ local function draw_todo_panel()
           end
         end
         ImGui.EndChild(ctx)
+      else
+        ImGui.EndChild(ctx)
       end
     else
       local chg, v = ImGui.InputTextMultiline(ctx, '##todomine',
@@ -5734,6 +5749,8 @@ local function draw_nowplaying()
     if #list == 0 then
       ImGui.TextDisabled(ctx, T('тишина'))
     end
+    ImGui.EndChild(ctx)
+  else
     ImGui.EndChild(ctx)
   end
 end
@@ -5812,6 +5829,8 @@ local function draw_console_bottom()
       state.log_scroll = false
     end
     ImGui.EndChild(ctx)
+  else
+    ImGui.EndChild(ctx)
   end
   ImGui.SetNextItemWidth(ctx, -1)
   if state.con_focus then
@@ -5884,6 +5903,8 @@ local function loop()
         -- сетка слева, панель тегов справа
         if ImGui.BeginChild(ctx, '##gridwrap', -(TAGS_W + 8), 0) then
           cols = draw_grid(cards)
+          ImGui.EndChild(ctx)
+        else
           ImGui.EndChild(ctx)
         end
         ImGui.SameLine(ctx)
