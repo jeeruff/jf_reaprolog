@@ -389,9 +389,9 @@ end
 local CARD_SIZES = {
   { label = 'S', w = 240, h = 32, thumb = 22, name = 16, micro = true },
   { label = 'M', w = 280, h = 96, thumb = 56, name = 18, mini = true },
-  -- L: высота ровно под контент (шапка+класс+мета+теги+волна+кнопки),
-  -- без пустой середины — раньше было 198 и треть карточки пустовала
-  { label = 'L', w = 340, h = 150, thumb = 56, name = 20 },
+  -- L: высота под весь контент. 150 было мало — «→ следующий шаг»
+  -- и строка тегов выдавливали ряд кнопок за нижнюю кромку.
+  { label = 'L', w = 340, h = 176, thumb = 56, name = 20 },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -504,8 +504,30 @@ local function all_tags(card, meta)
   return out
 end
 
+-- Цвета меток Finder (macOS): красный, оранжевый, жёлтый, зелёный,
+-- синий, фиолетовый, серый. Свои теги садятся на ту же палитру по хешу —
+-- каталог визуально говорит на языке системы.
+local FINDER_COLORS = {
+  0xE0605FFF, 0xE09A4EFF, 0xE8C84EFF, 0x7FD98AFF,
+  0x6EA8E8FF, 0xB98AD9FF, 0x9AA0A6FF,
+}
 local function tag_color(t)
-  return TAG_COLOR_MAP[t] or hash_color(fnv1a(t) % 360, 0.4, 0.8)
+  if TAG_COLOR_MAP[t] then return TAG_COLOR_MAP[t] end
+  return FINDER_COLORS[(fnv1a(t) % #FINDER_COLORS) + 1]
+end
+
+-- Метка тега как в Finder: цветная точка + подпись
+local function tag_dot(t, with_label)
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local x, y = ImGui.GetCursorScreenPos(ctx)
+  local r = 4
+  local lh = ImGui.GetTextLineHeight(ctx)
+  ImGui.DrawList_AddCircleFilled(dl, x + r, y + lh / 2, r, tag_color(t))
+  ImGui.Dummy(ctx, r * 2 + 3, lh)
+  if with_label then
+    ImGui.SameLine(ctx, 0, 3)
+    ImGui.TextDisabled(ctx, t)
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -3197,7 +3219,10 @@ local function draw_card(entry, i, card_w)
       ImGui.DrawList_AddText(fdl, bx + 5, hy + 1, 0x111213FF, lbl)
     end
     if cs.micro then
-      -- S: микро-логотип слева + волна; ховер по логотипу — play/stop
+      -- S: логотип слева, волна справа — одной высоты, ряд по центру
+      local _, availy = ImGui.GetContentRegionAvail(ctx)
+      local pad = math.max(0, (availy - cs.thumb) / 2)
+      if pad > 0.5 then ImGui.Dummy(ctx, 1, pad) end
       local lx, ly = ImGui.GetCursorScreenPos(ctx)
       draw_thumb(card, cs.thumb)
       local over_logo = ImGui.IsItemHovered(ctx)
@@ -3398,18 +3423,26 @@ local function draw_card(entry, i, card_w)
     if #tags > 0 then
       if expanded then
         for ti, t in ipairs(tags) do
-          local label = '#' .. t
           if ti > 1 then
-            ImGui.SameLine(ctx)
-            if ImGui.CalcTextSize(ctx, label) > ImGui.GetContentRegionAvail(ctx) then
+            ImGui.SameLine(ctx, 0, 8)
+            if ImGui.CalcTextSize(ctx, t) + 20 >
+               ImGui.GetContentRegionAvail(ctx) then
               ImGui.NewLine(ctx)
             end
           end
-          ImGui.TextColored(ctx, tag_color(t), label)
+          tag_dot(t, true)
         end
       else
-        ImGui.TextColored(ctx, tag_color(tags[1]),
-          trunc('#' .. table.concat(tags, ' #'), cs.name + 10))
+        -- свёрнутая: точки Finder + первые имена, без переносов
+        for ti, t in ipairs(tags) do
+          if ti > 4 then break end
+          if ti > 1 then ImGui.SameLine(ctx, 0, 6) end
+          tag_dot(t, ti <= 2)
+        end
+        if #tags > 4 then
+          ImGui.SameLine(ctx, 0, 4)
+          ImGui.TextDisabled(ctx, '+' .. (#tags - 4))
+        end
       end
     end
 
@@ -4449,9 +4482,15 @@ local function draw_tags_panel(h)
     end
     for _, t in ipairs(state.tags_all_cache) do
       local active = state.filter_tags[t]
-      if chip('#' .. t .. '###stag' .. t, active, tag_color(t)) then
+      -- строка в стиле меток Finder: цветная точка + имя, клик — фильтр
+      local dl2 = ImGui.GetWindowDrawList(ctx)
+      local x, y = ImGui.GetCursorScreenPos(ctx)
+      local lh = ImGui.GetTextLineHeight(ctx)
+      if ImGui.Selectable(ctx, '      ' .. t .. '###stag' .. t, active) then
         state.filter_tags[t] = not active or nil
       end
+      ImGui.DrawList_AddCircleFilled(dl2, x + 7, y + lh / 2, 4.5,
+        tag_color(t))
     end
     ImGui.EndChild(ctx)
   end
