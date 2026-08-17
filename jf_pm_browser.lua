@@ -139,6 +139,11 @@ local EN = {
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
   ['теги'] = 'tags', ['играет'] = 'playing', ['тишина'] = 'silence',
+  ['открытые проекты: обновлено %d'] = 'open projects: %d updated',
+  ['открытые проекты: изменений нет'] = 'open projects: no changes',
+  ['новые теги: '] = 'new tags: ',
+  ['перечитать открытые проекты (теги, регионы)'] =
+    'reread open projects (tags, regions)',
   ['gut: только для проектов других DAW'] = 'gut: foreign DAW projects only',
   ['gut: потрошу '] = 'gut: gutting ',
   ['gut: семплов не найдено (потеряно %d)'] =
@@ -1422,8 +1427,133 @@ local function warn_open(card, action)
 end
 
 -- Перечитать карточку с диска после текстовой правки .rpp
+-- ---------------------------------------------------------------------------
+-- Live-скан открытых проектов: читаем из сессии REAPER, а не с диска.
+-- Только что написанный тег на регионе появится в каталоге сразу,
+-- без сохранения проекта. Делается при запуске и по кнопке ↻ карточки.
+
+local function live_scan_project(proj, fn)
+  local card = state.index.projects[fn]
+  if not card then return false end
+  local changed = false
+
+  -- регионы и маркеры прямо из сессии
+  local regions, markers = {}, {}
+  local i = 0
+  while true do
+    local rv, isrgn, pos, rgnend, name = reaper.EnumProjectMarkers2(proj, i)
+    if rv == 0 then break end
+    if isrgn then
+      regions[#regions + 1] = { name = name or '', pos = pos, fin = rgnend }
+    else
+      markers[#markers + 1] = { name = name or '', pos = pos }
+    end
+    i = i + 1
+  end
+  local function join(list)
+    local t = {}
+    for k, r in ipairs(list) do t[k] = r.name end
+    return table.concat(t, '\1')
+  end
+  if join(regions) ~= join(card.regions or {})
+     or join(markers) ~= join(card.markers or {}) then
+    card.regions, card.markers = regions, markers
+    changed = true
+  end
+
+  -- имена треков
+  local tnames = {}
+  for t = 0, reaper.CountTracks(proj) - 1 do
+    local tr = reaper.GetTrack(proj, t)
+    local _, nm = reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME', '', false)
+    tnames[#tnames + 1] = nm or ''
+  end
+  if table.concat(tnames, '\1') ~= table.concat(card.track_names or {}, '\1') then
+    card.track_names = tnames
+    card.track_count = #tnames
+    changed = true
+  end
+
+  -- project notes и extstate (теги, класс, дедлайн — их правит отчёт)
+  local notes = reaper.GetSetProjectNotes(proj, false, '')
+  if notes ~= (card.notes or '') then
+    card.notes = notes
+    changed = true
+  end
+  card.ext = card.ext or {}
+  for _, key in ipairs({ 'STATUS', 'TAGS', 'DESC', 'DEADLINE',
+                         'REPORT_TODO', 'REPORT_DONE', 'TRACKID', 'SAMPLES' }) do
+    local _, val = reaper.GetProjExtState(proj, core.NAMESPACE, key)
+    if val and val ~= '' and val ~= card.ext[key] then
+      card.ext[key] = val
+      changed = true
+    end
+  end
+
+  -- темп
+  local bpm = reaper.Master_GetTempo()
+  if proj == reaper.EnumProjects(-1) and bpm and bpm > 0
+     and math.abs((card.tempo or 0) - bpm) > 0.01 then
+    card.tempo = bpm
+    changed = true
+  end
+
+  if changed then
+    search_cache[fn] = nil
+    meta_cache[fn] = nil
+  end
+  return changed
+end
+
+-- Пройти по всем открытым вкладкам. Возвращает число обновлённых.
+local function live_scan_all(quiet)
+  local n, seen_tags = 0, {}
+  local before = {}
+  for _, card in pairs(state.index.projects) do
+    for _, t in ipairs(all_tags(card, cached_meta(card))) do
+      before[t:lower()] = true
+    end
+  end
+  local i = 0
+  while true do
+    local proj, fn = reaper.EnumProjects(i)
+    if not proj then break end
+    if fn and fn ~= '' and live_scan_project(proj, fn) then
+      n = n + 1
+      local card = state.index.projects[fn]
+      for _, t in ipairs(all_tags(card, core.card_meta(card))) do
+        if not before[t:lower()] then seen_tags[#seen_tags + 1] = t end
+      end
+    end
+    i = i + 1
+  end
+  if n > 0 then
+    save_index_soon()
+    local msg = string.format(T('открытые проекты: обновлено %d'), n)
+    if #seen_tags > 0 then
+      msg = msg .. ' · ' .. T('новые теги: ') .. table.concat(seen_tags, ', ')
+    end
+    logf('ok', msg)
+  elseif not quiet then
+    logf('ok', T('открытые проекты: изменений нет'))
+  end
+  return n
+end
+
 local function refresh_card(path)
   local old = state.index.projects[path]
+  -- открытая вкладка новее диска: читаем сессию, файл не трогаем
+  local i = 0
+  while true do
+    local proj, fn = reaper.EnumProjects(i)
+    if not proj then break end
+    if fn == path then
+      live_scan_project(proj, path)
+      save_index_soon()
+      return state.index.projects[path]
+    end
+    i = i + 1
+  end
   local nc = core.build_card(path, old)
   if nc then state.index.projects[path] = nc end
   save_index_soon()
@@ -4503,6 +4633,11 @@ local function draw_toolbar()
     rescan()
   end
   ImGui.SameLine(ctx)
+  if ImGui.SmallButton(ctx, '⟳###livescan') then live_scan_all(false) end
+  if state.btn_tips and ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, T('перечитать открытые проекты (теги, регионы)'))
+  end
+  ImGui.SameLine(ctx)
   if ImGui.Button(ctx, T('настройки')) then
     state.show_settings = not state.show_settings
   end
@@ -5087,7 +5222,7 @@ CMDS = {
     con_out('play [pat] · stop · seq · loop <n> · loops · goto <pat>')
     con_out('view <вид> · size s|m|l · findprev · analyze · rescan · undo')
     con_out('dups · cat <категория|off> · autoclass')
-    con_out('trash [sweep|restore] — виртуальная корзина (30 дней)')
+    con_out('trash [sweep|restore] · live — перечитать открытые проекты')
   end,
   ls = function(args)
     local n = tonumber(args) or 10
@@ -5372,6 +5507,9 @@ CMDS = {
       end
       con_out(T('в корзине: %d'), n)
     end
+  end,
+  live = function()
+    live_scan_all(false)
   end,
   gut = function(args)
     local hits = args ~= '' and con_match(args, false) or nil
@@ -5746,6 +5884,12 @@ local function loop()
       if not state.trash_swept then
         state.trash_swept = true
         trash_sweep(false) -- просроченное — в Корзину macOS, раз за сессию
+      end
+      if not state.live_scanned then
+        state.live_scanned = true
+        -- открытые вкладки могли уйти вперёд диска: свежие теги,
+        -- регионы и треки подхватываем сразу при запуске
+        live_scan_all(true)
       end
       flush_index()   -- отложенная запись индекса
     end
