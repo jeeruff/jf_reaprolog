@@ -142,6 +142,9 @@ local EN = {
   ['открытые проекты: обновлено %d'] = 'open projects: %d updated',
   ['открытых вкладок: %d · изменений нет'] = 'open tabs: %d · no changes',
   ['новые теги: '] = 'new tags: ',
+  ['луп из активного проекта — рекурсия'] =
+    'loop from the active project — recursion',
+  ['луп ⟲%d → проект: %s'] = 'loop ⟲%d → project: %s',
   ['новый проект в каталоге: '] = 'new project in catalog: ',
   ['перечитать открытые проекты (теги, регионы)'] =
     'reread open projects (tags, regions)',
@@ -392,12 +395,12 @@ end
 -- M — горизонтальный клип, L — обычная карточка.
 -- Режима «все развёрнуты» больше нет: 2000 развёрнутых карточек без
 -- виртуализации подвесили REAPER.
+-- Ширины подобраны под узкое окно в доке: M даёт 3–4 колонки там,
+-- где раньше помещалось 2 и оставались чёрные провалы.
 local CARD_SIZES = {
-  { label = 'S', w = 240, h = 32, thumb = 22, name = 16, micro = true },
-  { label = 'M', w = 280, h = 96, thumb = 56, name = 18, mini = true },
-  -- L: высота под весь контент. 150 было мало — «→ следующий шаг»
-  -- и строка тегов выдавливали ряд кнопок за нижнюю кромку.
-  { label = 'L', w = 340, h = 176, thumb = 56, name = 20 },
+  { label = 'S', w = 200, h = 28, thumb = 20, name = 14, micro = true },
+  { label = 'M', w = 220, h = 84, thumb = 44, name = 15, mini = true },
+  { label = 'L', w = 300, h = 170, thumb = 52, name = 18 },
 }
 
 -- радикалы Канси для тамбнейлов-иероглифов
@@ -3657,7 +3660,7 @@ local function draw_grid(cards)
   local cs = CARD_SIZES[state.card_size]
   local avail = ImGui.GetContentRegionAvail(ctx)
   local card_w = cs.w
-  local cols = math.max(1, math.floor(avail / (card_w + 8)))
+  local cols = math.max(1, math.floor(avail / (card_w + 4)))
 
   -- Виртуализация: на 2000 карточках рисуем только видимые строки.
   -- Раскрытая карточка или режим L ломают равновысотность — тогда
@@ -4392,8 +4395,19 @@ local function draw_big_player(entry)
   if card.loops and #card.loops > 0 then
     for li, lp in ipairs(card.loops) do
       if li > 1 then ImGui.SameLine(ctx) end
-      if ImGui.SmallButton(ctx, string.format('▶%d %s–%s###lp%d', li,
-          fmt_duration(lp.a), fmt_duration(lp.b), li)) then
+      local lp_clicked = ImGui.SmallButton(ctx,
+        string.format('▶%d %s–%s###lp%d', li,
+          fmt_duration(lp.a), fmt_duration(lp.b), li))
+      -- перетаскивание лупа в аранжировку: отпусти над треком REAPER
+      if ImGui.BeginDragDropSource(ctx) then
+        ImGui.SetDragDropPayload(ctx, 'JF_PM_LOOP',
+          card.path .. '\1' .. li)
+        ImGui.Text(ctx, string.format('⟲%d %s  %s–%s', li,
+          trunc(card.name, 18), fmt_duration(lp.a), fmt_duration(lp.b)))
+        state.loop_drag = { card = card, li = li, lp = lp }
+        ImGui.EndDragDropSource(ctx)
+      end
+      if lp_clicked then
         preview_play(audio, true)
         apply_play_fx(card, audio)
         if players[audio] then
@@ -4613,7 +4627,7 @@ end
 
 -- Боковая панель тегов: справа от сетки. Клик — фильтр (AND по нескольким),
 -- повторный — снять. Раньше теги жили в тулбаре и съедали верх.
-local TAGS_W = 132
+local TAGS_W = 104
 local function draw_tags_panel(h)
   if ImGui.BeginChild(ctx, '##tagspanel', TAGS_W, h,
       ImGui.ChildFlags_Border) then
@@ -5638,8 +5652,8 @@ local function todo_collect()
   return table.concat(lines, '\n'), #out
 end
 
-local TODO_W = 320
-local CONSOLE_H = 158
+local TODO_W = 260
+local CONSOLE_H = 132
 local function draw_todo_panel()
   if not state.todo_loaded then
     state.todo_mine, state.todo_auto = todo_load()
@@ -5700,7 +5714,7 @@ end
 
 -- Мини-плейлист «сейчас играет»: слева внизу, половина ширины консоли.
 -- Показывает всё, что звучит прямо сейчас, с прогрессом и стопом.
-local NOWPLAY_W = 300
+local NOWPLAY_W = 240
 local function draw_nowplaying()
   if ImGui.BeginChild(ctx, '##nowplay', NOWPLAY_W, CONSOLE_H,
       ImGui.ChildFlags_Border) then
@@ -5841,6 +5855,10 @@ end
 
 local function loop()
   ImGui.PushFont(ctx, font)
+  -- плотная сетка: меньше воздуха между карточками и панелями
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_ItemSpacing, 4, 3)
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, 5, 4)
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 4, 2)
   ImGui.SetNextWindowSize(ctx, 980, 660, ImGui.Cond_FirstUseEver)
   local visible, open = ImGui.Begin(ctx, 'JF — проекты', true)
   if visible then
@@ -5906,6 +5924,30 @@ local function loop()
       batch_step()   -- очередь «превью всем»: один проект за кадр
       rescan_step()  -- фоновый рескан: порция карточек за кадр
       players_step()  -- очистка доигравших превью + шаг плейлиста
+      -- луп отпущен вне окна скрипта → вставляем его в активный проект
+      -- сабпроджект-айтемом у edit-курсора (как «собрать из лупов»)
+      if state.loop_drag
+         and not ImGui.IsMouseDown(ctx, ImGui.MouseButton_Left) then
+        local d = state.loop_drag
+        state.loop_drag = nil
+        if not ImGui.IsWindowHovered(ctx, ImGui.HoveredFlags_AnyWindow) then
+          local _, active_fn = reaper.EnumProjects(-1)
+          if active_fn == d.card.path then
+            logf('warn', T('луп из активного проекта — рекурсия'))
+          else
+            local off = d.card.pv_offset or 0
+            local item = insert_subproject(d.card.path, {
+              pos = d.lp.a + off, fin = d.lp.b + off,
+              name = d.card.name .. ' loop' .. d.li,
+            })
+            if item then
+              render_proxies({ { item = item, path = d.card.path } })
+              logf('ok', string.format(T('луп ⟲%d → проект: %s'), d.li,
+                d.card.name))
+            end
+          end
+        end
+      end
       findprev_step() -- поиск превью по ФС: один mdfind за кадр
       analyze_step()  -- анализ тональности/BPM порциями
       if not state.trash_swept then
@@ -5935,6 +5977,7 @@ local function loop()
     ImGui.TextDisabled(ctx, ver)
     ImGui.End(ctx)
   end
+  ImGui.PopStyleVar(ctx, 3)
   ImGui.PopFont(ctx)
   if open and not state.quit then
     reaper.defer(loop)
