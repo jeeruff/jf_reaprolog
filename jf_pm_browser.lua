@@ -139,12 +139,24 @@ local EN = {
   ['мастер-BPM'] = 'master BPM',
   ['плейлист'] = 'playlist', ['выборка'] = 'selection',
   ['теги'] = 'tags', ['играет'] = 'playing', ['тишина'] = 'silence',
+  ['Палитра:'] = 'Palette:', ['цвет'] = 'color', ['ЧБ'] = 'B&W',
+  ['БЧ'] = 'W&B', ['серый'] = 'grey',
+  ['цвет кодирует смысл → в ЧБ становится яркостью'] =
+    'color encodes meaning → becomes brightness in mono',
   ['открытые проекты: обновлено %d'] = 'open projects: %d updated',
   ['открытых вкладок: %d · изменений нет'] = 'open tabs: %d · no changes',
   ['новые теги: '] = 'new tags: ',
   ['луп из активного проекта — рекурсия'] =
     'loop from the active project — recursion',
   ['луп ⟲%d → проект: %s'] = 'loop ⟲%d → project: %s',
+  ['проект в самого себя — рекурсия'] = 'project into itself — recursion',
+  ['ссылка на проект: '] = 'project link: ',
+  ['сабпроект: '] = 'subproject: ',
+  ['выдели айтем-ссылку в проекте'] = 'select a link item in the project',
+  ['в notes айтема нет пути'] = 'no path in item notes',
+  ['файл не найден: '] = 'file not found: ',
+  ['не удалось создать айтем'] = 'could not create item',
+  ['не удалось вставить сабпроект'] = 'could not insert subproject',
   ['новый проект в каталоге: '] = 'new project in catalog: ',
   ['перечитать открытые проекты (теги, регионы)'] =
     'reread open projects (tags, regions)',
@@ -309,6 +321,30 @@ end
 local function status_label(s)
   if LANG == 'en' then return core.STATUS_EN[s] or s end
   return s
+end
+
+-- ---------------------------------------------------------------------------
+-- Монохром: цвет несёт смысл (класс, DAW, тег, рейтинг), поэтому в ЧБ он
+-- переводится в ЯРКОСТЬ по Rec.709 — различия сохраняются, палитра уходит.
+-- 0 цвет · 1 ЧБ (тёмный фон) · 2 БЧ (светлый фон) · 3 серый
+local MONO_MODES = { 'цвет', 'ЧБ', 'БЧ', 'серый' }
+local mono_mode = tonumber(core.get_setting('mono_mode')) or 0
+
+local function C(col)
+  if mono_mode == 0 or type(col) ~= 'number' then return col end
+  local r = (col >> 24) & 0xFF
+  local g = (col >> 16) & 0xFF
+  local b2 = (col >> 8) & 0xFF
+  local a = col & 0xFF
+  -- воспринимаемая яркость (Rec.709)
+  local y = 0.2126 * r + 0.7152 * g + 0.0722 * b2
+  if mono_mode == 2 then
+    y = 255 - y                       -- БЧ: инверсия под светлый фон
+  elseif mono_mode == 3 then
+    y = 96 + y * 0.45                 -- серый: сжатый диапазон, мягче
+  end
+  y = math.max(0, math.min(255, math.floor(y + 0.5)))
+  return (y << 24) | (y << 16) | (y << 8) | a
 end
 
 local ctx = ImGui.CreateContext('JF PM')
@@ -531,7 +567,7 @@ local function tag_dot(t, with_label)
   local x, y = ImGui.GetCursorScreenPos(ctx)
   local r = 4
   local lh = ImGui.GetTextLineHeight(ctx)
-  ImGui.DrawList_AddCircleFilled(dl, x + r, y + lh / 2, r, tag_color(t))
+  ImGui.DrawList_AddCircleFilled(dl, x + r, y + lh / 2, r, C(tag_color(t)))
   ImGui.Dummy(ctx, r * 2 + 3, lh)
   if with_label then
     ImGui.SameLine(ctx, 0, 3)
@@ -1338,6 +1374,92 @@ local function gut_project(card)
     missing > 0 and string.format(T(' · потеряно %d'), missing) or ''))
 end
 
+-- Чужая DAW: айтем-ссылка. Путь проекта пишется в notes айтема — тот же
+-- формат, что читает jf_dawsync (P_NOTES), поэтому его скрипты откроют
+-- проект двойным кликом. Длина айтема — по данным карточки либо 8 c.
+local function insert_daw_link(card)
+  local tr = reaper.GetSelectedTrack(0, 0)
+  if not tr then
+    if reaper.CountTracks(0) == 0 then
+      reaper.InsertTrackAtIndex(0, true)
+    end
+    tr = reaper.GetTrack(0, 0)
+    reaper.SetOnlyTrackSelected(tr)
+  end
+  local pos = reaper.GetCursorPosition()
+  local len = (card.duration or 0) > 0 and card.duration or 8
+  local item = reaper.AddMediaItemToTrack(tr)
+  if not item then return nil end
+  reaper.SetMediaItemInfo_Value(item, 'D_POSITION', pos)
+  reaper.SetMediaItemInfo_Value(item, 'D_LENGTH', len)
+  reaper.GetSetMediaItemInfo_String(item, 'P_NOTES', card.path, true)
+  -- пустой take с именем: видно, что это ссылка, а не тишина
+  local take = reaper.AddTakeToMediaItem(item)
+  if take then
+    local dt = core.DAW_TYPES[card.daw_ext] or {}
+    reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME',
+      '[' .. (dt.label or '?') .. '] ' .. card.name, true)
+  end
+  reaper.UpdateArrange()
+  return item
+end
+
+-- Карточка отпущена над аранжировкой: REAPER-проект — сабпроджектом,
+-- чужая DAW — айтемом-ссылкой (путь в notes для dawsync).
+local function drop_card_into_project(card)
+  local _, active_fn = reaper.EnumProjects(-1)
+  if active_fn == card.path then
+    logf('warn', T('проект в самого себя — рекурсия'))
+    return
+  end
+  if card.daw then
+    if insert_daw_link(card) then
+      logf('ok', T('ссылка на проект: ') .. card.name)
+    else
+      logf('warn', T('не удалось создать айтем'))
+    end
+    return
+  end
+  local item = insert_subproject(card.path)
+  if item then
+    render_proxies({ { item = item, path = card.path } })
+    logf('ok', T('сабпроект: ') .. card.name)
+  else
+    logf('warn', T('не удалось вставить сабпроект'))
+  end
+end
+
+-- Обратная сторона ссылки: открыть проект, записанный в notes выделенного
+-- айтема (формат jf_dawsync). Работает и для .rpp, и для чужих DAW.
+local function open_linked_project()
+  local item = reaper.GetSelectedMediaItem(0, 0)
+  if not item then
+    logf('warn', T('выдели айтем-ссылку в проекте'))
+    return
+  end
+  local _, note = reaper.GetSetMediaItemInfo_String(item, 'P_NOTES', '', false)
+  local path = note and note:match('^%s*(.-)%s*$') or ''
+  if path == '' then
+    logf('warn', T('в notes айтема нет пути'))
+    return
+  end
+  if not path:match('^/') then
+    -- относительный путь — от папки проекта (как в dawsync)
+    local proj_dir = reaper.GetProjectPath('')
+    if proj_dir and proj_dir ~= '' then
+      path = proj_dir:gsub('[/\\]+$', '') .. '/' .. path
+    end
+  end
+  local f = io.open(path, 'rb')
+  if not f then
+    logf('warn', T('файл не найден: ') .. path)
+    return
+  end
+  f:close()
+  open_project(path)
+  logf('ok', T('открываю: ') .. (path:match('([^/]+)$') or path))
+end
+
 -- Регион кликом → сабпроект в активный проект (обрезанный до региона)
 local function insert_region_subproject(path, region)
   local _, active_fn = reaper.EnumProjects(-1)
@@ -2065,7 +2187,7 @@ local function draw_wave_strip(card, width, height, multi)
     0x141414FF, 3)
   local clicked = false
   if not audio then
-    ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
+    ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, C(0x5A5A5AFF),
       T('нет превью'))
     ImGui.Dummy(ctx, width, height)
     return false
@@ -2088,11 +2210,11 @@ local function draw_wave_strip(card, width, height, multi)
       local ok, pos = reaper.CF_Preview_GetValue(players[audio], 'D_POSITION')
       if ok and w.len > 0 then
         local px = x0 + math.min(pos / w.len, 1) * width
-        ImGui.DrawList_AddLine(dl, px, y0, px, y0 + height, 0xFFFFFFDD, 1)
+        ImGui.DrawList_AddLine(dl, px, y0, px, y0 + height, C(0xFFFFFFDD), 1)
       end
     end
   else
-    ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, 0x5A5A5AFF,
+    ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, C(0x5A5A5AFF),
       T('пики не построились'))
   end
   ImGui.InvisibleButton(ctx, '###wave' .. card.path, width, height)
@@ -2751,7 +2873,7 @@ local function draw_thumb(card, size)
   end
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
-  ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + size, y0 + size, 0x161616FF, 4)
+  ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + size, y0 + size, C(0x161616FF), 4)
   local h = fnv1a(card.path)
   if state.thumb_style == 2 and #(card.items or {}) > 0
      and (card.duration or 0) > 0 then
@@ -2817,10 +2939,10 @@ local function draw_card_icons(card, meta, i, expanded, compact)
   local hit = false
   local foreign = card.daw ~= nil
   local function icon(glyph, id, tip, col)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x00000000)
-    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, 0xFFFFFF22)
-    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, 0xFFFFFF3A)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, col or 0x8A8F93FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Button, C(0x00000000))
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, C(0xFFFFFF22))
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, C(0xFFFFFF3A))
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, C(col or 0x8A8F93FF))
     local clicked = ImGui.SmallButton(ctx, glyph .. '###' .. id .. i)
     ImGui.PopStyleColor(ctx, 4)
     if state.btn_tips and ImGui.IsItemHovered(ctx) then
@@ -2984,7 +3106,7 @@ local function draw_md(text)
     local b = line:match('^%s*[-*]%s+(.+)')
     if todo then -- пропуск
     elseif h then
-      ImGui.TextColored(ctx, 0xD9B96CFF, h)
+      ImGui.TextColored(ctx, C(0xD9B96CFF), h)
     elseif b then
       ImGui.BulletText(ctx, b)
     elseif line ~= '' then
@@ -3008,10 +3130,10 @@ local function draw_card_details(card, meta)
   local keys_str = fmt_keys(card)
   if keys_str then
     ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0x7BD9D0FF, '· ' .. keys_str)
+    ImGui.TextColored(ctx, C(0x7BD9D0FF), '· ' .. keys_str)
   end
   if core.is_empty_project(card) then
-    ImGui.TextColored(ctx, 0x8A8F93FF, '∅ ' ..
+    ImGui.TextColored(ctx, C(0x8A8F93FF), '∅ ' ..
       ((card.item_count == 0) and T('нет айтемов') or T('нет аудио в папке проекта')) ..
       ((card.audio_files ~= nil)
         and ('  ·  ' .. T('аудиофайлов: ') .. card.audio_files) or ''))
@@ -3027,7 +3149,7 @@ local function draw_card_details(card, meta)
   ImGui.SameLine(ctx)
   if meta.deadline > 0 then
     local left = math.floor((meta.deadline - now) / 86400)
-    ImGui.TextColored(ctx, deadline_color(meta.deadline, now),
+    ImGui.TextColored(ctx, C(deadline_color(meta.deadline), now),
       os.date('%d.%m.%y', meta.deadline) ..
       (left < 0 and ('  (' .. T('просрочен') .. ')') or ('  (' .. left .. ' ' .. T('дн.') .. ')')))
     ImGui.SameLine(ctx)
@@ -3138,11 +3260,11 @@ local function draw_card_details(card, meta)
       end
       for _, t in ipairs(pr.tags) do
         ImGui.SameLine(ctx)
-        ImGui.TextColored(ctx, tag_color(t), '#' .. t)
+        ImGui.TextColored(ctx, C(tag_color(t)), '#' .. t)
       end
       if pr.rating > 0 then
         ImGui.SameLine(ctx)
-        ImGui.TextColored(ctx, 0xD9B96CFF, string.rep('+', pr.rating))
+        ImGui.TextColored(ctx, C(0xD9B96CFF), string.rep('+', pr.rating))
       end
     end
   end
@@ -3251,7 +3373,7 @@ local function draw_card_details(card, meta)
     if ImGui.CalcTextSize(ctx, label) + 12 > ImGui.GetContentRegionAvail(ctx) then
       ImGui.NewLine(ctx)
     end
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, cur[t] and e[2] or 0x9A9A9AFF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, C(cur[t] and e[2] or 0x9A9A9AFF))
     if ImGui.SmallButton(ctx, label .. '###tag' .. i) then
       local extra = card.tags_extra or {}
       local found
@@ -3375,7 +3497,7 @@ local function draw_card(entry, i, card_w)
         bx + tw + 10, hy + 17, 0xE8D44DFF, 3)
       ImGui.DrawList_AddRect(fdl, bx, hy, bx + tw + 10, hy + 17,
         0x111213FF, 3)
-      ImGui.DrawList_AddText(fdl, bx + 5, hy + 1, 0x111213FF, lbl)
+      ImGui.DrawList_AddText(fdl, bx + 5, hy + 1, C(0x111213FF), lbl)
     end
     if cs.micro then
       -- S: логотип слева, волна справа — одной высоты, ряд по центру
@@ -3390,7 +3512,7 @@ local function draw_card(entry, i, card_w)
         local pdl = ImGui.GetWindowDrawList(ctx)
         ImGui.DrawList_AddRectFilled(pdl, lx, ly,
           lx + cs.thumb, ly + cs.thumb, 0x000000AA, 3)
-        ImGui.DrawList_AddText(pdl, lx + 6, ly + 3, 0xFFFFFFFF,
+        ImGui.DrawList_AddText(pdl, lx + 6, ly + 3, C(0xFFFFFFFF),
           (audio and is_playing(audio)) and '■' or '▶')
         ImGui.SetTooltip(ctx, card.name)
         local lm = ImGui.GetKeyMods(ctx)
@@ -3441,7 +3563,7 @@ local function draw_card(entry, i, card_w)
     if card.daw then
       -- цветной бейдж DAW перед именем: после длинного имени он бы уехал
       local dt = core.DAW_TYPES[card.daw_ext] or {}
-      ImGui.TextColored(ctx, dt.color or 0x9A9A9AFF, '[' .. (dt.label or '?') .. ']')
+      ImGui.TextColored(ctx, C(dt.color or 0x9A9A9AFF), '[' .. (dt.label or '?') .. ']')
       if state.btn_tips and ImGui.IsItemHovered(ctx) then
         ImGui.SetTooltip(ctx, (dt.daw or '') .. ' · ' ..
           T('двойной клик — открыть в этой программе'))
@@ -3461,7 +3583,7 @@ local function draw_card(entry, i, card_w)
     if card.trashed then
       local left = core.trash_days_left(card)
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0xE06060FF, '🗑' .. (left or 0))
+      ImGui.TextColored(ctx, C(0xE06060FF), '🗑' .. (left or 0))
       if state.btn_tips and ImGui.IsItemHovered(ctx) then
         ImGui.SetTooltip(ctx, string.format(
           T('в корзине · %d дней до удаления · × — вернуть'), left or 0))
@@ -3493,7 +3615,7 @@ local function draw_card(entry, i, card_w)
     if core.is_empty_project(card) then
       -- пустышка: ни одного айтема или ни одного аудиофайла в папке
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0x7A7A7AFF, '∅')
+      ImGui.TextColored(ctx, C(0x7A7A7AFF), '∅')
       if ImGui.IsItemHovered(ctx) then
         ImGui.SetTooltip(ctx, (card.item_count == 0 and T('нет айтемов') or
           T('нет аудио в папке проекта')))
@@ -3501,12 +3623,12 @@ local function draw_card(entry, i, card_w)
     end
     if card.pinned then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0xD9B96CFF, '●') -- закреплён
+      ImGui.TextColored(ctx, C(0xD9B96CFF), '●') -- закреплён
     end
     if si then
       ImGui.SameLine(ctx)
       -- номер в выборке = позиция в merge
-      ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
+      ImGui.TextColored(ctx, C(0xD9B96CFF), '[' .. si .. ']')
     end
     local color = core.STATUS_COLORS[meta.status]
     local stage = core.PIPELINE[meta.status]
@@ -3514,7 +3636,7 @@ local function draw_card(entry, i, card_w)
       -- прогресс по пайплайну: ●●○○○ = «отмиксить»
       local dots = string.rep('●', stage) ..
                    string.rep('○', core.PIPELINE_STEPS - stage)
-      ImGui.TextColored(ctx, color or 0xAAAAAAFF, dots)
+      ImGui.TextColored(ctx, C(color or 0xAAAAAAFF), dots)
       ImGui.SameLine(ctx)
     end
     -- класс — выпадашкой прямо на карточке (пишется в индекс, как канбан)
@@ -3523,7 +3645,7 @@ local function draw_card(entry, i, card_w)
       if s2 == meta.status then cur_idx = si2 end
     end
     ImGui.SetNextItemWidth(ctx, 96)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, color or 0x9A9A9AFF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, C(color or 0x9A9A9AFF))
     local chg, ni = ImGui.Combo(ctx, '###cls' .. i, cur_idx, class_labels())
     ImGui.PopStyleColor(ctx)
     if ImGui.IsItemHovered(ctx) or ImGui.IsItemActive(ctx) then
@@ -3539,7 +3661,7 @@ local function draw_card(entry, i, card_w)
     end
     if (meta.deadline or 0) > 0 then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, deadline_color(meta.deadline, os.time()),
+      ImGui.TextColored(ctx, C(deadline_color(meta.deadline), os.time()),
         '→ ' .. os.date('%d.%m', meta.deadline))
     end
     if meta.status == '' then
@@ -3547,7 +3669,7 @@ local function draw_card(entry, i, card_w)
       local cat = core.auto_category(card)
       if cat then
         ImGui.SameLine(ctx)
-        ImGui.TextColored(ctx, CAT_COLORS[cat] or 0x8A8F93FF, '~' .. cat)
+        ImGui.TextColored(ctx, C(CAT_COLORS[cat] or 0x8A8F93FF), '~' .. cat)
         if state.btn_tips and ImGui.IsItemHovered(ctx) then
           ImGui.SetTooltip(ctx, T('подсказка по содержимому · клик — принять'))
         end
@@ -3559,7 +3681,7 @@ local function draw_card(entry, i, card_w)
     end
     if card.needs_report then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0xE06060FF, T('· без отчёта'))
+      ImGui.TextColored(ctx, C(0xE06060FF), T('· без отчёта'))
     end
 
     local keys_str = fmt_keys(card)
@@ -3624,7 +3746,10 @@ local function draw_card(entry, i, card_w)
   -- карточку можно перетащить в плейлист (payload как в канбане)
   if card_open and ImGui.BeginDragDropSource(ctx) then
     ImGui.SetDragDropPayload(ctx, 'JF_PM_CARD', card.path)
-    ImGui.Text(ctx, card.name)
+    ImGui.Text(ctx, (card.daw and ('[' ..
+      ((core.DAW_TYPES[card.daw_ext] or {}).label or '?') .. '] ') or '⧉ ')
+      .. card.name)
+    state.card_drag = card.path -- сброс вне окна → вставка в проект
     ImGui.EndDragDropSource(ctx)
   end
   ::card_done::
@@ -3740,8 +3865,8 @@ local function draw_timeline(cards)
   while mt < now do
     if mt >= min_t then
       local x = ax + label_w + (mt - min_t) / TIMELINE_SPAN * plot_w
-      ImGui.DrawList_AddLine(dl, x, ay, x, ay + 14, 0x3A3A3AFF)
-      ImGui.DrawList_AddText(dl, x + 3, ay, 0x777777FF, os.date('%m.%y', mt))
+      ImGui.DrawList_AddLine(dl, x, ay, x, ay + 14, C(0x3A3A3AFF))
+      ImGui.DrawList_AddText(dl, x + 3, ay, C(0x777777FF), os.date('%m.%y', mt))
     end
     local nt = os.date('*t', mt)
     nt.month = nt.month + 1
@@ -3769,7 +3894,7 @@ local function draw_timeline(cards)
       end
     end
 
-    ImGui.DrawList_AddText(dl, rx, ry + 1, 0xCCCCCCFF, trunc(card.name, 24))
+    ImGui.DrawList_AddText(dl, rx, ry + 1, C(0xCCCCCCFF), trunc(card.name, 24))
 
     local t1 = card.mtime or now
     local t0 = t1
@@ -3786,7 +3911,7 @@ local function draw_timeline(cards)
       local col = core.STATUS_COLORS[meta.status] or 0x8A8A8AFF
       ImGui.DrawList_AddRectFilled(dl, bx0, ry + 4, bx1, ry + 15, col, 2)
     else
-      ImGui.DrawList_AddText(dl, rx + label_w, ry + 1, 0x555555FF,
+      ImGui.DrawList_AddText(dl, rx + label_w, ry + 1, C(0x555555FF),
         T('старше полугода'))
     end
   end
@@ -3870,7 +3995,7 @@ local function draw_calendar(cards)
           key < today_key and 0xE06060FF or 0xD9B96CFF, 2, 0, 2)
       end
       if key == today_key then
-        ImGui.DrawList_AddRect(dl, cx, cy, cx + cell, cy + cell, 0xE8E8E8FF, 2)
+        ImGui.DrawList_AddRect(dl, cx, cy, cx + cell, cy + cell, C(0xE8E8E8FF), 2)
       end
       if mx >= cx and mx < cx + cell and my >= cy and my < cy + cell then
         hover_key, hover_act, hover_dl = key, a, dl_days[key]
@@ -3878,7 +4003,7 @@ local function draw_calendar(cards)
       if d == 0 then
         local m = os.date('%m', ts)
         if m ~= prev_month then
-          ImGui.DrawList_AddText(dl, cx, y0 - 16, 0x777777FF, os.date('%m.%y', ts))
+          ImGui.DrawList_AddText(dl, cx, y0 - 16, C(0x777777FF), os.date('%m.%y', ts))
           prev_month = m
         end
       end
@@ -3941,9 +4066,9 @@ local function draw_kanban(cards)
         local focused = state.kb_col == ci and state.kb_row == ei
         local si = sel_index(card.path)
         if focused then
-          ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xE8E8E8FF)
+          ImGui.PushStyleColor(ctx, ImGui.Col_Border, C(0xE8E8E8FF))
         elseif si then
-          ImGui.PushStyleColor(ctx, ImGui.Col_Border, 0xD9B96CFF)
+          ImGui.PushStyleColor(ctx, ImGui.Col_Border, C(0xD9B96CFF))
         end
         local kx, ky = ImGui.GetCursorScreenPos(ctx)
         if ImGui.BeginChild(ctx, '##kbc' .. card.path, col_w - 16, 64,
@@ -3954,14 +4079,14 @@ local function draw_kanban(cards)
           ImGui.Text(ctx, trunc(card.name, 14))
           if card.pinned then
             ImGui.SameLine(ctx)
-            ImGui.TextColored(ctx, 0xD9B96CFF, '●')
+            ImGui.TextColored(ctx, C(0xD9B96CFF), '●')
           end
           if si then
             ImGui.SameLine(ctx)
-            ImGui.TextColored(ctx, 0xD9B96CFF, '[' .. si .. ']')
+            ImGui.TextColored(ctx, C(0xD9B96CFF), '[' .. si .. ']')
           end
           ImGui.SameLine(ctx)
-          ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x7BB8D9FF)
+          ImGui.PushStyleColor(ctx, ImGui.Col_Text, C(0x7BB8D9FF))
           if ImGui.SmallButton(ctx, '▸###kbopen' .. ci .. '_' .. ei) then
             open_project(card.path)
           end
@@ -3972,7 +4097,7 @@ local function draw_kanban(cards)
           ImGui.TextDisabled(ctx, fmt_date(card.mtime))
           local na = e.meta.report_todo:match('^[^\n]+')
           if na then
-            ImGui.TextColored(ctx, 0xD9B96CFF, trunc('→ ' .. na, 16))
+            ImGui.TextColored(ctx, C(0xD9B96CFF), trunc('→ ' .. na, 16))
           end
           ImGui.EndGroup(ctx)
           ImGui.EndChild(ctx)
@@ -4022,7 +4147,7 @@ end
 local function chip(label, active, col)
   -- col — акцент активного чипа (цветовое кодирование групп)
   local on = col or 0x3D3D3DFF
-  ImGui.PushStyleColor(ctx, ImGui.Col_Button, active and on or 0x1E1E1EFF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, C(active and on or 0x1E1E1EFF))
   ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,
     active and on or 0x2E2E2EFF)
   ImGui.PushStyleColor(ctx, ImGui.Col_Text,
@@ -4037,11 +4162,11 @@ local VIEW_COLORS = { 0x7BB8D9FF, 0xD9B96CFF, 0x7FD98AFF, 0xC98AD9FF }
 local function view_tab(label, active, col)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 12, 6)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 6)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Button, active and col or 0x232425FF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, C(active and col or 0x232425FF))
   ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,
     active and col or 0x323334FF)
   ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, col)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Text, active and 0x111213FF or 0xB5B8BAFF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, C(active and 0x111213FF or 0xB5B8BAFF))
   local clicked = ImGui.Button(ctx, label)
   ImGui.PopStyleColor(ctx, 4)
   ImGui.PopStyleVar(ctx, 2)
@@ -4137,6 +4262,17 @@ local function draw_settings()
     state.btn_tips = false
     core.set_setting('btn_tips', '0')
   end
+
+  ImGui.Text(ctx, T('Палитра:'))
+  for mi, mname in ipairs(MONO_MODES) do
+    ImGui.SameLine(ctx)
+    if chip(T(mname) .. '###mono' .. mi, mono_mode == mi - 1) then
+      mono_mode = mi - 1
+      core.set_setting('mono_mode', tostring(mono_mode))
+    end
+  end
+  ImGui.SameLine(ctx)
+  ImGui.TextDisabled(ctx, T('цвет кодирует смысл → в ЧБ становится яркостью'))
 
   ImGui.Text(ctx, T('Язык / Language:'))
   ImGui.SameLine(ctx)
@@ -4306,7 +4442,7 @@ local function draw_big_player(entry)
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
   local width = ImGui.GetContentRegionAvail(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
-  ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + width, y0 + H, 0x141414FF, 3)
+  ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + width, y0 + H, C(0x141414FF), 3)
   local mid = y0 + H / 2
   local step = width / w.n
   for i = 1, w.n do
@@ -4338,23 +4474,23 @@ local function draw_big_player(entry)
   for li, lp in ipairs(card.loops or {}) do
     local lx0 = x0 + math.min(lp.a / w.len, 1) * width
     local lx1 = x0 + math.min(lp.b / w.len, 1) * width
-    ImGui.DrawList_AddRectFilled(dl, lx0, y0 + H - 6, lx1, y0 + H, 0xD9B96C88)
-    ImGui.DrawList_AddText(dl, lx0 + 2, y0 + H - 18, 0xD9B96CFF,
+    ImGui.DrawList_AddRectFilled(dl, lx0, y0 + H - 6, lx1, y0 + H, C(0xD9B96C88))
+    ImGui.DrawList_AddText(dl, lx0 + 2, y0 + H - 18, C(0xD9B96CFF),
       tostring(li))
   end
   -- текущее выделение
   if sel then
     local sx0 = x0 + sel.a * width
     local sx1 = x0 + sel.b * width
-    ImGui.DrawList_AddRectFilled(dl, sx0, y0, sx1, y0 + H, 0xD9B96C33)
-    ImGui.DrawList_AddRect(dl, sx0, y0, sx1, y0 + H, 0xD9B96CFF)
+    ImGui.DrawList_AddRectFilled(dl, sx0, y0, sx1, y0 + H, C(0xD9B96C33))
+    ImGui.DrawList_AddRect(dl, sx0, y0, sx1, y0 + H, C(0xD9B96CFF))
   end
   -- курсор воспроизведения
   if is_playing(audio) then
     local ok, pos = reaper.CF_Preview_GetValue(players[audio], 'D_POSITION')
     if ok and w.len > 0 then
       local px = x0 + math.min(pos / w.len, 1) * width
-      ImGui.DrawList_AddLine(dl, px, y0, px, y0 + H, 0xFFFFFFDD, 1)
+      ImGui.DrawList_AddLine(dl, px, y0, px, y0 + H, C(0xFFFFFFDD), 1)
     end
   end
 
@@ -4476,8 +4612,8 @@ local function draw_playq_panel(stack_h)
     end
     ImGui.SameLine(ctx)
     -- sync play: всё стартует одновременно (с BPM-синком ложится в грув)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0x7FD98AFF)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x111213FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Button, C(0x7FD98AFF))
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, C(0x111213FF))
     local syncgo = ImGui.SmallButton(ctx, '⇉ sync###pqsync')
     ImGui.PopStyleColor(ctx, 2)
     if syncgo then
@@ -4737,7 +4873,7 @@ local function draw_toolbar()
     string.format('WIP: %d', wip))
   if no_report > 0 then
     ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xE06060FF, string.format(T('без отчёта: %d'), no_report))
+    ImGui.TextColored(ctx, C(0xE06060FF), string.format(T('без отчёта: %d'), no_report))
   end
 
   -- ряд фильтров
@@ -4864,7 +5000,7 @@ local function draw_toolbar()
   -- выделенных — те же команды, что на карточке, но на всю выборку
   if #state.sel > 0 then
     ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xD9B96CFF, string.format(T('выбрано: %d'), #state.sel))
+    ImGui.TextColored(ctx, C(0xD9B96CFF), string.format(T('выбрано: %d'), #state.sel))
     ImGui.SameLine(ctx)
     if ImGui.SmallButton(ctx, T('на расслоение') .. '###selharv') then
       for _, p in ipairs(state.sel) do
@@ -4878,10 +5014,10 @@ local function draw_toolbar()
       if ImGui.Button(ctx, 'merge') then merge_selected() end
       ImGui.SameLine(ctx)
       -- сабпроектами: исходники не трогаются — ГЛАВНАЯ функция, ярче
-      ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0xD9B96CFF)
-      ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, 0xE8CD8AFF)
-      ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, 0xC9A95CFF)
-      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x111213FF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_Button, C(0xD9B96CFF))
+      ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, C(0xE8CD8AFF))
+      ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, C(0xC9A95CFF))
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, C(0x111213FF))
       local msub = ImGui.Button(ctx, '⧉ merge as subs')
       ImGui.PopStyleColor(ctx, 4)
       if msub then merge_as_subprojects(nil) end
@@ -5263,7 +5399,7 @@ CMDS = {
     con_out('play [pat] · stop · seq · loop <n> · loops · goto <pat>')
     con_out('view <вид> · size s|m|l · findprev · analyze · rescan · undo')
     con_out('dups · cat <категория|off> · autoclass')
-    con_out('trash [sweep|restore] · live — перечитать открытые проекты')
+    con_out('trash [sweep|restore] · live · link — открыть проект из notes')
   end,
   ls = function(args)
     local n = tonumber(args) or 10
@@ -5552,6 +5688,9 @@ CMDS = {
   live = function()
     live_scan_all(false)
   end,
+  link = function()
+    open_linked_project()
+  end,
   gut = function(args)
     local hits = args ~= '' and con_match(args, false) or nil
     local c = hits and hits[1] and hits[1].card
@@ -5687,7 +5826,7 @@ local function draw_todo_panel()
       if ImGui.BeginChild(ctx, '##todoauto', 0, 0) then
         for line in ((state.todo_auto or '') .. '\n'):gmatch('(.-)\n') do
           if line:sub(1, 1) == '#' then
-            ImGui.TextColored(ctx, 0xD9B96CFF, line)
+            ImGui.TextColored(ctx, C(0xD9B96CFF), line)
           elseif line ~= '' then
             ImGui.TextDisabled(ctx, line)
           end
@@ -5731,7 +5870,7 @@ local function draw_nowplaying()
     end
     if playlist then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, 0x7BB8D9FF, string.format('▶▶ %d/%d',
+      ImGui.TextColored(ctx, C(0x7BB8D9FF), string.format('▶▶ %d/%d',
         playlist.i, #playlist.queue))
     end
     for _, el in ipairs(list) do
@@ -5813,7 +5952,7 @@ local function draw_console_bottom()
   for _ in pairs(players) do nplay = nplay + 1 end
   if nplay > 0 then
     ImGui.SameLine(ctx)
-    ImGui.TextColored(ctx, 0xD9B96CFF, '♪ ' .. nplay ..
+    ImGui.TextColored(ctx, C(0xD9B96CFF), '♪ ' .. nplay ..
       (playlist and (' · ' .. T('цепочка') .. ' ' .. playlist.i .. '/'
         .. #playlist.queue) or ''))
     ImGui.SameLine(ctx)
@@ -5853,8 +5992,36 @@ local function draw_console_bottom()
   draw_todo_panel()
 end
 
+-- Палитра окна под режим: фон, текст, рамки. Цветной режим оставляет
+-- дефолтную тёмную тему ImGui.
+local MONO_THEME = {
+  [1] = { bg = 0x0A0A0AFF, child = 0x121212FF, text = 0xE6E6E6FF,
+          dim = 0x8C8C8CFF, border = 0x2E2E2EFF, frame = 0x1C1C1CFF },
+  [2] = { bg = 0xF2F2F2FF, child = 0xE8E8E8FF, text = 0x141414FF,
+          dim = 0x5A5A5AFF, border = 0xC0C0C0FF, frame = 0xDCDCDCFF },
+  [3] = { bg = 0x2B2B2BFF, child = 0x333333FF, text = 0xD8D8D8FF,
+          dim = 0x9E9E9EFF, border = 0x4A4A4AFF, frame = 0x3C3C3CFF },
+}
+
+local function push_mono_theme()
+  local th = MONO_THEME[mono_mode]
+  if not th then return 0 end
+  ImGui.PushStyleColor(ctx, ImGui.Col_WindowBg, th.bg)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg, th.child)
+  ImGui.PushStyleColor(ctx, ImGui.Col_PopupBg, th.child)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, th.text)
+  ImGui.PushStyleColor(ctx, ImGui.Col_TextDisabled, th.dim)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Border, th.border)
+  ImGui.PushStyleColor(ctx, ImGui.Col_FrameBg, th.frame)
+  ImGui.PushStyleColor(ctx, ImGui.Col_TitleBg, th.child)
+  ImGui.PushStyleColor(ctx, ImGui.Col_TitleBgActive, th.frame)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarBg, th.child)
+  return 10
+end
+
 local function loop()
   ImGui.PushFont(ctx, font)
+  local mono_pushed = push_mono_theme()
   -- плотная сетка: меньше воздуха между карточками и панелями
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_ItemSpacing, 4, 3)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_WindowPadding, 5, 4)
@@ -5926,6 +6093,16 @@ local function loop()
       players_step()  -- очистка доигравших превью + шаг плейлиста
       -- луп отпущен вне окна скрипта → вставляем его в активный проект
       -- сабпроджект-айтемом у edit-курсора (как «собрать из лупов»)
+      -- карточка отпущена вне окна → в аранжировку
+      if state.card_drag
+         and not ImGui.IsMouseDown(ctx, ImGui.MouseButton_Left) then
+        local p = state.card_drag
+        state.card_drag = nil
+        if not ImGui.IsWindowHovered(ctx, ImGui.HoveredFlags_AnyWindow) then
+          local c = state.index.projects[p]
+          if c then drop_card_into_project(c) end
+        end
+      end
       if state.loop_drag
          and not ImGui.IsMouseDown(ctx, ImGui.MouseButton_Left) then
         local d = state.loop_drag
@@ -5978,6 +6155,7 @@ local function loop()
     ImGui.End(ctx)
   end
   ImGui.PopStyleVar(ctx, 3)
+  if mono_pushed > 0 then ImGui.PopStyleColor(ctx, mono_pushed) end
   ImGui.PopFont(ctx)
   if open and not state.quit then
     reaper.defer(loop)
