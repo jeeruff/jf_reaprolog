@@ -109,6 +109,8 @@ local EN = {
   ['пики не построились'] = 'peaks failed to build',
   ['клик — сик · пкм — стоп'] = 'click — seek · right click — stop',
   ['играть: '] = 'play: ',
+  ['клик — только этот · Shift — поверх · пкм — стоп'] =
+    'click — solo · Shift — layer · right click — stop',
   ['клик — с места клика · пкм — стоп'] =
     'click — play from here · right click — stop',
   ['клик — subproject в активный проект\nCmd+клик — в корзину регионов'] =
@@ -2184,7 +2186,7 @@ local function draw_wave_strip(card, width, height, multi)
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
   ImGui.DrawList_AddRectFilled(dl, x0, y0, x0 + width, y0 + height,
-    0x141414FF, 3)
+    C(0x141414FF), 3)
   local clicked = false
   if not audio then
     ImGui.DrawList_AddText(dl, x0 + 6, y0 + height / 2 - 7, C(0x5A5A5AFF),
@@ -2220,6 +2222,8 @@ local function draw_wave_strip(card, width, height, multi)
   ImGui.InvisibleButton(ctx, '###wave' .. card.path, width, height)
   local wmods = ImGui.GetKeyMods(ctx)
   local sel_mod = wmods & ImGui.Mod_Ctrl ~= 0 or wmods & ImGui.Mod_Super ~= 0
+  -- Shift — играть поверх (совмещение), без Shift — только этот трек
+  local keep = wmods & ImGui.Mod_Shift ~= 0
   -- клик — играть с места клика / сик; Cmd+клик — мимо плеера, карточке
   -- (выделение → карточка попадает в плейлист); правый клик — стоп
   if ImGui.IsMouseDoubleClicked(ctx, ImGui.MouseButton_Left)
@@ -2230,8 +2234,8 @@ local function draw_wave_strip(card, width, height, multi)
   elseif ImGui.IsItemClicked(ctx, ImGui.MouseButton_Left) and not sel_mod then
     local mx = ImGui.GetMousePos(ctx)
     local frac = math.min(math.max((mx - x0) / width, 0), 1)
-    -- параллельно всегда: чужой луп в большом плеере не гасится
-    if not is_playing(audio) then preview_play(audio, true) end
+    -- без Shift — солo (остальные гаснут), с Shift — слоями
+    if not is_playing(audio) then preview_play(audio, keep) end
     if players[audio] and w and w.len > 0 then
       reaper.CF_Preview_SetValue(players[audio], 'D_POSITION', frac * w.len)
     end
@@ -2245,7 +2249,7 @@ local function draw_wave_strip(card, width, height, multi)
     ImGui.SetTooltip(ctx, is_playing(audio)
       and T('клик — сик · пкм — стоп')
       or (T('играть: ') .. (audio:match('([^/\\]+)$') or audio)
-        .. '\n' .. T('клик — с места клика · пкм — стоп')))
+        .. '\n' .. T('клик — только этот · Shift — поверх · пкм — стоп')))
   end
   return clicked
 end
@@ -3522,8 +3526,10 @@ local function draw_card(entry, i, card_w)
           inner_click = true
         elseif ImGui.IsMouseClicked(ctx, ImGui.MouseButton_Left)
            and not lsel then
-          -- cmd+клик пропускаем карточке: выделение вместо плей
-          if audio then preview_toggle(audio, true) end
+          -- cmd+клик пропускаем карточке: выделение вместо плей;
+          -- Shift — играть поверх других, иначе эксклюзивно
+          local keep_l = lm & ImGui.Mod_Shift ~= 0
+          if audio then preview_toggle(audio, keep_l) end
           inner_click = true
         end
       end
@@ -3984,9 +3990,10 @@ local function draw_calendar(cards)
       local cy = y0 + d * (cell + gap)
       local a = act[key]
       local future = key > today_key
-      local col = future and 0x141414FF or 0x1B1B1BFF
+      local col = future and C(0x141414FF) or C(0x1B1B1BFF)
       if a then
-        col = a.n >= 3 and 0xE8E8E8FF or (a.n == 2 and 0x9A9A9AFF or 0x5C5C5CFF)
+        col = a.n >= 3 and C(0xE8E8E8FF)
+          or (a.n == 2 and C(0x9A9A9AFF) or C(0x5C5C5CFF))
       end
       ImGui.DrawList_AddRectFilled(dl, cx, cy, cx + cell, cy + cell, col, 2)
       if dl_days[key] then
@@ -4516,7 +4523,7 @@ local function draw_big_player(entry)
       bigsel[card.path] = nil
       loop_bounds[audio] = nil
       if not is_playing(audio) then
-        preview_play(audio, true)
+        preview_play(audio, keep)
         apply_play_fx(card, audio)
       end
       if players[audio] and w.len > 0 then
